@@ -1,6 +1,8 @@
 <h1 align="center">calsync</h1>
 
-<p align="center"><strong>Mirror your busy time between a personal and a work Google calendar — times only, never details.</strong></p>
+<p align="center"><strong>Privately sync Personal and Work. No more double bookings, no more missed meetings.</strong></p>
+
+<p align="center">Mirrors your busy time between a personal and a work Google account as private "Busy" blocks.</p>
 
 <p align="center">
 <a href="#quick-start">Quick start</a> ·
@@ -20,17 +22,19 @@ calsync closes that gap without handing either calendar to the other. Every
 busy event on one becomes a private `Busy` block on the other, in both
 directions. Scheduling tools see when you're free; nobody sees why.
 
+- **Never double-book again.** Busy time is mirrored both ways, and edits
+  follow: move or cancel an event and its mirror moves or disappears with it.
+- **Never miss a meeting again** because you forgot to check your other
+  calendar. Anything booked on one shows as busy on the other.
+- **Exclude specific events and keywords from being mirrored.** Skip a
+  category by title keyword ("therapy", "confidential"), or one event or
+  series by an opaque key. Excluded events never get a mirror, and existing
+  ones are removed.
 - **Privacy is the design, not a setting.** Mirrors carry start and end times
   and nothing else. Titles, descriptions, locations, attendees, and conference
   links never cross. No reminders or guest notifications are ever sent.
-- **Keep some things out entirely.** Exclude a category by title keyword
-  ("therapy", "confidential"), or one event or series by an opaque key.
-  Excluded events never get a mirror, and existing ones are removed.
 - **Your machine, your keys.** Refresh tokens live in the macOS Keychain or
   your local vault, and Google only ever talks to your own OAuth client.
-- **Fast when it can be.** With a public HTTPS endpoint, Google pushes changes
-  and mirrors land in seconds; otherwise calsync polls every minute. A daily
-  full pass repairs anything that drifted.
 - **Talks to your AI tools.** `calsync mcp` lets Cursor or Claude Desktop check
   status, preview a sync, and manage exclusions from chat — counts and opaque
   keys only, never event contents.
