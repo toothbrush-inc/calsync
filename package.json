@@ -1,0 +1,46 @@
+{
+  "name": "calsync",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Privacy-preserving bidirectional Google Calendar availability sync",
+  "type": "module",
+  "bin": {
+    "calsync": "apps/cli/dist/cli.js"
+  },
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "workspaces": [
+    "packages/engine",
+    "apps/cli"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "clean": "npm run clean --workspaces --if-present",
+    "dev": "tsx apps/cli/src/cli.ts",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "start": "node apps/cli/dist/cli.js",
+    "pretest": "node scripts/require-node.js",
+    "test": "npm test --workspaces --if-present",
+    "test:watch": "vitest",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/better-sqlite3": "^9.6.0",
+    "@types/node": "^24.13.3",
+    "eslint": "^10.8.1",
+    "eslint-config-prettier": "^10.1.8",
+    "prettier": "^3.9.6",
+    "tsx": "^4.23.12",
+    "typescript": "5.9.3",
+    "typescript-eslint": "^8.67.0",
+    "vitest": "^4.1.10"
+  },
+  "dependencies": {
+    "@dvd-toy-box/vault": "^0.13.0"
+  }
+}

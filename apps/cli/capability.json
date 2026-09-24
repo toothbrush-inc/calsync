@@ -1,0 +1,29 @@
+{
+  "id": "calsync",
+  "store": {
+    "name": "calsync",
+    "tagline": "Privately sync Personal and Work. No more double bookings, no more missed meetings.",
+    "description": "Mirrors your busy time between a personal and a work Google account as private \"Busy\" blocks.",
+    "highlights": [
+      "Never double-book again: busy time is mirrored both ways, and edits follow",
+      "Never miss a meeting again because you forgot to check your other calendar",
+      "Exclude specific events and keywords from being mirrored"
+    ],
+    "accent": "leaf",
+    "repo": "https://github.com/toothbrush-inc/calsync"
+  },
+  "connections": [
+    {
+      "provider": "google",
+      "slot": "personal",
+      "optional": false,
+      "actions": ["read", "write"]
+    },
+    {
+      "provider": "google",
+      "slot": "work",
+      "optional": false,
+      "actions": ["read", "write"]
+    }
+  ]
+}

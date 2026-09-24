@@ -1,0 +1,10 @@
+# Secret scanning configuration for gitleaks (https://github.com/gitleaks/gitleaks).
+# The test suite signs and verifies tokens with an obvious placeholder secret;
+# allow that literal so a history scan reports only real findings.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Placeholder secrets used by the test suite"
+regexes = ['''0123456789abcdef''']
+paths = ['''apps/cli/test/.*\.test\.ts''']

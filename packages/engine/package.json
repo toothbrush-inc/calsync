@@ -1,0 +1,27 @@
+{
+  "name": "@calsync/engine",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Pure calendar sync engine: ports, reconcile, and Busy projection",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist coverage",
+    "pretest": "node ../../scripts/require-node.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  }
+}
