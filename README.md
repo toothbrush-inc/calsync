@@ -12,6 +12,16 @@
 <a href="#documentation">Docs</a>
 </p>
 
+```text
+  personal calendar                                  work calendar
+  ┌──────────────────────┐                          ┌──────────────────────┐
+  │ Dentist  15:00–16:00 │ ──── mirror as ────────▶ │ Busy     15:00–16:00 │
+  │ Busy     09:00–09:30 │ ◀─── mirror as ───────── │ Standup  09:00–09:30 │
+  └──────────────────────┘                          └──────────────────────┘
+                     ▲                                 ▲
+                     └──────────── calsync ────────────┘
+```
+
 ---
 
 Work can't see personal. Personal can't see work. The booking dialog in front
