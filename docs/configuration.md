@@ -30,7 +30,8 @@ the OAuth callback listener (`CALSYNC_CONNECT_*`) are covered in
 [hosting.md](hosting.md).
 
 Refresh tokens stay in the macOS Keychain or the local vault. SQLite stores
-account metadata, opaque mappings, sync tokens, CLI exclusions, and
+the signed-in accounts' email addresses and the synced calendars' names (to
+show which is which), opaque mappings, sync tokens, CLI exclusions, and
 privacy-safe aggregates — never event contents.
 
 ## Google OAuth credentials

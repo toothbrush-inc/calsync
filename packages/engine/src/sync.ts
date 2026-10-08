@@ -253,6 +253,14 @@ export function stateKey(key: string, tenantId?: string): string {
   return tenantId === undefined || tenantId === "default" ? key : `tenant:${tenantId}:${key}`;
 }
 
+/**
+ * Every sync_state key the engine keeps for one calendar, for a caller that
+ * forgets the calendar.
+ */
+export function calendarStateKeys(calendarKey: CalendarKey, tenantId: string): string[] {
+  return [syncTokenKey(calendarKey, tenantId), ownDeletionsKey(calendarKey, tenantId)];
+}
+
 function syncTokenKey(calendarKey: CalendarKey, tenantId: string): string {
   return stateKey(`incremental:sync-token:${calendarKey}`, tenantId);
 }

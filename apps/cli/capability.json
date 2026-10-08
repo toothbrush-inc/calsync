@@ -24,6 +24,42 @@
       "slot": "work",
       "optional": false,
       "actions": ["read", "write"]
+    },
+    {
+      "provider": "google",
+      "slot": "account1",
+      "optional": true,
+      "actions": ["read", "write"]
+    },
+    {
+      "provider": "google",
+      "slot": "account2",
+      "optional": true,
+      "actions": ["read", "write"]
+    },
+    {
+      "provider": "google",
+      "slot": "account3",
+      "optional": true,
+      "actions": ["read", "write"]
+    },
+    {
+      "provider": "google",
+      "slot": "account4",
+      "optional": true,
+      "actions": ["read", "write"]
+    },
+    {
+      "provider": "google",
+      "slot": "account5",
+      "optional": true,
+      "actions": ["read", "write"]
+    },
+    {
+      "provider": "google",
+      "slot": "account6",
+      "optional": true,
+      "actions": ["read", "write"]
     }
   ]
 }

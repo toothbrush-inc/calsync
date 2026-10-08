@@ -56,7 +56,10 @@ function manager(
   let tokens = 0;
   return new ChannelManager({
     address: options.address ?? ADDRESS,
-    calendarIds: { personal: "personal-calendar", work: "work-calendar" },
+    calendars: [
+      { key: "personal", calendarId: "personal-calendar" },
+      { key: "work", calendarId: "work-calendar" },
+    ],
     ttlSeconds: 604_800,
     renewBeforeMs: options.renewBeforeMs ?? 60 * 60 * 1_000,
     createClient: () => Promise.resolve(api),
@@ -153,7 +156,7 @@ describe("channel manager", () => {
     const result = await manager(state, api).ensure();
 
     expect(result.armed).toEqual([]);
-    expect(result.failed.map((failure) => failure.role)).toEqual(["personal", "work"]);
+    expect(result.failed.map((failure) => failure.calendarKey)).toEqual(["personal", "work"]);
     expect(state.getWatchChannel("personal")).toBeNull();
     state.close();
   });
