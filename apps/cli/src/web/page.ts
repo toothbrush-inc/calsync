@@ -454,19 +454,15 @@ export function renderDashboardPage(): string {
   const exclusionLists = document.getElementById("exclusion-lists");
   const exclusionNote = document.getElementById("exclusion-note");
   const DIRECTIONS = [
-    { id: "personalToWork", from: "personal", title: "Personal → work",
+    { id: "personal", from: "personal", title: "Personal → work",
       who: "Personal events kept off your work calendar." },
-    { id: "workToPersonal", from: "work", title: "Work → personal",
+    { id: "work", from: "work", title: "Work → personal",
       who: "Work events kept off your personal calendar." },
   ];
   const APPLY_HINT = "The next sync pass applies this.";
 
   function keyScope(value) {
     return value.includes(":series:") ? "whole series" : "one occurrence";
-  }
-
-  function directionFrom(direction) {
-    return direction === "personalToWork" ? "personal" : "work";
   }
 
   function chip(kind, entry) {
@@ -499,7 +495,7 @@ export function renderDashboardPage(): string {
         remove.disabled = true;
         const body = kind === "key"
           ? { action: "remove", keys: [entry.value] }
-          : { action: "remove", keywords: [entry.value], from: directionFrom(entry.direction) };
+          : { action: "remove", keywords: [entry.value], from: entry.source };
         void changeExclusions(body);
       });
       span.append(remove);
@@ -568,8 +564,8 @@ export function renderDashboardPage(): string {
     exclusionLists.replaceChildren(...DIRECTIONS.map((direction) => {
       const card = directionCard(direction);
       card.append(
-        group("Keywords", "keyword", snapshot.keywords.filter((entry) => entry.direction === direction.id)),
-        group("Events", "key", snapshot.keys.filter((entry) => entry.direction === direction.id)),
+        group("Keywords", "keyword", snapshot.keywords.filter((entry) => entry.source === direction.id)),
+        group("Events", "key", snapshot.keys.filter((entry) => entry.source === direction.id)),
         keywordForm(direction),
       );
       return card;
@@ -753,13 +749,13 @@ export function renderDashboardPage(): string {
       const list = document.createElement("ul");
       list.className = "events";
       const events = previewEvents
-        .filter((event) => event.direction === direction.id)
+        .filter((event) => event.source === direction.id)
         .filter((event) => !needle || (event.title || "").toLowerCase().includes(needle))
         .filter((event) => !hideExcluded || event.status === "mirrored");
       if (events.length === 0) {
         const empty = document.createElement("li");
         empty.className = "empty";
-        empty.textContent = previewEvents.some((event) => event.direction === direction.id)
+        empty.textContent = previewEvents.some((event) => event.source === direction.id)
           ? "No events match the filter."
           : "No events in the sync window.";
         list.append(empty);
@@ -777,7 +773,7 @@ export function renderDashboardPage(): string {
     const parts = [
       planned === 0 ? "No changes planned" : planned + (planned === 1 ? " operation" : " operations") + " planned",
       previewEvents.length + " events in the sync window",
-      view.mirrors.personalToWork.active + " busy blocks would go to work, " + view.mirrors.workToPersonal.active + " to personal",
+      (view.destinations.work?.active ?? 0) + " busy blocks would go to work, " + (view.destinations.personal?.active ?? 0) + " to personal",
     ];
     previewSummary.textContent = parts.join(" · ") + ".";
     previewResults.hidden = false;
@@ -970,8 +966,8 @@ export function renderDashboardPage(): string {
       if (status.lastFullSyncAt) parts.push("Last full sync " + relative(status.lastFullSyncAt));
       if (status.lastResult) {
         parts.push(
-          status.lastResult.personalToWorkActive + " busy blocks mirrored to work, " +
-          status.lastResult.workToPersonalActive + " to personal",
+          (status.lastResult.blocks.work ?? 0) + " busy blocks mirrored to work, " +
+          (status.lastResult.blocks.personal ?? 0) + " to personal",
         );
       }
       summary.textContent = parts.join(" · ");

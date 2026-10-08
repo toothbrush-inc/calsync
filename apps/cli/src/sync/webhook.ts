@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { AccountRole } from "@calsync/engine";
+import type { AccountRole } from "../config.js";
 
 import type { WatchChannelRecord } from "../storage/index.js";
 

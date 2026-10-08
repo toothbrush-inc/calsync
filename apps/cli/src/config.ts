@@ -5,15 +5,23 @@ import { fileURLToPath } from "node:url";
 import { config as loadDotenv } from "dotenv";
 import { z } from "zod";
 
-import type { SyncConfig } from "@calsync/engine";
+import { legacyCalendarKeys, type SyncConfig } from "@calsync/engine";
 import type { ScanGateLimits } from "./scanlimit.js";
 
-export {
-  accountRoles,
-  type AccountConfig,
-  type AccountRole,
-  type SyncConfig,
-} from "@calsync/engine";
+export type { SyncConfig } from "@calsync/engine";
+
+/**
+ * The two Google sign-ins this host knows. Each signs in one calendar, whose
+ * calendar key is the role itself.
+ */
+export const accountRoles = legacyCalendarKeys;
+export type AccountRole = (typeof accountRoles)[number];
+
+export interface AccountConfig {
+  tenantId: string;
+  role: AccountRole;
+  calendarId: string;
+}
 
 export function repositoryRoot(): string {
   return resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -112,6 +120,8 @@ export interface WebhookConfig {
 }
 
 export interface AppConfig extends SyncConfig {
+  /** The sign-in behind each calendar; `calendars` lists the same two by key. */
+  accounts: Record<AccountRole, AccountConfig>;
   pollIntervalMs: number;
   webhook?: WebhookConfig;
   logging?: {
@@ -164,8 +174,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   const values = result.data;
   const webhook = webhookConfig(values);
 
+  const calendarIds: Record<AccountRole, string> = {
+    personal: values.CALSYNC_PERSONAL_CALENDAR_ID,
+    work: values.CALSYNC_WORK_CALENDAR_ID,
+  };
   return {
     tenantId: values.CALSYNC_TENANT_ID,
+    calendars: accountRoles.map((role) => ({
+      key: role,
+      calendarId: calendarIds[role],
+      source: true,
+      destination: true,
+    })),
     accounts: {
       personal: {
         tenantId: values.CALSYNC_TENANT_ID,
@@ -186,11 +206,17 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       futureDays: values.CALSYNC_WINDOW_FUTURE_DAYS,
     },
     timezone: values.CALSYNC_TIMEZONE,
+    // The variable names predate per-source exclusions: "personal to work"
+    // holds back personal events, which is the personal source's exclusion.
     exclusions: {
-      personalToWork: parseList(values.CALSYNC_EXCLUDE_PERSONAL_TO_WORK),
-      workToPersonal: parseList(values.CALSYNC_EXCLUDE_WORK_TO_PERSONAL),
-      personalToWorkKeywords: parseKeywords(values.CALSYNC_EXCLUDE_PERSONAL_TO_WORK_KEYWORDS),
-      workToPersonalKeywords: parseKeywords(values.CALSYNC_EXCLUDE_WORK_TO_PERSONAL_KEYWORDS),
+      keys: {
+        personal: parseList(values.CALSYNC_EXCLUDE_PERSONAL_TO_WORK),
+        work: parseList(values.CALSYNC_EXCLUDE_WORK_TO_PERSONAL),
+      },
+      keywords: {
+        personal: parseKeywords(values.CALSYNC_EXCLUDE_PERSONAL_TO_WORK_KEYWORDS),
+        work: parseKeywords(values.CALSYNC_EXCLUDE_WORK_TO_PERSONAL_KEYWORDS),
+      },
     },
     logging: {
       maxBytes: values.CALSYNC_LOG_MAX_BYTES,

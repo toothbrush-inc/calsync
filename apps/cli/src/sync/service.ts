@@ -7,7 +7,6 @@ import {
   SyncEngine,
   googleApiErrorInfo,
   systemClock,
-  type AccountRole,
   type CalendarAPI,
   type Clock,
   type DedupeResult,
@@ -19,7 +18,7 @@ import {
   type SyncStatus,
 } from "@calsync/engine";
 
-import type { AppConfig, WebhookConfig } from "../config.js";
+import type { AccountRole, AppConfig, WebhookConfig } from "../config.js";
 import type { ChannelAPI } from "../google/channels.js";
 import type { StateDatabase, WatchChannelRecord } from "../storage/index.js";
 import { ChannelManager, stopWatchChannels, type WatchChannelStore } from "./channels.js";

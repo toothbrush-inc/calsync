@@ -1,16 +1,18 @@
 import {
   LAST_FULL_SYNC_KEY,
   LAST_RESULT_KEY,
+  parseStoredResult,
   stateKey,
-  type AccountRole,
+  type CalendarKey,
   type ReconcileLog,
   type ReconcileProgress,
   type SyncReconcileResult,
 } from "@calsync/engine";
 
-import { accountRoles, loadConfig, type AppConfig } from "../config.js";
+import { accountRoles, loadConfig, type AccountRole, type AppConfig } from "../config.js";
 import {
   changeExclusions,
+  exclusionSources,
   snapshotExclusions,
   type ExclusionChangeResult,
   type ExclusionSnapshot,
@@ -57,12 +59,6 @@ export interface AccountStatusResult {
   message: string;
 }
 
-export interface MirrorTotals {
-  active: number;
-  excluded: number;
-  duplicateSuppressed: number;
-}
-
 export interface SyncAggregates {
   created: number;
   updated: number;
@@ -70,10 +66,10 @@ export interface SyncAggregates {
   repaired: number;
   failed: number;
   converged: boolean;
-  mirrors: {
-    personalToWork: MirrorTotals;
-    workToPersonal: MirrorTotals;
-  };
+  /** Busy blocks each calendar holds, by calendar key. */
+  destinations: SyncReconcileResult["destinations"];
+  /** Events each source calendar's exclusions hold back, by calendar key. */
+  sources: SyncReconcileResult["sources"];
 }
 
 /** Push-notification health: whether channels are configured and when they expire. */
@@ -89,7 +85,8 @@ export interface StatusResult {
 }
 
 export interface OperationCount {
-  direction: "personalToWork" | "workToPersonal";
+  /** Calendar the busy blocks are written to. */
+  destination: CalendarKey;
   operation: ReconcileLog["operation"];
   reason: ReconcileLog["reason"];
   count: number;
@@ -329,6 +326,7 @@ function handleExclusionChange<T extends "add" | "remove">(
         ...(input.keywords === undefined ? {} : { keywords: input.keywords }),
         ...(input.from === undefined ? {} : { from: input.from }),
       },
+      exclusionSources(resolveConfig(runtime)),
       { allowMix: true },
     );
     return { ok: true, data: { action, ...result } };
@@ -371,7 +369,8 @@ function readLastSync(
   if (rawResult === null && lastFullSyncAt === null) {
     return null;
   }
-  const aggregates = rawResult === null ? null : parseStoredAggregates(rawResult);
+  const stored = parseStoredResult(rawResult);
+  const aggregates = stored === null ? null : syncAggregates(stored);
   if (aggregates === null && lastFullSyncAt === null) {
     return null;
   }
@@ -379,64 +378,6 @@ function readLastSync(
     ...(aggregates ?? emptyAggregates()),
     lastFullSyncAt,
   };
-}
-
-function parseStoredAggregates(raw: string): SyncAggregates | null {
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      return null;
-    }
-    const record = parsed as Record<string, unknown>;
-    if (
-      typeof record["created"] !== "number" ||
-      typeof record["updated"] !== "number" ||
-      typeof record["deleted"] !== "number" ||
-      typeof record["repaired"] !== "number" ||
-      typeof record["failed"] !== "number" ||
-      typeof record["converged"] !== "boolean"
-    ) {
-      return null;
-    }
-    return {
-      created: record["created"],
-      updated: record["updated"],
-      deleted: record["deleted"],
-      repaired: record["repaired"],
-      failed: record["failed"],
-      converged: record["converged"],
-      mirrors: parseMirrors(record["mirrors"]),
-    };
-  } catch {
-    return null;
-  }
-}
-
-function parseMirrors(value: unknown): SyncAggregates["mirrors"] {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return emptyAggregates().mirrors;
-  }
-  const record = value as Record<string, unknown>;
-  return {
-    personalToWork: parseMirrorTotals(record["personalToWork"]),
-    workToPersonal: parseMirrorTotals(record["workToPersonal"]),
-  };
-}
-
-function parseMirrorTotals(value: unknown): MirrorTotals {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return { active: 0, excluded: 0, duplicateSuppressed: 0 };
-  }
-  const record = value as Record<string, unknown>;
-  return {
-    active: numberOrZero(record["active"]),
-    excluded: numberOrZero(record["excluded"]),
-    duplicateSuppressed: numberOrZero(record["duplicateSuppressed"]),
-  };
-}
-
-function numberOrZero(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
 function emptyAggregates(): SyncAggregates {
@@ -447,10 +388,8 @@ function emptyAggregates(): SyncAggregates {
     repaired: 0,
     failed: 0,
     converged: true,
-    mirrors: {
-      personalToWork: { active: 0, excluded: 0, duplicateSuppressed: 0 },
-      workToPersonal: { active: 0, excluded: 0, duplicateSuppressed: 0 },
-    },
+    destinations: {},
+    sources: {},
   };
 }
 
@@ -462,25 +401,20 @@ function syncAggregates(result: SyncReconcileResult): SyncAggregates {
     repaired: result.repaired,
     failed: result.failed,
     converged: result.converged,
-    mirrors: {
-      personalToWork: { ...result.mirrors.personalToWork },
-      workToPersonal: { ...result.mirrors.workToPersonal },
-    },
+    destinations: structuredClone(result.destinations),
+    sources: structuredClone(result.sources),
   };
 }
 
 function countOperations(operations: readonly ReconcileLog[]): OperationCount[] {
   const counts = new Map<string, OperationCount>();
   for (const entry of operations) {
-    const direction =
-      entry.sourceRole === "personal" && entry.destinationRole === "work"
-        ? "personalToWork"
-        : "workToPersonal";
-    const key = `${direction}\0${entry.operation}\0${entry.reason}`;
+    const destination = entry.destinationKey;
+    const key = `${destination}\0${entry.operation}\0${entry.reason}`;
     const existing = counts.get(key);
     if (existing === undefined) {
       counts.set(key, {
-        direction,
+        destination,
         operation: entry.operation,
         reason: entry.reason,
         count: 1,
@@ -490,9 +424,9 @@ function countOperations(operations: readonly ReconcileLog[]): OperationCount[] 
     }
   }
   return [...counts.values()].sort((left, right) => {
-    const direction = left.direction.localeCompare(right.direction);
-    if (direction !== 0) {
-      return direction;
+    const destination = left.destination.localeCompare(right.destination);
+    if (destination !== 0) {
+      return destination;
     }
     const operation = left.operation.localeCompare(right.operation);
     return operation === 0 ? left.reason.localeCompare(right.reason) : operation;

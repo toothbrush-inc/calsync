@@ -6,7 +6,7 @@ import {
   type Vault,
 } from "@dvd-toy-box/vault";
 
-import type { AccountRole } from "@calsync/engine";
+import type { AccountRole } from "./config.js";
 
 import {
   loadConfig,

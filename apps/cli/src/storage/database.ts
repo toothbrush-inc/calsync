@@ -4,9 +4,8 @@ import { dirname } from "node:path";
 import Database from "better-sqlite3";
 
 import type {
-  AccountRole,
+  CalendarKey,
   EventMapping,
-  ExclusionDirection,
   ExclusionSource,
   MappingStore,
   StoredExclusionKey,
@@ -14,12 +13,9 @@ import type {
   SyncStateStore,
 } from "@calsync/engine";
 
-export type {
-  EventMapping,
-  ExclusionDirection,
-  StoredExclusionKey,
-  StoredExclusionKeyword,
-} from "@calsync/engine";
+import type { AccountRole } from "../config.js";
+
+export type { EventMapping, StoredExclusionKey, StoredExclusionKeyword } from "@calsync/engine";
 
 export interface AccountRecord {
   tenantId: string;
@@ -39,22 +35,20 @@ interface AccountRow {
 
 interface MappingRow {
   mapping_key: string;
-  source_role: AccountRole;
-  source_event_id: string;
+  destination_key: CalendarKey;
   destination_event_id: string;
-  source_etag: string | null;
   destination_etag: string | null;
   updated_at: string;
 }
 
 interface ExclusionKeyRow {
-  direction: ExclusionDirection;
+  source_key: CalendarKey;
   value: string;
   created_at: string;
 }
 
 interface ExclusionKeywordRow {
-  direction: ExclusionDirection;
+  source_key: CalendarKey;
   keyword: string;
   created_at: string;
 }
@@ -273,25 +267,21 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
     this.db
       .prepare(
         `INSERT INTO event_mappings (
-           mapping_key, tenant_id, source_role, source_event_id, destination_event_id,
-           source_etag, destination_etag, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           mapping_key, tenant_id, destination_key, destination_event_id, destination_etag,
+           updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(mapping_key) DO UPDATE SET
            tenant_id = excluded.tenant_id,
-           source_role = excluded.source_role,
-           source_event_id = excluded.source_event_id,
+           destination_key = excluded.destination_key,
            destination_event_id = excluded.destination_event_id,
-           source_etag = excluded.source_etag,
            destination_etag = excluded.destination_etag,
            updated_at = excluded.updated_at`,
       )
       .run(
         mapping.mappingKey,
         tid,
-        mapping.sourceRole,
-        mapping.sourceEventId,
+        mapping.destinationKey,
         mapping.destinationEventId,
-        mapping.sourceEtag,
         mapping.destinationEtag,
         mapping.updatedAt,
       );
@@ -300,33 +290,23 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
   getMapping(mappingKey: string, tenantId?: string): EventMapping | null {
     const tid = tenantId ?? this.tenantId;
     const row = this.db
-      .prepare(
-        `SELECT mapping_key, tenant_id, source_role, source_event_id, destination_event_id,
-                source_etag, destination_etag, updated_at
-         FROM event_mappings WHERE mapping_key = ? AND tenant_id = ?`,
-      )
+      .prepare(`${MAPPING_COLUMNS} WHERE mapping_key = ? AND tenant_id = ?`)
       .get(mappingKey, tid) as MappingRow | undefined;
     return row === undefined ? null : mappingFromRow(row);
   }
 
-  listMappings(sourceRole?: AccountRole, tenantId?: string): EventMapping[] {
+  listMappings(destinationKey?: CalendarKey, tenantId?: string): EventMapping[] {
     const tid = tenantId ?? this.tenantId;
     const rows =
-      sourceRole === undefined
+      destinationKey === undefined
         ? (this.db
-            .prepare(
-              `SELECT mapping_key, tenant_id, source_role, source_event_id, destination_event_id,
-                      source_etag, destination_etag, updated_at
-               FROM event_mappings WHERE tenant_id = ? ORDER BY mapping_key`,
-            )
+            .prepare(`${MAPPING_COLUMNS} WHERE tenant_id = ? ORDER BY mapping_key`)
             .all(tid) as MappingRow[])
         : (this.db
             .prepare(
-              `SELECT mapping_key, tenant_id, source_role, source_event_id, destination_event_id,
-                      source_etag, destination_etag, updated_at
-               FROM event_mappings WHERE tenant_id = ? AND source_role = ? ORDER BY mapping_key`,
+              `${MAPPING_COLUMNS} WHERE tenant_id = ? AND destination_key = ? ORDER BY mapping_key`,
             )
-            .all(tid, sourceRole) as MappingRow[]);
+            .all(tid, destinationKey) as MappingRow[]);
     return rows.map(mappingFromRow);
   }
 
@@ -370,27 +350,27 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
     const tid = tenantId ?? this.tenantId;
     const rows = this.db
       .prepare(
-        `SELECT tenant_id, direction, value, created_at
+        `SELECT tenant_id, source_key, value, created_at
          FROM exclusion_keys
          WHERE tenant_id = ?
-         ORDER BY direction, value`,
+         ORDER BY source_key, value`,
       )
       .all(tid) as ExclusionKeyRow[];
     return rows.map((row) => ({
-      direction: row.direction,
+      sourceKey: row.source_key,
       value: row.value,
       createdAt: row.created_at,
     }));
   }
 
-  addExclusionKey(direction: ExclusionDirection, value: string, tenantId?: string): boolean {
+  addExclusionKey(sourceKey: CalendarKey, value: string, tenantId?: string): boolean {
     const tid = tenantId ?? this.tenantId;
     const result = this.db
       .prepare(
-        `INSERT OR IGNORE INTO exclusion_keys (tenant_id, value, direction, created_at)
+        `INSERT OR IGNORE INTO exclusion_keys (tenant_id, value, source_key, created_at)
          VALUES (?, ?, ?, ?)`,
       )
-      .run(tid, value, direction, new Date().toISOString());
+      .run(tid, value, sourceKey, new Date().toISOString());
     return result.changes > 0;
   }
 
@@ -406,41 +386,37 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
     const tid = tenantId ?? this.tenantId;
     const rows = this.db
       .prepare(
-        `SELECT tenant_id, direction, keyword, created_at
+        `SELECT tenant_id, source_key, keyword, created_at
          FROM exclusion_keywords
          WHERE tenant_id = ?
-         ORDER BY direction, keyword`,
+         ORDER BY source_key, keyword`,
       )
       .all(tid) as ExclusionKeywordRow[];
     return rows.map((row) => ({
-      direction: row.direction,
+      sourceKey: row.source_key,
       keyword: row.keyword,
       createdAt: row.created_at,
     }));
   }
 
-  addExclusionKeyword(direction: ExclusionDirection, keyword: string, tenantId?: string): boolean {
+  addExclusionKeyword(sourceKey: CalendarKey, keyword: string, tenantId?: string): boolean {
     const tid = tenantId ?? this.tenantId;
     const result = this.db
       .prepare(
-        `INSERT OR IGNORE INTO exclusion_keywords (tenant_id, direction, keyword, created_at)
+        `INSERT OR IGNORE INTO exclusion_keywords (tenant_id, source_key, keyword, created_at)
          VALUES (?, ?, ?, ?)`,
       )
-      .run(tid, direction, keyword, new Date().toISOString());
+      .run(tid, sourceKey, keyword, new Date().toISOString());
     return result.changes > 0;
   }
 
-  removeExclusionKeyword(
-    direction: ExclusionDirection,
-    keyword: string,
-    tenantId?: string,
-  ): boolean {
+  removeExclusionKeyword(sourceKey: CalendarKey, keyword: string, tenantId?: string): boolean {
     const tid = tenantId ?? this.tenantId;
     const result = this.db
       .prepare(
-        "DELETE FROM exclusion_keywords WHERE tenant_id = ? AND direction = ? AND keyword = ?",
+        "DELETE FROM exclusion_keywords WHERE tenant_id = ? AND source_key = ? AND keyword = ?",
       )
-      .run(tid, direction, keyword);
+      .run(tid, sourceKey, keyword);
     return result.changes > 0;
   }
 
@@ -503,25 +479,42 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
   }
 
   private migrate(): void {
-    const legacyTables = Object.entries(PRE_TENANT_COLUMNS).filter(([table]) =>
-      this.isPreTenantTable(table),
+    const preTenant = Object.keys(LEGACY_COPIES).filter((table) => this.isPreTenantTable(table));
+    const preKeyed = Object.keys(ROLE_KEYED_COLUMNS).filter(
+      (table) => !preTenant.includes(table) && this.hasColumn(table, ROLE_KEYED_COLUMNS[table]),
     );
     this.db.transaction(() => {
-      // Pre-tenant tables changed primary keys, so they are rebuilt: renamed
-      // aside, recreated with tenant_id, and their rows copied under 'default'.
-      for (const [table] of legacyTables) {
+      // Tables whose primary keys or columns changed are rebuilt: renamed
+      // aside, recreated, and their rows copied over. Pre-tenant rows land
+      // under 'default'; role-keyed rows get the calendar key they meant.
+      for (const table of preTenant) {
         this.db.exec(`ALTER TABLE ${table} RENAME TO ${table}_pre_tenant`);
+      }
+      for (const table of preKeyed) {
+        this.db.exec(`ALTER TABLE ${table} RENAME TO ${table}_pre_keys`);
       }
       this.createTables();
       this.addColumnIfMissing("accounts", "calendar_fingerprint", "TEXT");
-      for (const [table, columns] of legacyTables) {
-        this.db.exec(
-          `INSERT INTO ${table} (tenant_id, ${columns})
-           SELECT 'default', ${columns} FROM ${table}_pre_tenant;
-           DROP TABLE ${table}_pre_tenant;`,
-        );
+      for (const table of preTenant) {
+        this.copyLegacyRows(table, `${table}_pre_tenant`, "'default'");
+      }
+      for (const table of preKeyed) {
+        this.copyLegacyRows(table, `${table}_pre_keys`, "tenant_id");
       }
     })();
+  }
+
+  private copyLegacyRows(table: string, from: string, tenant: string): void {
+    const copy = LEGACY_COPIES[table];
+    if (copy === undefined) {
+      throw new Error(`No migration for table ${table}`);
+    }
+    this.db.exec(`${copy(from, tenant)}; DROP TABLE ${from};`);
+  }
+
+  private hasColumn(table: string, column: string | undefined): boolean {
+    const columns = this.db.pragma(`table_info(${table})`) as { name: string }[];
+    return columns.some((existing) => existing.name === column);
   }
 
   private addColumnIfMissing(table: string, column: string, type: string): void {
@@ -555,17 +548,19 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
         PRIMARY KEY (tenant_id, role)
       );
 
+      -- One busy block calsync wrote, by the calendar holding it. No source
+      -- event identifiers: a block merges any number of sources.
       CREATE TABLE IF NOT EXISTS event_mappings (
         mapping_key TEXT PRIMARY KEY,
         tenant_id TEXT NOT NULL,
-        source_role TEXT NOT NULL CHECK (source_role IN ('personal', 'work')),
-        source_event_id TEXT NOT NULL,
+        destination_key TEXT NOT NULL,
         destination_event_id TEXT NOT NULL,
-        source_etag TEXT,
         destination_etag TEXT,
-        updated_at TEXT NOT NULL,
-        UNIQUE (tenant_id, source_role, source_event_id)
+        updated_at TEXT NOT NULL
       );
+
+      CREATE INDEX IF NOT EXISTS event_mappings_destination
+        ON event_mappings (tenant_id, destination_key);
 
       CREATE TABLE IF NOT EXISTS sync_state (
         key TEXT PRIMARY KEY,
@@ -573,20 +568,21 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
         updated_at TEXT NOT NULL
       );
 
+      -- Exclusions belong to the source calendar whose events they hold back.
       CREATE TABLE IF NOT EXISTS exclusion_keys (
         tenant_id TEXT NOT NULL,
         value TEXT NOT NULL,
-        direction TEXT NOT NULL CHECK (direction IN ('personalToWork', 'workToPersonal')),
+        source_key TEXT NOT NULL,
         created_at TEXT NOT NULL,
         PRIMARY KEY (tenant_id, value)
       );
 
       CREATE TABLE IF NOT EXISTS exclusion_keywords (
         tenant_id TEXT NOT NULL,
-        direction TEXT NOT NULL CHECK (direction IN ('personalToWork', 'workToPersonal')),
+        source_key TEXT NOT NULL,
         keyword TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        PRIMARY KEY (tenant_id, direction, keyword)
+        PRIMARY KEY (tenant_id, source_key, keyword)
       );
 
       CREATE TABLE IF NOT EXISTS watch_channels (
@@ -605,16 +601,57 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
   }
 }
 
-/** Column lists (minus tenant_id) used to copy rows out of pre-tenant tables. */
-const PRE_TENANT_COLUMNS: Record<string, string> = {
-  accounts: "role, calendar_id, authorized_at, verified_at",
-  event_mappings:
-    "mapping_key, source_role, source_event_id, destination_event_id, source_etag, destination_etag, updated_at",
-  exclusion_keys: "value, direction, created_at",
-  exclusion_keywords: "direction, keyword, created_at",
-  watch_channels:
-    "role, calendar_id, channel_id, resource_id, token_hash, address, expires_at, created_at",
+/**
+ * The role-era column that marks a table as needing its rows re-keyed by
+ * calendar. Each direction had one source and one destination, so the
+ * conversion is exact.
+ */
+const ROLE_KEYED_COLUMNS: Record<string, string> = {
+  event_mappings: "source_role",
+  exclusion_keys: "direction",
+  exclusion_keywords: "direction",
 };
+
+/** A mapping sourced from one role's calendar sits on the other's. */
+const DESTINATION_OF_SOURCE_ROLE =
+  "CASE source_role WHEN 'personal' THEN 'work' ELSE 'personal' END";
+/** "personalToWork" held back personal events: the personal source's exclusion. */
+const SOURCE_OF_DIRECTION = "CASE direction WHEN 'personalToWork' THEN 'personal' ELSE 'work' END";
+
+/**
+ * Copies one legacy table's rows into its current shape. `tenant` is the SQL
+ * for each row's tenant: a literal for pre-tenant tables, the column otherwise.
+ */
+const LEGACY_COPIES: Record<string, (from: string, tenant: string) => string> = {
+  accounts: (from, tenant) =>
+    `INSERT INTO accounts (tenant_id, role, calendar_id, authorized_at, verified_at)
+     SELECT ${tenant}, role, calendar_id, authorized_at, verified_at FROM ${from}`,
+  event_mappings: (from, tenant) =>
+    `INSERT INTO event_mappings (
+       mapping_key, tenant_id, destination_key, destination_event_id, destination_etag, updated_at
+     )
+     SELECT mapping_key, ${tenant}, ${DESTINATION_OF_SOURCE_ROLE}, destination_event_id,
+            destination_etag, updated_at
+     FROM ${from}`,
+  exclusion_keys: (from, tenant) =>
+    `INSERT INTO exclusion_keys (tenant_id, value, source_key, created_at)
+     SELECT ${tenant}, value, ${SOURCE_OF_DIRECTION}, created_at FROM ${from}`,
+  exclusion_keywords: (from, tenant) =>
+    `INSERT INTO exclusion_keywords (tenant_id, source_key, keyword, created_at)
+     SELECT ${tenant}, ${SOURCE_OF_DIRECTION}, keyword, created_at FROM ${from}`,
+  watch_channels: (from, tenant) =>
+    `INSERT INTO watch_channels (
+       tenant_id, role, calendar_id, channel_id, resource_id, token_hash, address, expires_at,
+       created_at
+     )
+     SELECT ${tenant}, role, calendar_id, channel_id, resource_id, token_hash, address,
+            expires_at, created_at
+     FROM ${from}`,
+};
+
+const MAPPING_COLUMNS = `SELECT mapping_key, tenant_id, destination_key, destination_event_id,
+        destination_etag, updated_at
+ FROM event_mappings`;
 
 const WATCH_CHANNEL_COLUMNS = `SELECT tenant_id, role, calendar_id, channel_id, resource_id,
         token_hash, address, expires_at, created_at
@@ -647,10 +684,8 @@ function accountFromRow(row: AccountRow): AccountRecord {
 function mappingFromRow(row: MappingRow): EventMapping {
   return {
     mappingKey: row.mapping_key,
-    sourceRole: row.source_role,
-    sourceEventId: row.source_event_id,
+    destinationKey: row.destination_key,
     destinationEventId: row.destination_event_id,
-    sourceEtag: row.source_etag,
     destinationEtag: row.destination_etag,
     updatedAt: row.updated_at,
   };

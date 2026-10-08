@@ -1,8 +1,4 @@
-import {
-  parseExclusionKeywords,
-  parseOpaqueExclusionKey,
-  type ExclusionDirection,
-} from "@calsync/engine";
+import { parseExclusionKeywords, parseOpaqueExclusionKey, type CalendarKey } from "@calsync/engine";
 
 import type { AppConfig } from "./config.js";
 
@@ -12,7 +8,8 @@ export type ExclusionOrigin = "cli" | "env";
 export interface ExclusionItem {
   kind: ExclusionKind;
   value: string;
-  direction: ExclusionDirection;
+  /** The calendar whose events it holds back. */
+  source: CalendarKey;
 }
 
 export interface ExclusionChangeResult {
@@ -24,7 +21,7 @@ export interface ExclusionChangeResult {
 
 export interface ExclusionListEntry {
   value: string;
-  direction: ExclusionDirection;
+  source: CalendarKey;
   origin: ExclusionOrigin;
 }
 
@@ -34,12 +31,12 @@ export interface ExclusionSnapshot {
 }
 
 export interface ExclusionStore {
-  addExclusionKey(direction: ExclusionDirection, value: string): boolean;
+  addExclusionKey(sourceKey: CalendarKey, value: string): boolean;
   removeExclusionKey(value: string): boolean;
-  addExclusionKeyword(direction: ExclusionDirection, keyword: string): boolean;
-  removeExclusionKeyword(direction: ExclusionDirection, keyword: string): boolean;
-  listExclusionKeys(): readonly { direction: ExclusionDirection; value: string }[];
-  listExclusionKeywords(): readonly { direction: ExclusionDirection; keyword: string }[];
+  addExclusionKeyword(sourceKey: CalendarKey, keyword: string): boolean;
+  removeExclusionKeyword(sourceKey: CalendarKey, keyword: string): boolean;
+  listExclusionKeys(): readonly { sourceKey: CalendarKey; value: string }[];
+  listExclusionKeywords(): readonly { sourceKey: CalendarKey; keyword: string }[];
 }
 
 export interface ExclusionChangeInput {
@@ -48,10 +45,15 @@ export interface ExclusionChangeInput {
   from?: string | readonly string[];
 }
 
+/**
+ * Adds or removes exclusions. `sources` are the calendars whose events can
+ * be excluded: a keyword names one with `from`, an opaque key carries its own.
+ */
 export function changeExclusions(
   action: "add" | "remove",
   state: ExclusionStore,
   input: ExclusionChangeInput,
+  sources: readonly CalendarKey[],
   options: { allowMix?: boolean } = {},
 ): ExclusionChangeResult {
   const keyValues = asList(input.keys).map((key) => key.trim());
@@ -72,67 +74,57 @@ export function changeExclusions(
 
   const result = emptyExclusionChangeResult();
   if (hasKeywords) {
-    mergeExclusionChange(result, changeKeywordExclusions(action, state, keywords, fromValues));
+    mergeExclusionChange(
+      result,
+      changeKeywordExclusions(action, state, keywords, fromValues, sources),
+    );
   }
   if (hasKeys) {
     if (fromValues.length > 0 && !hasKeywords) {
-      throw new Error("--from is only used with --keyword; opaque keys include their direction");
+      throw new Error("--from is only used with --keyword; opaque keys include their calendar");
     }
-    mergeExclusionChange(result, changeKeyExclusions(action, state, keyValues));
+    mergeExclusionChange(result, changeKeyExclusions(action, state, keyValues, sources));
   }
   return result;
 }
 
 export function snapshotExclusions(config: AppConfig, state: ExclusionStore): ExclusionSnapshot {
   const storedKeys = new Map(
-    state.listExclusionKeys().map((row) => [`${row.direction}\0${row.value}`, row] as const),
+    state.listExclusionKeys().map((row) => [`${row.sourceKey}\0${row.value}`, row] as const),
   );
   const storedKeywords = new Map(
-    state.listExclusionKeywords().map((row) => [`${row.direction}\0${row.keyword}`, row] as const),
+    state.listExclusionKeywords().map((row) => [`${row.sourceKey}\0${row.keyword}`, row] as const),
   );
   const keywords: ExclusionListEntry[] = [];
   const keys: ExclusionListEntry[] = [];
-  for (const direction of ["personalToWork", "workToPersonal"] as const) {
-    const envKeywords =
-      direction === "personalToWork"
-        ? config.exclusions.personalToWorkKeywords
-        : config.exclusions.workToPersonalKeywords;
-    const envKeys =
-      direction === "personalToWork"
-        ? config.exclusions.personalToWork
-        : config.exclusions.workToPersonal;
+  for (const { key: source } of config.calendars.filter((calendar) => calendar.source)) {
     for (const row of storedKeywords.values()) {
-      if (row.direction === direction) {
-        keywords.push({ value: row.keyword, direction, origin: "cli" });
+      if (row.sourceKey === source) {
+        keywords.push({ value: row.keyword, source, origin: "cli" });
       }
     }
-    for (const keyword of envKeywords) {
-      if (!storedKeywords.has(`${direction}\0${keyword}`)) {
-        keywords.push({ value: keyword, direction, origin: "env" });
+    for (const keyword of config.exclusions.keywords[source] ?? []) {
+      if (!storedKeywords.has(`${source}\0${keyword}`)) {
+        keywords.push({ value: keyword, source, origin: "env" });
       }
     }
     for (const row of storedKeys.values()) {
-      if (row.direction === direction) {
-        keys.push({ value: row.value, direction, origin: "cli" });
+      if (row.sourceKey === source) {
+        keys.push({ value: row.value, source, origin: "cli" });
       }
     }
-    for (const value of envKeys) {
-      if (!storedKeys.has(`${direction}\0${value}`)) {
-        keys.push({ value, direction, origin: "env" });
+    for (const value of config.exclusions.keys[source] ?? []) {
+      if (!storedKeys.has(`${source}\0${value}`)) {
+        keys.push({ value, source, origin: "env" });
       }
     }
   }
   return { keywords, keys };
 }
 
-export function sourceRoleToDirection(value: string): ExclusionDirection {
-  if (value === "personal") {
-    return "personalToWork";
-  }
-  if (value === "work") {
-    return "workToPersonal";
-  }
-  throw new Error(`Invalid --from "${value}"; expected personal or work`);
+/** The source calendars of a config, the only ones an exclusion can name. */
+export function exclusionSources(config: AppConfig): CalendarKey[] {
+  return config.calendars.filter((calendar) => calendar.source).map((calendar) => calendar.key);
 }
 
 export function emptyExclusionChangeResult(): ExclusionChangeResult {
@@ -144,30 +136,34 @@ function changeKeywordExclusions(
   state: ExclusionStore,
   keywords: readonly string[],
   fromValues: readonly string[],
+  sources: readonly CalendarKey[],
 ): ExclusionChangeResult {
   if (keywords.length === 0) {
     throw new Error("Keyword must not be blank");
   }
-  const from = fromValues[0];
-  if (from === undefined) {
-    throw new Error("Use --from personal or --from work with --keyword");
+  const choices = sources.map((key) => `--from ${key}`).join(" or ");
+  const source = fromValues[0];
+  if (source === undefined) {
+    throw new Error(`Use ${choices} with --keyword`);
   }
   if (fromValues.length > 1) {
     throw new Error(
-      "Use --from once for a keyword batch; personal and work keywords need separate commands",
+      "Use --from once for a keyword batch; each calendar's keywords need a separate command",
     );
   }
-  const direction = sourceRoleToDirection(from);
+  if (!sources.includes(source)) {
+    throw new Error(`Invalid --from "${source}"; expected ${sources.join(" or ")}`);
+  }
   const result = emptyExclusionChangeResult();
   for (const keyword of keywords) {
-    const item: ExclusionItem = { kind: "keyword", value: keyword, direction };
+    const item: ExclusionItem = { kind: "keyword", value: keyword, source };
     if (action === "add") {
-      if (state.addExclusionKeyword(direction, keyword)) {
+      if (state.addExclusionKeyword(source, keyword)) {
         result.added.push(item);
       } else {
         result.alreadyPresent.push(item);
       }
-    } else if (state.removeExclusionKeyword(direction, keyword)) {
+    } else if (state.removeExclusionKeyword(source, keyword)) {
       result.removed.push(item);
     } else {
       result.missing.push(item);
@@ -180,16 +176,17 @@ function changeKeyExclusions(
   action: "add" | "remove",
   state: ExclusionStore,
   keyValues: readonly string[],
+  sources: readonly CalendarKey[],
 ): ExclusionChangeResult {
   const result = emptyExclusionChangeResult();
   for (const value of uniqueInOrder(keyValues)) {
     const item: ExclusionItem = {
       kind: "key",
       value,
-      direction: parseOpaqueExclusionKey(value),
+      source: parseOpaqueExclusionKey(value, sources),
     };
     if (action === "add") {
-      if (state.addExclusionKey(item.direction, value)) {
+      if (state.addExclusionKey(item.source, value)) {
         result.added.push(item);
       } else {
         result.alreadyPresent.push(item);

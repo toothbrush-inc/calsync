@@ -70,7 +70,7 @@ Everything below the two calendars and the sync status lives under a collapsed
 "Advanced" block.
 
 - **Exclusions** mirror `calsync exclude` and the MCP exclusion tools. Each
-  direction lists its keywords and excluded events with its own keyword box;
+  source calendar lists its keywords and excluded events with its own keyword box;
   `.env` entries are read-only, CLI-managed ones have a remove button, and a
   paste box takes opaque keys. `GET /api/exclusions` returns the
   `exclude list` snapshot; `POST /api/exclusions` takes

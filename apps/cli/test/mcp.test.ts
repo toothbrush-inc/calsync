@@ -60,9 +60,13 @@ describe("MCP tool handlers", () => {
         repaired: 0,
         failed: 0,
         converged: true,
-        mirrors: {
-          personalToWork: { active: 4, excluded: 1, duplicateSuppressed: 0 },
-          workToPersonal: { active: 3, excluded: 0, duplicateSuppressed: 2 },
+        destinations: {
+          work: { active: 4, duplicateSuppressed: 0 },
+          personal: { active: 3, duplicateSuppressed: 2 },
+        },
+        sources: {
+          personal: { excluded: 1 },
+          work: { excluded: 0 },
         },
         access_token: "ya29.secret-token",
         sourceTitle: "Dentist",
@@ -96,9 +100,13 @@ describe("MCP tool handlers", () => {
       created: 2,
       deleted: 1,
       lastFullSyncAt: "2026-08-14T12:00:00.000Z",
-      mirrors: {
-        personalToWork: { active: 4, excluded: 1, duplicateSuppressed: 0 },
-        workToPersonal: { active: 3, excluded: 0, duplicateSuppressed: 2 },
+      destinations: {
+        work: { active: 4, duplicateSuppressed: 0 },
+        personal: { active: 3, duplicateSuppressed: 2 },
+      },
+      sources: {
+        personal: { excluded: 1 },
+        work: { excluded: 0 },
       },
     });
     expect(json).not.toContain("ya29");
@@ -128,7 +136,7 @@ describe("MCP tool handlers", () => {
       return;
     }
     expect(result.data.lastSync?.created).toBe(7);
-    expect(result.data.lastSync?.mirrors.personalToWork.active).toBe(7);
+    expect(result.data.lastSync?.destinations["work"]?.active).toBe(7);
     expect(result.data.lastSync?.lastFullSyncAt).toBe("2026-09-22T00:00:00.000Z");
   });
 
@@ -241,7 +249,7 @@ describe("MCP tool handlers", () => {
     expect(result.error.code).toBe("connect_unavailable");
   });
 
-  it("previews sync as directional counts and omits titles unless the dangerous flag is on", async () => {
+  it("previews sync as per-calendar counts and omits titles unless the dangerous flag is on", async () => {
     const once = vi.fn((options?: Parameters<SyncService["once"]>[0]) => {
       options?.onOperation?.(
         operation("personal", "work", "create", "destination-missing", "Private planning"),
@@ -267,16 +275,16 @@ describe("MCP tool handlers", () => {
     expect(once.mock.calls[0]?.[0]).not.toHaveProperty("lockTimeoutMs");
     expect(preview.data.operations).toEqual([
       {
-        direction: "personalToWork",
-        operation: "create",
-        reason: "destination-missing",
-        count: 2,
-      },
-      {
-        direction: "workToPersonal",
+        destination: "personal",
         operation: "update",
         reason: "destination-drifted",
         count: 1,
+      },
+      {
+        destination: "work",
+        operation: "create",
+        reason: "destination-missing",
+        count: 2,
       },
     ]);
     const defaultJson = JSON.stringify(toJsonPayload(preview.data));
@@ -390,8 +398,8 @@ describe("MCP tool handlers", () => {
     }
     expect(listed.data.keywords).toEqual(
       expect.arrayContaining([
-        { value: "dentist", direction: "personalToWork", origin: "cli" },
-        { value: "focus time", direction: "personalToWork", origin: "env" },
+        { value: "dentist", source: "personal", origin: "cli" },
+        { value: "focus time", source: "personal", origin: "env" },
       ]),
     );
     expect(listed.data.keys.map((entry) => entry.value)).toEqual(
@@ -404,7 +412,7 @@ describe("MCP tool handlers", () => {
       return;
     }
     expect(removed.data.removed).toEqual([
-      { kind: "key", value: PERSONAL_KEY, direction: "personalToWork" },
+      { kind: "key", value: PERSONAL_KEY, source: "personal" },
     ]);
   });
 
@@ -421,7 +429,7 @@ describe("MCP tool handlers", () => {
     expect(result.data).toMatchObject({
       dryRun: false,
       created: 1,
-      mirrors: { personalToWork: { active: 1 } },
+      destinations: { work: { active: 1 } },
     });
     expect(JSON.stringify(toJsonPayload(result.data))).not.toContain("title");
   });
@@ -697,9 +705,13 @@ function storedAggregates(created: number): Record<string, unknown> {
     repaired: 0,
     failed: 0,
     converged: true,
-    mirrors: {
-      personalToWork: { active: created, excluded: 0, duplicateSuppressed: 0 },
-      workToPersonal: { active: 0, excluded: 0, duplicateSuppressed: 0 },
+    destinations: {
+      work: { active: created, duplicateSuppressed: 0 },
+      personal: { active: 0, duplicateSuppressed: 0 },
+    },
+    sources: {
+      personal: { excluded: 0 },
+      work: { excluded: 0 },
     },
   };
 }
@@ -707,6 +719,10 @@ function storedAggregates(created: number): Record<string, unknown> {
 function configFixture(tenantId = "default"): AppConfig {
   return {
     tenantId,
+    calendars: [
+      { key: "personal", calendarId: "personal@example.com", source: true, destination: true },
+      { key: "work", calendarId: "work@example.com", source: true, destination: true },
+    ],
     accounts: {
       personal: { tenantId, role: "personal", calendarId: "personal@example.com" },
       work: { tenantId, role: "work", calendarId: "work@example.com" },
@@ -715,10 +731,8 @@ function configFixture(tenantId = "default"): AppConfig {
     window: { pastDays: 30, futureDays: 365 },
     timezone: "UTC",
     exclusions: {
-      personalToWork: [],
-      workToPersonal: [],
-      personalToWorkKeywords: ["focus time"],
-      workToPersonalKeywords: [],
+      keys: { personal: [], work: [] },
+      keywords: { personal: ["focus time"], work: [] },
     },
   };
 }
@@ -732,8 +746,8 @@ function operation(
 ): ReconcileLog {
   return {
     operation: operationName,
-    sourceRole,
-    destinationRole,
+    destinationKey: destinationRole,
+    sourceKeys: [sourceRole],
     reason,
     sourceTitles: [sourceTitle],
     timeRange: {
@@ -763,17 +777,13 @@ function syncResult(
     repaired: values.repaired ?? 0,
     failed: values.failed ?? 0,
     converged: values.converged ?? true,
-    mirrors: {
-      personalToWork: {
-        active: values.personalActive ?? 0,
-        excluded: 0,
-        duplicateSuppressed: 0,
-      },
-      workToPersonal: {
-        active: values.workActive ?? 0,
-        excluded: 0,
-        duplicateSuppressed: 0,
-      },
+    destinations: {
+      work: { active: values.personalActive ?? 0, duplicateSuppressed: 0 },
+      personal: { active: values.workActive ?? 0, duplicateSuppressed: 0 },
+    },
+    sources: {
+      personal: { excluded: 0 },
+      work: { excluded: 0 },
     },
   };
 }

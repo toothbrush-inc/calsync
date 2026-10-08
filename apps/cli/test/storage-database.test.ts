@@ -30,10 +30,8 @@ describe("StateDatabase", () => {
     database.upsertAccount("personal", "acme-calendar");
     database.putMapping({
       mappingKey: "acme-mapping-key",
-      sourceRole: "work",
-      sourceEventId: "source-id",
+      destinationKey: "work",
       destinationEventId: "destination-id",
-      sourceEtag: null,
       destinationEtag: null,
       updatedAt: "2026-08-10T20:00:00.000Z",
     });
@@ -108,8 +106,9 @@ describe("StateDatabase", () => {
         tenantId: "default",
         calendarId: "primary",
       });
+      // Sourced from work, so the block sits on personal.
       expect(database.getMapping("legacy-key")).toMatchObject({
-        sourceRole: "work",
+        destinationKey: "personal",
         destinationEventId: "destination-id",
       });
       // Re-opening must not attempt the rebuild again.
@@ -122,15 +121,82 @@ describe("StateDatabase", () => {
     }
   });
 
+  it("re-keys role-era mappings and exclusions by calendar, keeping their meaning", () => {
+    const directory = mkdtempSync(join(tmpdir(), "calsync-role-keyed-"));
+    const path = join(directory, "state.sqlite");
+    const legacy = new Database(path);
+    legacy.exec(`
+      CREATE TABLE event_mappings (
+        mapping_key TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        source_role TEXT NOT NULL CHECK (source_role IN ('personal', 'work')),
+        source_event_id TEXT NOT NULL,
+        destination_event_id TEXT NOT NULL,
+        source_etag TEXT,
+        destination_etag TEXT,
+        updated_at TEXT NOT NULL,
+        UNIQUE (tenant_id, source_role, source_event_id)
+      );
+      CREATE TABLE exclusion_keys (
+        tenant_id TEXT NOT NULL,
+        value TEXT NOT NULL,
+        direction TEXT NOT NULL CHECK (direction IN ('personalToWork', 'workToPersonal')),
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, value)
+      );
+      CREATE TABLE exclusion_keywords (
+        tenant_id TEXT NOT NULL,
+        direction TEXT NOT NULL CHECK (direction IN ('personalToWork', 'workToPersonal')),
+        keyword TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, direction, keyword)
+      );
+      INSERT INTO event_mappings VALUES
+        ('block-on-work', 'acme', 'personal', 'k1', 'dest-1', NULL, '"e1"', '2026-08-10T20:00:00.000Z'),
+        ('block-on-personal', 'acme', 'work', 'k2', 'dest-2', NULL, NULL, '2026-08-10T20:00:00.000Z');
+      INSERT INTO exclusion_keys VALUES
+        ('acme', 'calsync-exclude:v1:p2w:occ:x', 'personalToWork', '2026-08-10T20:00:00.000Z');
+      INSERT INTO exclusion_keywords VALUES
+        ('acme', 'workToPersonal', 'confidential', '2026-08-10T20:00:00.000Z');
+    `);
+    legacy.close();
+
+    const database = new StateDatabase(path, "acme");
+    try {
+      expect(database.listMappings("work")).toEqual([
+        expect.objectContaining({
+          mappingKey: "block-on-work",
+          destinationEventId: "dest-1",
+          destinationEtag: '"e1"',
+        }),
+      ]);
+      expect(database.listMappings("personal").map((mapping) => mapping.mappingKey)).toEqual([
+        "block-on-personal",
+      ]);
+      expect(database.listExclusionKeys()).toEqual([
+        expect.objectContaining({ sourceKey: "personal", value: "calsync-exclude:v1:p2w:occ:x" }),
+      ]);
+      expect(database.listExclusionKeywords()).toEqual([
+        expect.objectContaining({ sourceKey: "work", keyword: "confidential" }),
+      ]);
+      // A third calendar's keys fit the new columns.
+      expect(database.addExclusionKeyword("calendar-family", "soccer")).toBe(true);
+      const reopened = new StateDatabase(path, "acme");
+      expect(reopened.listMappings()).toHaveLength(2);
+      reopened.close();
+    } finally {
+      database.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("upserts mappings and sync state for reconciliation consumers", () => {
     const database = new StateDatabase(":memory:");
 
     database.putMapping({
       mappingKey: "opaque-mapping-key",
-      sourceRole: "work",
-      sourceEventId: "source-id",
+      destinationKey: "work",
       destinationEventId: "destination-id",
-      sourceEtag: "source-v1",
       destinationEtag: null,
       updatedAt: "2026-08-10T20:00:00.000Z",
     });
@@ -141,8 +207,7 @@ describe("StateDatabase", () => {
     });
 
     expect(database.getMapping("opaque-mapping-key")).toMatchObject({
-      sourceRole: "work",
-      sourceEventId: "source-id",
+      destinationKey: "work",
       destinationEventId: "destination-id",
     });
     expect(database.listMappings("work")).toHaveLength(1);
@@ -157,16 +222,16 @@ describe("StateDatabase", () => {
     const database = new StateDatabase(":memory:");
     const key = `calsync-exclude:v1:w2p:series:${"c".repeat(43)}`;
 
-    expect(database.addExclusionKeyword("personalToWork", "dentist")).toBe(true);
-    expect(database.addExclusionKeyword("personalToWork", "dentist")).toBe(false);
-    expect(database.addExclusionKey("workToPersonal", key)).toBe(true);
+    expect(database.addExclusionKeyword("personal", "dentist")).toBe(true);
+    expect(database.addExclusionKeyword("personal", "dentist")).toBe(false);
+    expect(database.addExclusionKey("work", key)).toBe(true);
     expect(database.listExclusionKeywords()).toEqual([
-      expect.objectContaining({ direction: "personalToWork", keyword: "dentist" }),
+      expect.objectContaining({ sourceKey: "personal", keyword: "dentist" }),
     ]);
     expect(database.listExclusionKeys()).toEqual([
-      expect.objectContaining({ direction: "workToPersonal", value: key }),
+      expect.objectContaining({ sourceKey: "work", value: key }),
     ]);
-    expect(database.removeExclusionKeyword("personalToWork", "dentist")).toBe(true);
+    expect(database.removeExclusionKeyword("personal", "dentist")).toBe(true);
     expect(database.removeExclusionKey(key)).toBe(true);
     expect(database.listExclusionKeywords()).toEqual([]);
     expect(database.listExclusionKeys()).toEqual([]);

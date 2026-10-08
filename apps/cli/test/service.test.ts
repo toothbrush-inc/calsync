@@ -361,6 +361,10 @@ describe("sync process lock", () => {
     const state = new StateDatabase(":memory:");
     const config: AppConfig = {
       tenantId: "default",
+      calendars: [
+        { key: "personal", calendarId: "personal-calendar", source: true, destination: true },
+        { key: "work", calendarId: "work-calendar", source: true, destination: true },
+      ],
       accounts: {
         personal: { tenantId: "default", role: "personal", calendarId: "personal-calendar" },
         work: { tenantId: "default", role: "work", calendarId: "work-calendar" },
@@ -369,10 +373,8 @@ describe("sync process lock", () => {
       window: { pastDays: 30, futureDays: 365 },
       timezone: "UTC",
       exclusions: {
-        personalToWork: [],
-        workToPersonal: [],
-        personalToWorkKeywords: [],
-        workToPersonalKeywords: [],
+        keys: { personal: [], work: [] },
+        keywords: { personal: [], work: [] },
       },
     };
     const client: CalendarAPI = {
@@ -483,7 +485,7 @@ describe("sync process lock", () => {
   it("applies CLI-stored title keywords on the next sync pass", async () => {
     const directory = mkdtempSync(join(tmpdir(), "calsync-stored-exclude-"));
     const state = new StateDatabase(":memory:");
-    state.addExclusionKeyword("personalToWork", "medical");
+    state.addExclusionKeyword("personal", "medical");
     const personal = new MemoryCalendar([
       {
         id: "private-source-id",
@@ -501,7 +503,8 @@ describe("sync process lock", () => {
 
     const result = await service.once({ dryRun: true });
     expect(result.created).toBe(0);
-    expect(result.mirrors.personalToWork).toMatchObject({ active: 0, excluded: 1 });
+    expect(result.destinations["work"]).toMatchObject({ active: 0 });
+    expect(result.sources["personal"]).toMatchObject({ excluded: 1 });
     expect(work.insertedIds).toEqual([]);
     state.close();
     rmSync(directory, { recursive: true });
@@ -539,10 +542,8 @@ describe("incremental sync orchestration", () => {
 
     runtime.state.putMapping({
       mappingKey: "mapping",
-      sourceRole: "work",
-      sourceEventId: "source",
+      destinationKey: "personal",
       destinationEventId: "managed-destination",
-      sourceEtag: null,
       destinationEtag: '"managed-v1"',
       updatedAt: new Date().toISOString(),
     });
@@ -560,10 +561,8 @@ describe("incremental sync orchestration", () => {
     await runtime.service.once();
     runtime.state.putMapping({
       mappingKey: "mapping",
-      sourceRole: "work",
-      sourceEventId: "source",
+      destinationKey: "personal",
       destinationEventId: "managed-destination",
-      sourceEtag: null,
       destinationEtag: '"managed-v1"',
       updatedAt: new Date().toISOString(),
     });
@@ -1428,6 +1427,10 @@ function idleCalendar(): CalendarAPI {
 function testConfig(): AppConfig {
   return {
     tenantId: "default",
+    calendars: [
+      { key: "personal", calendarId: "personal-calendar", source: true, destination: true },
+      { key: "work", calendarId: "work-calendar", source: true, destination: true },
+    ],
     accounts: {
       personal: { tenantId: "default", role: "personal", calendarId: "personal-calendar" },
       work: { tenantId: "default", role: "work", calendarId: "work-calendar" },
@@ -1436,10 +1439,8 @@ function testConfig(): AppConfig {
     window: { pastDays: 30, futureDays: 365 },
     timezone: "UTC",
     exclusions: {
-      personalToWork: [],
-      workToPersonal: [],
-      personalToWorkKeywords: [],
-      workToPersonalKeywords: [],
+      keys: { personal: [], work: [] },
+      keywords: { personal: [], work: [] },
     },
   };
 }
