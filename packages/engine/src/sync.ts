@@ -116,12 +116,20 @@ export class SyncEngine {
     const pendingTokens: Record<CalendarKey, string> = {};
     const ownDeletions = readOwnDeletions(this.syncState, config, this.config.tenantId);
     let relevantChange = false;
-    for (const calendar of config.calendars) {
-      const client = clients[calendar.key];
-      if (client === undefined) {
-        throw new Error(`No calendar client for "${calendar.key}"`);
-      }
-      const poll = await this.pollChanges(calendar.key, calendar.calendarId, client, options);
+    // Independent per calendar, so a wake costs one round-trip, not one per calendar.
+    const polls = await Promise.all(
+      config.calendars.map(async (calendar) => {
+        const client = clients[calendar.key];
+        if (client === undefined) {
+          throw new Error(`No calendar client for "${calendar.key}"`);
+        }
+        return {
+          calendar,
+          poll: await this.pollChanges(calendar.key, calendar.calendarId, client, options),
+        };
+      }),
+    );
+    for (const { calendar, poll } of polls) {
       pendingTokens[calendar.key] = poll.changes.nextSyncToken;
       if (poll.invalidToken) {
         reason = "invalid-token";

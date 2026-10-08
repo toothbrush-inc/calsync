@@ -45,6 +45,7 @@ import { StateDatabase, type CalendarRecord, type GoogleAccountRecord } from "./
 import {
   calendarLabel,
   calendarLabels,
+  isSynced,
   resolveAccountRef,
   resolveAvailableRef,
   resolveCalendarRef,
@@ -309,14 +310,10 @@ function addAccountCommands(
           const email = entry.email ?? entry.slot;
           process.stdout.write(`${email}:\n`);
           const available = await accounts.auth.availableCalendars(entry.slot);
+          // Read after listing, which resolves stored aliases.
+          const current = accounts.state.listCalendars();
           for (const option of available) {
-            const connected = synced.some(
-              (record) =>
-                record.calendarId.toLowerCase() === option.calendarId.toLowerCase() ||
-                (option.primary &&
-                  record.account === entry.slot &&
-                  record.calendarId === "primary"),
-            );
+            const connected = isSynced(option, current);
             const ref = option.primary ? email : `${email}/${option.name}`;
             const use = connected
               ? "synced"

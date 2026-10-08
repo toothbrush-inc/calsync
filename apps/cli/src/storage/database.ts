@@ -450,9 +450,19 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
   }
 
   /** Marks a calendar verified and fills in what the check learned about it. */
+  /**
+   * Records a passing check. `resolvedId` replaces the "primary" alias a role
+   * calendar was stored under with the id Google resolves it to, so the
+   * calendar compares equal to itself however it is reached.
+   */
   verifyCalendar(
     key: CalendarKey,
-    details: { fingerprint?: string | undefined; name?: string | null; accessRole?: string | null },
+    details: {
+      fingerprint?: string | undefined;
+      name?: string | null;
+      accessRole?: string | null;
+      resolvedId?: string | undefined;
+    },
     now = new Date(),
     tenantId?: string,
   ): void {
@@ -472,7 +482,11 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
              ELSE COALESCE(?, calendar_fingerprint)
            END,
            name = COALESCE(?, name),
-           access_role = COALESCE(?, access_role)
+           access_role = COALESCE(?, access_role),
+           calendar_id = CASE
+             WHEN calendar_id = 'primary' AND ? IS NOT NULL THEN ?
+             ELSE calendar_id
+           END
          WHERE tenant_id = ? AND calendar_key = ?`,
       )
       .run(
@@ -481,6 +495,8 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
         details.fingerprint ?? null,
         details.name ?? null,
         details.accessRole ?? null,
+        details.resolvedId ?? null,
+        details.resolvedId ?? null,
         tid,
         key,
       );
@@ -498,6 +514,23 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
     const tid = tenantId ?? this.tenantId;
     const rows = this.db
       .prepare(`${CALENDAR_COLUMNS} WHERE tenant_id = ? ORDER BY ${CALENDAR_ORDER}`)
+      .all(tid) as CalendarRow[];
+    return rows.map(calendarFromRow);
+  }
+
+  /**
+   * Calendars a check has not resolved yet: a role calendar still under the
+   * "primary" alias, or one written before calsync kept fingerprints. Until
+   * it is, a second copy of it would get past the duplicate check.
+   */
+  listUnresolvedCalendars(tenantId?: string): CalendarRecord[] {
+    const tid = tenantId ?? this.tenantId;
+    const rows = this.db
+      .prepare(
+        `${CALENDAR_COLUMNS} WHERE tenant_id = ?
+           AND (calendar_id = 'primary' OR calendar_fingerprint IS NULL)
+         ORDER BY ${CALENDAR_ORDER}`,
+      )
       .all(tid) as CalendarRow[];
     return rows.map(calendarFromRow);
   }
@@ -612,12 +645,13 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
     fingerprint: string | undefined,
     now = new Date(),
     tenantId?: string,
+    resolvedId?: string,
   ): string | undefined {
     const tid = tenantId ?? this.tenantId;
     return this.db
       .transaction((): string | undefined => {
         this.verifyGoogleAccount(role, null, now, tid);
-        this.verifyCalendar(role, { fingerprint }, now, tid);
+        this.verifyCalendar(role, { fingerprint, resolvedId }, now, tid);
         return fingerprint === undefined
           ? undefined
           : this.calendarConflict(fingerprint, role, tid);

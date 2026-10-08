@@ -122,6 +122,16 @@ export function calendarFingerprint(
         .digest("hex");
 }
 
+/**
+ * The id to store for a calendar Google just resolved: "primary" becomes the
+ * account's real calendar id; any other id is kept as given.
+ */
+function storedCalendarId(entry: calendar_v3.Schema$CalendarListEntry, calendarId: string): string {
+  return calendarId === "primary" && typeof entry.id === "string" && entry.id !== ""
+    ? entry.id
+    : calendarId;
+}
+
 export interface LogoutResult {
   removed: boolean;
   /** Another sign-in on this host is the same Google account, so Google was not asked to revoke. */
@@ -503,7 +513,11 @@ export class GoogleAuthService {
       if (account === null) {
         // First passing check is what records the account and, once both
         // roles have one, makes the daemon adopt the tenant: refuse here.
-        const adoption = this.state.adoptAccount(role, calendarId, fingerprint);
+        const adoption = this.state.adoptAccount(
+          role,
+          storedCalendarId(entry, calendarId),
+          fingerprint,
+        );
         if (!adoption.adopted) {
           return {
             role,
@@ -518,7 +532,13 @@ export class GoogleAuthService {
           };
         }
       } else {
-        conflictsWith = this.state.verifyAccount(role, fingerprint);
+        conflictsWith = this.state.verifyAccount(
+          role,
+          fingerprint,
+          undefined,
+          undefined,
+          storedCalendarId(entry, calendarId),
+        );
       }
       return {
         role,
@@ -692,6 +712,8 @@ export class GoogleAuthService {
 
   /** Every calendar the account in `slot` can see, with what calsync could do with it. */
   async availableCalendars(slot: string): Promise<AvailableCalendar[]> {
+    // Resolved first, so a synced calendar is recognised by its id alone.
+    await this.resolveStoredCalendars();
     const api = await this.calendarApi(slot);
     const calendars: AvailableCalendar[] = [];
     let pageToken: string | undefined;
@@ -761,16 +783,9 @@ export class GoogleAuthService {
       );
     }
     const resolvedId = typeof entry.id === "string" && entry.id !== "" ? entry.id : calendarId;
-    // A role's calendar is stored by its alias, "primary"; it is the same
-    // calendar as this account's primary, whatever its fingerprint says.
-    const role = this.state
-      .listCalendars()
-      .find((calendar) => calendar.account === slot && calendar.calendarId === "primary");
-    if (role !== undefined && entry.primary === true) {
-      throw new AuthenticationError(
-        calendarRefusalMessage({ added: false, reason: "duplicate", key: role.key }),
-      );
-    }
+    // Every stored calendar resolved, so the duplicate check below sees this
+    // one however it was first reached.
+    await this.resolveStoredCalendars();
     const key = calendarKeyFor(resolvedId);
     const existing = this.state.getCalendar(key);
     if (existing !== null && existing.account !== slot) {
@@ -820,6 +835,13 @@ export class GoogleAuthService {
     }
   }
 
+  /** Checks the calendars no check has resolved yet, which fills in their ids and fingerprints. */
+  private async resolveStoredCalendars(): Promise<void> {
+    await Promise.all(
+      this.state.listUnresolvedCalendars().map((calendar) => this.checkCalendar(calendar)),
+    );
+  }
+
   /** Checks one connected calendar is still reachable with the access its roles need. */
   async checkCalendar(calendar: CalendarRecord): Promise<CalendarStatus> {
     try {
@@ -845,7 +867,10 @@ export class GoogleAuthService {
         fingerprint,
         name: entry.summaryOverride ?? entry.summary ?? null,
         accessRole: accessRole ?? null,
+        resolvedId: storedCalendarId(entry, calendar.calendarId),
       });
+      // It also proves the sign-in works, which status then need not check again.
+      this.state.verifyGoogleAccount(calendar.account, null);
       const refreshed = this.state.getCalendar(calendar.key) ?? calendar;
       const conflictsWith =
         fingerprint === undefined
@@ -933,7 +958,11 @@ export class GoogleAuthService {
       }
       const previous = await this.tokens.getRefreshToken(role).catch(() => null);
       await this.tokens.setRefreshToken(role, refreshToken);
-      const adoption = this.state.adoptAccount(role, calendarId, fingerprint);
+      const adoption = this.state.adoptAccount(
+        role,
+        storedCalendarId(entry, calendarId),
+        fingerprint,
+      );
       if (!adoption.adopted) {
         // Lost a race: put back the sign-in other calendars may still use.
         await (previous === null

@@ -26,6 +26,7 @@ import {
 } from "../exclusions.js";
 import {
   calendarLabel,
+  isSynced,
   resolveAvailableRef,
   resolveCalendarRef,
   withStoredCalendars,
@@ -308,16 +309,12 @@ export async function handleListCalendars(
       const email = entry.email ?? entry.slot;
       // One account that cannot list (signed out, say) leaves the others' lists.
       const options = await accounts.auth.availableCalendars(entry.slot).catch(() => []);
+      // Read after listing, which resolves stored aliases.
+      const synced = accounts.state.listCalendars();
       for (const option of options) {
         available.push({
           calendar: option.primary ? email : `${email}/${option.name}`,
-          synced: stored.some(
-            (calendar) =>
-              calendar.calendarId.toLowerCase() === option.calendarId.toLowerCase() ||
-              (option.primary &&
-                calendar.account === entry.slot &&
-                calendar.calendarId === "primary"),
-          ),
+          synced: isSynced(option, synced),
           can_receive: option.writable,
           can_share: option.readable,
         });

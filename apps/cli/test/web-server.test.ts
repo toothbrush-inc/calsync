@@ -178,8 +178,14 @@ function fakeRuntime(tenantId: string, overrides: Partial<WebTenantRuntime> = {}
       runtime.signIns.push(account);
       return Promise.resolve({ status: "adopted" as const, account });
     },
-    availableCalendars: () =>
-      Promise.resolve([
+    availableCalendars: (slot) => {
+      // Listing resolves a role calendar's "primary" alias first, as the real one does.
+      runtime.calendars = runtime.calendars.map((calendar) =>
+        calendar.account === slot && calendar.calendarId === "primary"
+          ? { ...calendar, calendarId: "primary-id@example.com" }
+          : calendar,
+      );
+      return Promise.resolve([
         {
           calendarId: "primary-id@example.com",
           name: "primary-id@example.com",
@@ -196,7 +202,8 @@ function fakeRuntime(tenantId: string, overrides: Partial<WebTenantRuntime> = {}
           writable: false,
           readable: true,
         },
-      ]),
+      ]);
+    },
     connectCalendar: (slot, calendarId, roles) => {
       const added = calendarRecord(tenantId, "cal-team", slot, calendarId, {
         name: "Team",
@@ -634,6 +641,35 @@ describe("web onboarding server", () => {
     }
   });
 
+  it("asks Google about a sign-in only when none of its calendars just checked out", async () => {
+    const checked: string[] = [];
+    const { base, server } = await startServer({
+      runtimeFor: (tenantId) =>
+        fakeRuntime(tenantId, {
+          checkAccount: (slot) => {
+            checked.push(slot);
+            return Promise.resolve({ slot, email: null, valid: false, message: "revoked" });
+          },
+          checkCalendar: (calendar) =>
+            Promise.resolve(
+              calendar.account === "work"
+                ? { calendar, valid: false, message: "not authorized" }
+                : { calendar, valid: true, message: "readable and writable" },
+            ),
+        }),
+    });
+    try {
+      const status = (await (await fetch(`${base}/api/status`)).json()) as WebStatusView;
+      expect(checked).toEqual(["work"]);
+      expect(status.signIns.map(({ slot, valid, calendars }) => [slot, valid, calendars])).toEqual([
+        ["personal", true, 1],
+        ["work", false, 1],
+      ]);
+    } finally {
+      await server.close();
+    }
+  });
+
   it("is not syncing until one calendar shares busy time and another receives it", async () => {
     const { base, server } = await startServer({
       runtimeFor: (tenantId) => {
@@ -694,7 +730,7 @@ describe("web onboarding server", () => {
         await fetch(`${base}/api/calendars/available?account=work`)
       ).json()) as { calendars: { name: string; synced: boolean }[] };
       expect(available.calendars.map((entry) => [entry.name, entry.synced])).toEqual([
-        // The role's own calendar is stored as "primary", and is that account's primary.
+        // The role's own calendar, stored as "primary" until listing resolved it.
         ["primary-id@example.com", true],
         ["Team", false],
       ]);
