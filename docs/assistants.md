@@ -52,7 +52,7 @@ sign-in is recorded on the next `get_status`.
 | `get_status`       | Checks every sign-in and calendar; last-sync aggregates                     | Reads                                     |
 | `connect_account`  | Starts signing in another Google account and returns a browser URL          | Writes a token to the vault after consent |
 | `list_calendars`   | Synced calendars; with `available=true`, every calendar that could be added | Reads                                     |
-| `add_calendar`     | Syncs one more calendar (up to six), optionally share- or receive-only      | Writes calendar settings                  |
+| `add_calendar`     | Syncs one more calendar (up to six), sharing and receiving busy time        | Writes calendar settings                  |
 | `remove_calendar`  | Stops syncing a calendar and deletes the busy blocks written for it         | Writes mirrors                            |
 | `connect_provider` | Re-authorizes the original `personal` or `work` sign-in                     | Writes a token to the vault after consent |
 | `preview_sync`     | Dry-runs one reconciliation and returns counts by calendar and operation    | Reads                                     |

@@ -328,8 +328,6 @@ export async function handleListCalendars(
 
 export interface AddCalendarInput {
   calendar: string;
-  share_only?: boolean | undefined;
-  receive_only?: boolean | undefined;
 }
 
 export async function handleAddCalendar(
@@ -340,19 +338,13 @@ export async function handleAddCalendar(
   if (accounts === undefined) {
     return unavailable("calendars_unavailable", "This server cannot add calendars");
   }
-  if (input.share_only === true && input.receive_only === true) {
-    return unavailable("invalid_roles", "Use share_only or receive_only, not both");
-  }
   try {
     const { account, calendar } = await resolveAvailableRef(
       input.calendar,
       accounts.state.listGoogleAccounts(),
       (slot) => accounts.auth.availableCalendars(slot),
     );
-    const added = await accounts.auth.connectCalendar(account.slot, calendar.calendarId, {
-      source: input.receive_only !== true,
-      destination: input.share_only !== true,
-    });
+    const added = await accounts.auth.connectCalendar(account.slot, calendar.calendarId);
     return {
       ok: true,
       data: {

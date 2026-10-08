@@ -319,7 +319,7 @@ function addAccountCommands(
               ? "synced"
               : option.writable
                 ? "can share and receive busy time"
-                : "can only share busy time (--source-only)";
+                : "can only share busy time: calsync cannot write to it";
             process.stdout.write(`  ${ref}  (${use})\n`);
           }
         }
@@ -330,34 +330,21 @@ function addAccountCommands(
     .command("add")
     .description("Sync one more calendar from a signed-in account")
     .argument("<calendar>", "<email> for the account's own calendar, or <email>/<calendar name>")
-    .option("--source-only", "share its busy time, but write no busy blocks to it")
-    .option("--destination-only", "receive busy blocks, but share none of its own busy time")
     .option("--tenant <id>", "tenant identifier (defaults to CALSYNC_TENANT_ID)")
-    .action(
-      async (
-        ref: string,
-        options: { sourceOnly?: boolean; destinationOnly?: boolean; tenant?: string },
-      ) => {
-        if (options.sourceOnly === true && options.destinationOnly === true) {
-          throw new Error("Use --source-only or --destination-only, not both");
-        }
-        await withAccounts(runtimeFactory, options.tenant, async (accounts) => {
-          const { account: owner, calendar: choice } = await resolveAvailableRef(
-            ref,
-            accounts.state.listGoogleAccounts(),
-            (slot) => accounts.auth.availableCalendars(slot),
-          );
-          const added = await accounts.auth.connectCalendar(owner.slot, choice.calendarId, {
-            source: options.destinationOnly !== true,
-            destination: options.sourceOnly !== true,
-          });
-          const label = calendarLabel(added, accounts.state.listGoogleAccounts());
-          process.stdout.write(
-            `${label}: added (${formatCalendarRoles(added)}). The next sync pass mirrors it.\n`,
-          );
-        });
-      },
-    );
+    .action(async (ref: string, options: { tenant?: string }) => {
+      await withAccounts(runtimeFactory, options.tenant, async (accounts) => {
+        const { account: owner, calendar: choice } = await resolveAvailableRef(
+          ref,
+          accounts.state.listGoogleAccounts(),
+          (slot) => accounts.auth.availableCalendars(slot),
+        );
+        const added = await accounts.auth.connectCalendar(owner.slot, choice.calendarId);
+        const label = calendarLabel(added, accounts.state.listGoogleAccounts());
+        process.stdout.write(
+          `${label}: added (${formatCalendarRoles(added)}). The next sync pass mirrors it.\n`,
+        );
+      });
+    });
 
   calendar
     .command("remove")
@@ -470,7 +457,9 @@ function formatCalendarRoles(calendar: Pick<CalendarRecord, "source" | "destinat
   if (calendar.source && calendar.destination) {
     return "shares and receives busy time";
   }
-  return calendar.source ? "shares busy time only" : "receives busy time only";
+  return calendar.source
+    ? "shares busy time only: calsync cannot write to it"
+    : "receives busy time only";
 }
 
 function isAccountRole(value: string): value is AccountRole {
@@ -828,11 +817,7 @@ function addWebCommands(program: Command): void {
             startAccountConnect: () => auth.startAccountConnect(),
             adoptSignIn: (slot) => auth.adoptSignIn(slot),
             availableCalendars: (slot) => auth.availableCalendars(slot),
-            connectCalendar: (slot, calendarId, roles) =>
-              auth.connectCalendar(slot, calendarId, roles),
-            setCalendarRoles: (key, roles) => {
-              state.setCalendarRoles(key, roles);
-            },
+            connectCalendar: (slot, calendarId) => auth.connectCalendar(slot, calendarId),
             removeCalendar: (key, options) => runtime.accounts.removeCalendar(key, options),
             disconnectAccount: (slot) => auth.disconnectAccount(slot),
             syncSummary: () => readSyncSummary(runtime.state, tenantId),

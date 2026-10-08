@@ -362,8 +362,10 @@ export function renderDashboardPage(): string {
   }
 
   function rolesText(calendar) {
-    if (calendar.shares && calendar.receives) return "Shares its busy time and receives the others'";
-    return calendar.shares ? "Shares its busy time only" : "Receives the others' busy time only";
+    if (calendar.shares && calendar.receives) return null;
+    return calendar.shares
+      ? "Shares its busy time only: calsync can't write to this calendar"
+      : "Receives the others' busy time only";
   }
 
   function el(tag, className, text) {
@@ -416,38 +418,10 @@ export function renderDashboardPage(): string {
   function calendarCard(calendar) {
     const div = el("div", "card");
     div.append(el("h2", "label", calendar.label));
-    div.append(el("p", "roles", rolesText(calendar)));
+    const roles = rolesText(calendar);
+    if (roles) div.append(el("p", "roles", roles));
     div.append(el("p", "status", calendar.message));
     const row = el("div", "row");
-    const select = document.createElement("select");
-    select.setAttribute("aria-label", "What " + calendar.label + " does");
-    for (const [value, text, needsWrite] of [
-      ["both", "Share and receive", true],
-      ["shares", "Share only", false],
-      ["receives", "Receive only", true],
-    ]) {
-      const option = el("option", "", text);
-      option.value = value;
-      option.disabled = needsWrite && !calendar.writable;
-      select.append(option);
-    }
-    select.value = calendar.shares && calendar.receives ? "both" : calendar.shares ? "shares" : "receives";
-    select.addEventListener("change", async () => {
-      select.disabled = true;
-      try {
-        await post("/api/calendars", {
-          action: "update",
-          key: calendar.key,
-          shares: select.value !== "receives",
-          receives: select.value !== "shares",
-        });
-        accountMessage("Updated " + calendar.label + ". The next sync pass applies it.");
-      } catch (error) {
-        accountMessage(String(error.message || error), "error");
-      }
-      wantFresh = true;
-      void refresh();
-    });
     const actions = el("div", "actions");
     if (calendar.calendarUrl) {
       const link = el("a", "open", "Open in Google Calendar ↗");
@@ -469,7 +443,7 @@ export function renderDashboardPage(): string {
       void refresh();
       void loadExclusions();
     }));
-    row.append(select, actions);
+    row.append(actions);
     div.append(row);
     if (calendar.conflict) {
       const warn = el("p", "hint", "Another calsync sign-in on this host syncs this calendar together with one of yours, so its events are mirrored twice. Ask whoever runs this calsync to remove one of them.");
@@ -483,8 +457,8 @@ export function renderDashboardPage(): string {
     const li = document.createElement("li");
     li.append(el("span", "name", option.primary ? option.name + " (its own calendar)" : option.name));
     const actions = el("span", "event-actions");
-    const add = (label, receives) => {
-      const button = el("button", receives ? "connect" : "link", label);
+    const add = () => {
+      const button = el("button", "connect", "Add");
       button.type = "button";
       button.addEventListener("click", async () => {
         button.disabled = true;
@@ -493,8 +467,6 @@ export function renderDashboardPage(): string {
             action: "add",
             account: signIn.slot,
             calendarId: option.calendarId,
-            shares: true,
-            receives,
           });
           accountMessage("Added " + option.name + ". The next sync pass mirrors it.");
         } catch (error) {
@@ -516,8 +488,8 @@ export function renderDashboardPage(): string {
     } else if (full) {
       actions.append(el("span", "why", "at the " + current.maxCalendars + "-calendar limit"));
     } else {
-      if (option.writable) actions.append(add("Add", true));
-      actions.append(add(option.writable ? "Share only" : "Add, share only", false));
+      if (!option.writable) actions.append(el("span", "why", "shares busy time only"));
+      actions.append(add());
     }
     li.append(actions);
     return li;

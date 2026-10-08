@@ -427,23 +427,43 @@ describe("account and calendar connection", () => {
       source: true,
       destination: true,
     });
-    await expect(auth.connectCalendar("account1", "holidays@group.test")).rejects.toThrow(
-      /--source-only/u,
-    );
-    expect(
-      await auth.connectCalendar("account1", "holidays@group.test", {
-        source: true,
-        destination: false,
-      }),
-    ).toMatchObject({ source: true, destination: false });
+    // One calsync can only read shares its busy time, without being asked.
+    expect(await auth.connectCalendar("account1", "holidays@group.test")).toMatchObject({
+      source: true,
+      destination: false,
+    });
     // Free/busy access shows busy times but not events, so there is nothing to read.
-    await expect(
-      auth.connectCalendar("account1", "boss@work.test", { source: true, destination: false }),
-    ).rejects.toThrow(/cannot read/u);
+    await expect(auth.connectCalendar("account1", "boss@work.test")).rejects.toThrow(
+      /cannot read/u,
+    );
     await expect(auth.connectCalendar("account1", "team@group.test")).resolves.toMatchObject({
       key: team.key,
     });
     expect(state.listCalendars()).toHaveLength(2);
+    state.close();
+  });
+
+  it("makes a calendar it can write to share and receive, whatever it was set to", async () => {
+    const state = new StateDatabase(":memory:");
+    state.upsertGoogleAccount("account1", "me@work.test", NOW);
+    // Set to share only by an earlier version's dropdown.
+    state.addCalendar({
+      key: "cal-team",
+      account: "account1",
+      calendarId: "team@group.test",
+      source: true,
+      destination: false,
+    });
+    const auth = new FakeAuth(state, tokenStore(), { account1: WORK_CALENDARS });
+    const team = state.getCalendar("cal-team");
+    if (team === null) {
+      throw new Error("not stored");
+    }
+    await expect(auth.checkCalendar(team)).resolves.toMatchObject({
+      valid: true,
+      message: "readable and writable",
+      calendar: { source: true, destination: true },
+    });
     state.close();
   });
 

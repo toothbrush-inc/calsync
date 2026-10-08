@@ -851,23 +851,22 @@ describe("account and calendar commands", () => {
   });
 
   function runtimeWith(overrides: Partial<NonNullable<AppRuntime["accounts"]>["auth"]> = {}) {
-    const connectCalendar = vi.fn(
-      (slot: string, calendarId: string, roles?: { source: boolean; destination: boolean }) => {
-        state.addCalendar({
-          key: "cal-team",
-          account: slot,
-          calendarId,
-          name: "Team",
-          source: roles?.source ?? true,
-          destination: roles?.destination ?? true,
-        });
-        const added = state.getCalendar("cal-team");
-        if (added === null) {
-          throw new Error("not recorded");
-        }
-        return Promise.resolve(added);
-      },
-    );
+    // Team is read-only, so it only shares, as the real one decides.
+    const connectCalendar = vi.fn((slot: string, calendarId: string) => {
+      state.addCalendar({
+        key: "cal-team",
+        account: slot,
+        calendarId,
+        name: "Team",
+        source: true,
+        destination: false,
+      });
+      const added = state.getCalendar("cal-team");
+      if (added === null) {
+        throw new Error("not recorded");
+      }
+      return Promise.resolve(added);
+    });
     const removeCalendar = vi.fn(() =>
       Promise.resolve({ created: 0, updated: 0, deleted: 3, repaired: 0 }),
     );
@@ -930,19 +929,21 @@ describe("account and calendar commands", () => {
     const listed = await run(runtime, ["calendar", "list", "--available"]);
     expect(listed).toContain("me@work.test:");
     expect(listed).toContain("  me@work.test  (synced)");
-    expect(listed).toContain("  me@work.test/Team  (can only share busy time (--source-only))");
+    expect(listed).toContain(
+      "  me@work.test/Team  (can only share busy time: calsync cannot write to it)",
+    );
   });
 
-  it("adds a calendar by account and name, with the roles asked for", async () => {
+  it("adds a calendar by account and name", async () => {
     const { runtime, connectCalendar } = runtimeWith();
-    const output = await run(runtime, ["calendar", "add", "ME@work.test/team", "--source-only"]);
-    expect(connectCalendar).toHaveBeenCalledWith("account1", "team@group.test", {
-      source: true,
-      destination: false,
-    });
-    expect(output).toContain("me@work.test / Team: added (shares busy time only)");
+    const output = await run(runtime, ["calendar", "add", "ME@work.test/team"]);
+    expect(connectCalendar).toHaveBeenCalledWith("account1", "team@group.test");
+    expect(output).toContain(
+      "me@work.test / Team: added (shares busy time only: calsync cannot write to it)",
+    );
     expect(await run(runtime, ["calendar", "list"])).toBe(
-      "me@work.test  (shares and receives busy time)\nme@work.test / Team  (shares busy time only)\n",
+      "me@work.test  (shares and receives busy time)\n" +
+        "me@work.test / Team  (shares busy time only: calsync cannot write to it)\n",
     );
   });
 

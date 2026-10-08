@@ -37,7 +37,7 @@ calsync service logs --lines 50
 ## More than two calendars
 
 calsync syncs up to six calendars. Each one shares its busy time with all the
-others, receives theirs as merged `Busy` blocks, or both. Sign in each Google
+others and receives theirs as merged `Busy` blocks. Sign in each Google
 account once, then pick its calendars:
 
 ```sh
@@ -45,13 +45,13 @@ calsync account add                         # sign in; repeat per Google account
 calsync calendar list --available           # every calendar those accounts can use
 calsync calendar add me@work.example        # the account's own calendar
 calsync calendar add me@work.example/Team   # another calendar, by name
-calsync calendar add me@gmail.example/Holidays --source-only
 calsync calendar list
 ```
 
-`--source-only` shares a calendar's busy time without writing blocks to it,
-which is what a calendar you can only read needs; `--destination-only` does
-the reverse. A calendar you see only as free/busy cannot be added yet.
+A calendar you can only read (shared with you without edit access) can't
+receive blocks, so calsync adds it to share its busy time only; it shares and
+receives again once it can write to it. A calendar you see only as free/busy
+cannot be added yet.
 
 The two original sign-ins (`calsync auth personal|work`) keep working and
 count towards the six. A calendar can be synced once, through one account:

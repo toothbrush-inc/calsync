@@ -753,14 +753,11 @@ export class GoogleAuthService {
    * Adds a calendar the account in `slot` can see. Receiving busy blocks
    * needs write access; sharing busy time needs to read its events.
    */
-  async connectCalendar(
-    slot: string,
-    calendarId: string,
-    roles: { source: boolean; destination: boolean } = { source: true, destination: true },
-  ): Promise<CalendarRecord> {
-    if (!roles.source && !roles.destination) {
-      throw new AuthenticationError("a calendar must share busy time, receive it, or both");
-    }
+  /**
+   * Syncs one more calendar: it shares its busy time and receives the
+   * others'. One calsync cannot write to only shares.
+   */
+  async connectCalendar(slot: string, calendarId: string): Promise<CalendarRecord> {
     if (this.state.getGoogleAccount(slot) === null) {
       throw new AuthenticationError("that Google account is not signed in");
     }
@@ -772,11 +769,6 @@ export class GoogleAuthService {
       throw new AuthenticationError(authFailureMessage(error));
     }
     const accessRole = entry.accessRole ?? undefined;
-    if (roles.destination && !isWritableAccessRole(accessRole)) {
-      throw new AuthenticationError(
-        `calsync cannot write busy blocks to that calendar (access role: ${accessRole ?? "unknown"}); add it with --source-only to share its busy time only`,
-      );
-    }
     if (!isReadableAccessRole(accessRole)) {
       throw new AuthenticationError(
         `calsync cannot read that calendar's events (access role: ${accessRole ?? "unknown"})`,
@@ -800,8 +792,8 @@ export class GoogleAuthService {
       calendarId: resolvedId,
       name: entry.summaryOverride ?? entry.summary ?? null,
       accessRole: accessRole ?? null,
-      source: roles.source,
-      destination: roles.destination,
+      source: true,
+      destination: isWritableAccessRole(accessRole),
       fingerprint: calendarFingerprint(entry, calendarId),
     });
     if (!result.added) {
@@ -871,6 +863,11 @@ export class GoogleAuthService {
       });
       // It also proves the sign-in works, which status then need not check again.
       this.state.verifyGoogleAccount(calendar.account, null);
+      // Every calendar calsync can write to shares and receives, whatever an
+      // earlier version let it be set to.
+      if (isWritableAccessRole(accessRole) && !(calendar.source && calendar.destination)) {
+        this.state.setCalendarRoles(calendar.key, { source: true, destination: true });
+      }
       const refreshed = this.state.getCalendar(calendar.key) ?? calendar;
       const conflictsWith =
         fingerprint === undefined
@@ -879,7 +876,9 @@ export class GoogleAuthService {
       return {
         calendar: refreshed,
         valid: true,
-        message: calendar.destination ? "readable and writable" : "readable",
+        message: refreshed.destination
+          ? "readable and writable"
+          : "shares its busy time only: calsync cannot write to it",
         ...(conflictsWith === undefined ? {} : { conflictsWith }),
       };
     } catch (error) {
