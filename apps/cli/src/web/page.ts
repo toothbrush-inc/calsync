@@ -777,7 +777,7 @@ export function renderDashboardPage(): string {
     const parts = [
       planned === 0 ? "No changes planned" : planned + (planned === 1 ? " operation" : " operations") + " planned",
       previewEvents.length + " events in the sync window",
-      view.mirrors.personalToWork.active + " would be mirrored to work, " + view.mirrors.workToPersonal.active + " to personal",
+      view.mirrors.personalToWork.active + " busy blocks would go to work, " + view.mirrors.workToPersonal.active + " to personal",
     ];
     previewSummary.textContent = parts.join(" · ") + ".";
     previewResults.hidden = false;

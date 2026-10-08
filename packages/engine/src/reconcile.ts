@@ -25,6 +25,7 @@ import {
   MAPPING_PROPERTY,
   normalizeSourceEvents,
   type GoogleCalendarEvent,
+  type NormalizedEventTime,
   type NormalizedSourceEvent,
 } from "./normalize.js";
 import {
@@ -57,7 +58,8 @@ export interface ReconcileLog {
   destinationRole: AccountRole;
   reason: ReconcileReason;
   timeRange?: ReconcileTimeRange;
-  sourceTitle?: string;
+  /** Titles of every source merged into the block, in start order; untitled sources are left out. */
+  sourceTitles?: string[];
   dryRun: boolean;
 }
 
@@ -123,6 +125,12 @@ export interface ReconcileOptions {
   log?: (entry: ReconcileLog) => void;
   onSourceEvent?: (entry: ReconcileSourceDetail) => void;
   onProgress?: (progress: ReconcileProgress) => void;
+  /**
+   * Each managed block a sync pass deleted. Google reports the deletion back
+   * as a cancelled change; the caller remembers these to tell its own
+   * deletions from someone else's.
+   */
+  onDestinationDeleted?: (destinationRole: AccountRole, eventId: string) => void;
 }
 
 export interface ReconcileProgress {
@@ -138,6 +146,17 @@ type Clients = Record<AccountRole, CalendarAPI>;
 type EventSets = Record<AccountRole, GoogleCalendarEvent[]>;
 type SourceSets = Record<AccountRole, NormalizedSourceEvent[]>;
 type ManagedBlock = GoogleCalendarEvent & { id: string };
+
+/**
+ * One merged busy interval for a destination calendar: the union of every
+ * desired source event that overlaps or abuts it. Identity comes from the
+ * interval itself, so the same slot always maps to the same block however
+ * many sources stand behind it.
+ */
+interface BusyBlock {
+  time: NormalizedEventTime;
+  sources: NormalizedSourceEvent[];
+}
 
 interface EvaluatedSource {
   source: NormalizedSourceEvent;
@@ -166,6 +185,12 @@ const LONG_PRUNE_SPACING_MS = 300;
 const MAX_DELETE_SPACING_MS = 1_200;
 const INITIAL_COOLDOWN_MS = 5_000;
 const MAX_COOLDOWN_MS = 60_000;
+/**
+ * Replacement IDs tried when a returning slot's ID belongs to a deleted block.
+ * Each return of the same slot consumes one; a slot vacated and refilled this
+ * often within Google's tombstone retention is not plausible.
+ */
+const MAX_TOMBSTONE_LINKS = 32;
 /** Tries per block across cooldowns, on top of the adapter's own quick retries. */
 const MAX_DELETE_ATTEMPTS = 6;
 
@@ -275,11 +300,11 @@ export class Reconciler {
 
   async rebuild(options: ReconcileOptions = {}): Promise<ReconcileResult> {
     const now = options.now ?? this.clock.now();
-    const events = await this.listBoth(calendarWindow(this.config, now), options);
-    const sources = {
-      personal: normalizeSourceEvents(events.personal),
-      work: normalizeSourceEvents(events.work),
-    };
+    const { events, normalized, duplicateKeys } = await this.discover(
+      calendarWindow(this.config, now),
+      options,
+      "Planning mapping rebuild",
+    );
     const result = { ...EMPTY_RESULT };
 
     if (!options.dryRun) {
@@ -289,20 +314,15 @@ export class Reconciler {
     }
     for (const destinationRole of roles()) {
       const sourceRole = opposite(destinationRole);
-      const sourceByKey = new Map(
-        sources[sourceRole].map((source) => [
-          mappingKey(sourceRole, source, this.config.tenantId),
-          source,
-        ]),
-      );
+      const blocks = this.planDirection(sourceRole, normalized[sourceRole], duplicateKeys).blocks;
       for (const destination of activeManagedEvents(events[destinationRole])) {
         const key = managedMappingKey(destination);
-        const source = key === undefined ? undefined : sourceByKey.get(key);
-        if (key === undefined || source === undefined || destination.id == null) {
+        const block = key === undefined ? undefined : blocks.get(key);
+        if (key === undefined || block === undefined || destination.id == null) {
           continue;
         }
         if (!options.dryRun) {
-          this.mappings.putMapping(toMapping(key, sourceRole, source, destination, now));
+          this.mappings.putMapping(toMapping(key, sourceRole, destination, now));
         }
         record(
           result,
@@ -310,8 +330,8 @@ export class Reconciler {
           sourceRole,
           "rebuild-mapping",
           options,
-          normalizedTimeRange(source),
-          source.sourceTitle,
+          blockTimeRange(block),
+          blockTitles(block),
         );
       }
     }
@@ -461,7 +481,11 @@ export class Reconciler {
     }[] = [];
     for (const destinationRole of roles()) {
       const sourceRole = opposite(destinationRole);
-      const { desired } = this.evaluateDirection(sourceRole, normalized[sourceRole], duplicateKeys);
+      const { blocks: desired } = this.planDirection(
+        sourceRole,
+        normalized[sourceRole],
+        duplicateKeys,
+      );
       const mappedIds = new Map(
         this.mappings
           .listMappings(sourceRole, this.config.tenantId)
@@ -656,7 +680,7 @@ export class Reconciler {
     sourceRole: AccountRole,
     sourceEvents: readonly NormalizedSourceEvent[],
     duplicateKeys: ReadonlySet<string>,
-  ): { evaluatedSources: EvaluatedSource[]; desired: Map<string, NormalizedSourceEvent> } {
+  ): { evaluatedSources: EvaluatedSource[]; desired: NormalizedSourceEvent[] } {
     const exclusions = this.config.exclusions;
     const keys = sourceRole === "personal" ? exclusions.personalToWork : exclusions.workToPersonal;
     const keywords =
@@ -674,17 +698,39 @@ export class Reconciler {
             : undefined),
       };
     });
-    const desired = new Map(
-      evaluatedSources
-        .filter(
-          ({ source, exclusionReason }) =>
-            exclusionReason === undefined &&
-            (source.duplicateMatchKey === undefined ||
-              !duplicateKeys.has(source.duplicateMatchKey)),
-        )
-        .map(({ source }) => [mappingKey(sourceRole, source, this.config.tenantId), source]),
-    );
+    const desired = evaluatedSources
+      .filter(
+        ({ source, exclusionReason }) =>
+          exclusionReason === undefined &&
+          (source.duplicateMatchKey === undefined || !duplicateKeys.has(source.duplicateMatchKey)),
+      )
+      .map(({ source }) => source);
     return { evaluatedSources, desired };
+  }
+
+  /**
+   * The busy blocks one destination should hold: desired sources merged into
+   * disjoint intervals. The destination's own events never suppress a block,
+   * even one they cover in full: the block says another calendar is busy too.
+   */
+  private planDirection(
+    sourceRole: AccountRole,
+    sourceEvents: readonly NormalizedSourceEvent[],
+    duplicateKeys: ReadonlySet<string>,
+  ): { evaluatedSources: EvaluatedSource[]; blocks: Map<string, BusyBlock> } {
+    const { evaluatedSources, desired } = this.evaluateDirection(
+      sourceRole,
+      sourceEvents,
+      duplicateKeys,
+    );
+    const destinationRole = opposite(sourceRole);
+    const blocks = new Map(
+      mergeBusyBlocks(desired).map((block) => [
+        busyBlockKey(destinationRole, block.time, this.config.tenantId),
+        block,
+      ]),
+    );
+    return { evaluatedSources, blocks };
   }
 
   private async listBoth(window: CalendarWindow, options: ReconcileOptions): Promise<EventSets> {
@@ -746,7 +792,7 @@ export class Reconciler {
   ): Promise<MirrorDirectionSummary> {
     const destinationRole = opposite(sourceRole);
     const destinationCalendarId = this.config.accounts[destinationRole].calendarId;
-    const { evaluatedSources, desired } = this.evaluateDirection(
+    const { evaluatedSources, blocks } = this.planDirection(
       sourceRole,
       sourceEvents,
       duplicateKeys,
@@ -763,7 +809,7 @@ export class Reconciler {
       });
     }
     const summary: MirrorDirectionSummary = {
-      active: options.dryRun === true ? desired.size : 0,
+      active: options.dryRun === true ? blocks.size : 0,
       excluded: evaluatedSources.filter(({ exclusionReason }) => exclusionReason !== undefined)
         .length,
       duplicateSuppressed: evaluatedSources.filter(
@@ -779,7 +825,7 @@ export class Reconciler {
         .listMappings(sourceRole, this.config.tenantId)
         .map((mapping) => [mapping.mappingKey, mapping]),
     );
-    const total = desired.size + [...mappings.keys()].filter((key) => !desired.has(key)).length;
+    const total = blocks.size + [...mappings.keys()].filter((key) => !blocks.has(key)).length;
     let completed = 0;
     let succeeded = 0;
     let failed = 0;
@@ -805,7 +851,7 @@ export class Reconciler {
     progress();
 
     for (const mapping of mappings.values()) {
-      if (desired.has(mapping.mappingKey)) {
+      if (blocks.has(mapping.mappingKey)) {
         continue;
       }
       const failuresBefore = result.failed;
@@ -828,6 +874,9 @@ export class Reconciler {
         finishItem(failuresBefore, operationsBefore);
         continue;
       }
+      if (options.dryRun !== true) {
+        options.onDestinationDeleted?.(destinationRole, mapping.destinationEventId);
+      }
       record(
         result,
         "delete",
@@ -842,7 +891,7 @@ export class Reconciler {
       finishItem(failuresBefore, operationsBefore);
     }
 
-    for (const [key, source] of desired) {
+    for (const [key, block] of blocks) {
       const failuresBefore = result.failed;
       const operationsBefore = operationCount(result);
       const knownMapping = mappings.get(key);
@@ -883,6 +932,9 @@ export class Reconciler {
           finishItem(failuresBefore, operationsBefore);
           continue;
         }
+        if (options.dryRun !== true) {
+          options.onDestinationDeleted?.(destinationRole, extraId);
+        }
         record(
           result,
           "delete",
@@ -890,7 +942,7 @@ export class Reconciler {
           "duplicate-destination",
           options,
           eventTimeRange(extra),
-          source.sourceTitle,
+          blockTitles(block),
         );
       }
 
@@ -901,7 +953,7 @@ export class Reconciler {
       ) {
         const reason =
           destination?.status === "cancelled" ? "destination-cancelled" : "destination-missing";
-        const insert = projectBusyEventInsert(source, key);
+        const insert = projectBusyEventInsert(block, key);
         if (knownMapping !== undefined || destination?.status === "cancelled") {
           const tombstone = destination?.id ?? knownMapping?.destinationEventId ?? insert.id;
           insert.id = managedGoogleEventId(`${key}:replacement:${tombstone}`);
@@ -911,10 +963,24 @@ export class Reconciler {
           options.dryRun !== true &&
           !(await attemptOperation(
             async () => {
-              inserted = await this.clients[destinationRole].insertEvent(
-                destinationCalendarId,
-                insert,
-              );
+              const client = this.clients[destinationRole];
+              inserted = await client.insertEvent(destinationCalendarId, insert);
+              // A slot that comes back reuses its interval key, and the ID it
+              // derives may belong to a block deleted earlier. Google keeps
+              // that tombstone and answers the insert with a conflict, so
+              // follow the chain of IDs derived from each tombstone until one
+              // is free: every return of the slot used up one link.
+              for (
+                let link = 0;
+                inserted?.status === "cancelled" && link < MAX_TOMBSTONE_LINKS;
+                link += 1
+              ) {
+                insert.id = managedGoogleEventId(`${key}:replacement:${insert.id}`);
+                inserted = await client.insertEvent(destinationCalendarId, insert);
+              }
+              if (inserted?.status === "cancelled") {
+                throw new Error("Every replacement ID for this busy block is a deleted event");
+              }
             },
             result,
             failures,
@@ -933,10 +999,10 @@ export class Reconciler {
           sourceRole,
           reason,
           options,
-          normalizedTimeRange(source),
-          source.sourceTitle,
+          blockTimeRange(block),
+          blockTitles(block),
         );
-      } else if (!matchesManagedProjection(destination, projectBusyEvent(source, key))) {
+      } else if (!matchesManagedProjection(destination, projectBusyEvent(block, key))) {
         const destinationId = destination.id;
         const destinationEtag = destination.etag;
         let patched: GoogleCalendarEvent | undefined;
@@ -947,7 +1013,7 @@ export class Reconciler {
               patched = await this.clients[destinationRole].patchEvent(
                 destinationCalendarId,
                 destinationId,
-                projectBusyEvent(source, key),
+                projectBusyEvent(block, key),
                 destinationEtag ?? undefined,
               );
             },
@@ -964,13 +1030,13 @@ export class Reconciler {
           sourceRole,
           "destination-drifted",
           options,
-          normalizedTimeRange(source),
-          source.sourceTitle,
+          blockTimeRange(block),
+          blockTitles(block),
         );
       }
 
       if (options.dryRun !== true) {
-        this.mappings.putMapping(toMapping(key, sourceRole, source, destination, now));
+        this.mappings.putMapping(toMapping(key, sourceRole, destination, now));
       }
       if (adoptedExisting) {
         record(
@@ -979,8 +1045,8 @@ export class Reconciler {
           sourceRole,
           "mapping-missing",
           options,
-          normalizedTimeRange(source),
-          source.sourceTitle,
+          blockTimeRange(block),
+          blockTitles(block),
         );
       }
       finishItem(failuresBefore, operationsBefore);
@@ -999,6 +1065,24 @@ export function mappingKey(
   // orphan every mirrored event on an existing deployment.
   const scope = tenantId === undefined || tenantId === "default" ? "" : `${tenantId}\0`;
   return createHash("sha256").update(`${scope}${role}\0${source.occurrenceKey}`).digest("hex");
+}
+
+/**
+ * Identity of a merged busy block on one destination. Keys feed managed
+ * Google event IDs, so they hash the interval rather than any source event:
+ * the slot is the identity, and source event IDs never reach the destination.
+ */
+export function busyBlockKey(
+  destinationRole: AccountRole,
+  time: NormalizedEventTime,
+  tenantId?: string,
+): string {
+  const { start, end } = timeBounds(time);
+  return createHash("sha256")
+    .update(
+      `block:v2\0${tenantId ?? "default"}\0${destinationRole}\0${time.kind}\0${start}\0${end}`,
+    )
+    .digest("hex");
 }
 
 export function calendarWindow(config: SyncConfig, now: Date): CalendarWindow {
@@ -1173,7 +1257,7 @@ function groupByTimeRange(blocks: readonly ManagedBlock[]): Map<string, ManagedB
  */
 function strayBlocks(
   group: readonly ManagedBlock[],
-  desired: ReadonlyMap<string, NormalizedSourceEvent>,
+  desired: ReadonlyMap<string, unknown>,
   mappedIds: ReadonlyMap<string, string>,
 ): { block: ManagedBlock; kind: StrayBlockKind }[] {
   const ranked = [...group].sort(
@@ -1195,6 +1279,107 @@ function strayBlocks(
   return strays.map((block) => ({ block, kind }));
 }
 
+/**
+ * Unions overlapping or abutting sources into disjoint blocks. Timed and
+ * all-day events merge separately: an all-day date has no instant to compare
+ * against. A timed value without an offset cannot be placed on the timeline,
+ * so it stays a block of its own.
+ */
+function mergeBusyBlocks(sources: readonly NormalizedSourceEvent[]): BusyBlock[] {
+  const intervals: {
+    kind: NormalizedEventTime["kind"];
+    start: number;
+    end: number;
+    source: NormalizedSourceEvent;
+  }[] = [];
+  const unplaced: BusyBlock[] = [];
+  for (const source of sources) {
+    const bounds = instantBounds(source.time);
+    if (bounds === undefined) {
+      unplaced.push({ time: source.time, sources: [source] });
+    } else {
+      intervals.push({ kind: source.time.kind, ...bounds, source });
+    }
+  }
+  intervals.sort((left, right) => left.start - right.start || left.end - right.end);
+
+  const merged: BusyBlock[] = [];
+  for (const kind of ["timed", "all-day"] as const) {
+    let current: { start: number; end: number; sources: NormalizedSourceEvent[] } | undefined;
+    for (const interval of intervals.filter((candidate) => candidate.kind === kind)) {
+      if (current !== undefined && interval.start <= current.end) {
+        current.end = Math.max(current.end, interval.end);
+        current.sources.push(interval.source);
+        continue;
+      }
+      if (current !== undefined) {
+        merged.push(blockFromInstants(kind, current));
+      }
+      current = { start: interval.start, end: interval.end, sources: [interval.source] };
+    }
+    if (current !== undefined) {
+      merged.push(blockFromInstants(kind, current));
+    }
+  }
+  return [...merged, ...unplaced];
+}
+
+function blockFromInstants(
+  kind: NormalizedEventTime["kind"],
+  interval: { start: number; end: number; sources: NormalizedSourceEvent[] },
+): BusyBlock {
+  const time: NormalizedEventTime =
+    kind === "all-day"
+      ? {
+          kind,
+          startDate: new Date(interval.start).toISOString().slice(0, 10),
+          endDate: new Date(interval.end).toISOString().slice(0, 10),
+        }
+      : {
+          kind,
+          startDateTime: rfc3339(interval.start),
+          endDateTime: rfc3339(interval.end),
+        };
+  return { time, sources: interval.sources };
+}
+
+function rfc3339(milliseconds: number): string {
+  return new Date(milliseconds).toISOString().replace(/\.000Z$/u, "Z");
+}
+
+/** Comparable bounds: UTC midnight for all-day dates, the instant for timed values. */
+function instantBounds(time: NormalizedEventTime): { start: number; end: number } | undefined {
+  const { start, end } = timeBounds(time);
+  if (time.kind === "timed" && !(hasOffset(start) && hasOffset(end))) {
+    return undefined;
+  }
+  const startMs = Date.parse(time.kind === "all-day" ? `${start}T00:00:00Z` : start);
+  const endMs = Date.parse(time.kind === "all-day" ? `${end}T00:00:00Z` : end);
+  return Number.isNaN(startMs) || Number.isNaN(endMs) ? undefined : { start: startMs, end: endMs };
+}
+
+function hasOffset(value: string): boolean {
+  return /(?:Z|[+-]\d{2}:\d{2})$/iu.test(value);
+}
+
+function timeBounds(time: NormalizedEventTime): { start: string; end: string } {
+  return time.kind === "all-day"
+    ? { start: time.startDate, end: time.endDate }
+    : { start: time.startDateTime, end: time.endDateTime };
+}
+
+function blockTimeRange(block: BusyBlock): ReconcileTimeRange {
+  const { start, end } = timeBounds(block.time);
+  return { kind: block.time.kind, start, end };
+}
+
+/** Every titled source merged into the block, for private dry-run detail. */
+function blockTitles(block: BusyBlock): string[] {
+  return block.sources.flatMap((source) =>
+    source.sourceTitle === undefined ? [] : [source.sourceTitle],
+  );
+}
+
 function intersectDuplicateKeys(
   personal: readonly NormalizedSourceEvent[],
   work: readonly NormalizedSourceEvent[],
@@ -1207,19 +1392,22 @@ function intersectDuplicateKeys(
   );
 }
 
+/**
+ * A block has no single source, so the mapping's source columns carry the
+ * opaque block key: the store keeps no source event identifiers at all.
+ */
 function toMapping(
   key: string,
   sourceRole: AccountRole,
-  source: NormalizedSourceEvent,
   destination: GoogleCalendarEvent,
   now: Date,
 ): EventMapping {
   return {
     mappingKey: key,
     sourceRole,
-    sourceEventId: source.id,
+    sourceEventId: key,
     destinationEventId: destination.id ?? managedGoogleEventId(key),
-    sourceEtag: source.etag ?? null,
+    sourceEtag: null,
     destinationEtag: destination.etag ?? null,
     updatedAt: now.toISOString(),
   };
@@ -1232,7 +1420,7 @@ function record(
   reason: ReconcileReason,
   options: ReconcileOptions,
   timeRange?: ReconcileTimeRange,
-  sourceTitle?: string,
+  sourceTitles: readonly string[] = [],
 ): void {
   const field = `${operation}${operation === "repair" ? "ed" : "d"}` as
     "created" | "updated" | "deleted" | "repaired";
@@ -1243,7 +1431,7 @@ function record(
     destinationRole: opposite(sourceRole),
     reason,
     ...(timeRange === undefined ? {} : { timeRange }),
-    ...(sourceTitle === undefined ? {} : { sourceTitle }),
+    ...(sourceTitles.length === 0 ? {} : { sourceTitles: [...sourceTitles] }),
     dryRun: options.dryRun ?? false,
   });
 }

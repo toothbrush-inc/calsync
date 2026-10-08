@@ -891,9 +891,9 @@ export function formatDryRunReport(
     lines.push("", "Details (private source titles and timestamps; terminal output is sensitive):");
     for (const entry of operations) {
       const title =
-        entry.sourceTitle === undefined
+        entry.sourceTitles === undefined
           ? "(source title unavailable)"
-          : JSON.stringify(entry.sourceTitle);
+          : entry.sourceTitles.map((sourceTitle) => JSON.stringify(sourceTitle)).join(" + ");
       const range =
         entry.timeRange === undefined
           ? "(time range unavailable)"

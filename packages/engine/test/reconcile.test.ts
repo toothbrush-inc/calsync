@@ -102,9 +102,15 @@ describe("Reconciler", () => {
     expect(runtime.work.events[0]?.summary).toBe("Busy");
     expect(runtime.personal.events).toHaveLength(1);
 
+    // A block's identity is its slot, so a moved source swaps blocks.
     first(runtime.personal.events).start = { dateTime: "2026-08-10T12:00:00Z" };
     first(runtime.personal.events).end = { dateTime: "2026-08-10T13:00:00Z" };
-    await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({ updated: 1 });
+    await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
+      created: 1,
+      deleted: 1,
+      updated: 0,
+    });
+    expect(runtime.work.events).toHaveLength(1);
     expect(runtime.work.events[0]?.start).toEqual({ dateTime: "2026-08-10T12:00:00Z" });
 
     runtime.personal.events.splice(0);
@@ -371,7 +377,13 @@ describe("Reconciler", () => {
   it("applies title keywords only in their configured direction", async () => {
     const runtime = setup(
       [source("personal-focus", { summary: "Team Focus" })],
-      [source("work-focus", { summary: "Team Focus" })],
+      [
+        source("work-focus", {
+          summary: "Team Focus",
+          start: { dateTime: "2026-08-10T14:00:00Z" },
+          end: { dateTime: "2026-08-10T15:00:00Z" },
+        }),
+      ],
     );
     runtime.config.exclusions.personalToWorkKeywords = ["focus"];
 
@@ -611,7 +623,7 @@ describe("Reconciler", () => {
         destinationRole: "work",
         dryRun: false,
       });
-      expect(operations.every((entry) => entry.sourceTitle === undefined)).toBe(true);
+      expect(operations.every((entry) => entry.sourceTitles === undefined)).toBe(true);
       // The live mirror is untouched, so the next pass has nothing to do.
       await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
         created: 0,
@@ -619,14 +631,14 @@ describe("Reconciler", () => {
       });
     });
 
-    it("keeps two live mirrors that genuinely share a slot", async () => {
+    it("keeps the one merged block that sources sharing a slot produce", async () => {
       const runtime = setup([source("meeting-a"), source("meeting-b")]);
       await runtime.reconciler.reconcile();
-      expect(runtime.work.events).toHaveLength(2);
+      expect(runtime.work.events).toHaveLength(1);
 
       await expect(runtime.reconciler.dedupe()).resolves.toMatchObject({
         deleted: 0,
-        inspected: { work: 2 },
+        inspected: { work: 1 },
       });
       expect(runtime.work.deletedIds).toEqual([]);
     });
@@ -672,29 +684,36 @@ describe("Reconciler", () => {
       expect(runtime.work.events.map((event) => event.id)).toEqual([mapping.destinationEventId]);
     });
 
+    it("keeps the block when Google re-creates its source in the same slot", async () => {
+      const runtime = setup([source("personal-source")]);
+      await runtime.reconciler.reconcile();
+      const live = first(runtime.work.events);
+      first(runtime.personal.events).id = "personal-source-reborn";
+      first(runtime.personal.events).iCalUID = "reborn@example.test";
+
+      await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
+        created: 0,
+        deleted: 0,
+      });
+      expect(runtime.work.events.map((event) => event.id)).toEqual([live.id]);
+    });
+
     it("drops the mapping of a mapped block it removes", async () => {
       const runtime = setup([source("personal-source")]);
       await runtime.reconciler.reconcile();
-      const mapping = first(runtime.state.listMappings());
-      // Google re-created the source under a new identity: the old mirror is
-      // still mapped, the new one is live.
-      first(runtime.personal.events).id = "personal-source-reborn";
-      first(runtime.personal.events).iCalUID = "reborn@example.test";
-      await runtime.reconciler.reconcile();
-      expect(runtime.work.events).toHaveLength(1);
-      runtime.state.putMapping(mapping);
+      const live = first(runtime.state.listMappings());
+      // A block mapped under a key no pass will produce again, beside the live one.
+      const stale = { ...live, mappingKey: "stale-key", destinationEventId: "stale-block" };
+      runtime.state.putMapping(stale);
       runtime.work.events.push({
-        ...strayBlock(mapping.destinationEventId),
-        extendedProperties: {
-          private: { calsyncManaged: "true", calsyncMapping: mapping.mappingKey },
-        },
+        ...strayBlock("stale-block"),
+        extendedProperties: { private: { calsyncManaged: "true", calsyncMapping: "stale-key" } },
       });
-      runtime.work.deletedIds.splice(0);
 
       await expect(runtime.reconciler.dedupe()).resolves.toMatchObject({ deleted: 1 });
-      expect(runtime.work.deletedIds).toEqual([mapping.destinationEventId]);
-      expect(runtime.state.getMapping(mapping.mappingKey)).toBeNull();
-      expect(runtime.state.listMappings()).toHaveLength(1);
+      expect(runtime.work.deletedIds).toEqual(["stale-block"]);
+      expect(runtime.state.getMapping("stale-key")).toBeNull();
+      expect(runtime.state.listMappings()).toEqual([live]);
     });
 
     it("treats managed blocks outside the sync window as phantoms", async () => {
@@ -910,8 +929,222 @@ describe("Reconciler", () => {
     });
   });
 
+  describe("merged busy blocks", () => {
+    function at(id: string, start: string, end: string, overrides: GoogleCalendarEvent = {}) {
+      return source(id, {
+        start: { dateTime: `2026-08-10T${start}:00Z` },
+        end: { dateTime: `2026-08-10T${end}:00Z` },
+        ...overrides,
+      });
+    }
+
+    /** Active timed busy blocks as start/end pairs. */
+    function slots(events: readonly GoogleCalendarEvent[]): string[] {
+      return events
+        .filter(
+          (event) =>
+            event.summary === "Busy" &&
+            event.status !== "cancelled" &&
+            event.start?.dateTime != null,
+        )
+        .map((event) => `${event.start?.dateTime ?? ""}/${event.end?.dateTime ?? ""}`)
+        .sort();
+    }
+
+    it("merges overlapping and abutting sources into one block and leaves gaps free", async () => {
+      const runtime = setup([
+        at("a", "09:00", "10:00"),
+        at("b", "09:30", "10:30"),
+        at("c", "10:30", "11:00"),
+        // Five minutes after c ends: a real gap, never bridged.
+        at("d", "11:05", "12:00"),
+      ]);
+
+      await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
+        created: 2,
+        mirrors: { personalToWork: { active: 2 } },
+      });
+      expect(slots(runtime.work.events)).toEqual([
+        "2026-08-10T09:00:00Z/2026-08-10T11:00:00Z",
+        "2026-08-10T11:05:00Z/2026-08-10T12:00:00Z",
+      ]);
+      expect(runtime.state.listMappings()).toHaveLength(2);
+      await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
+        created: 0,
+        updated: 0,
+        deleted: 0,
+      });
+    });
+
+    it("logs every titled source merged into a block, in start order", async () => {
+      const runtime = setup([
+        at("later", "09:30", "10:30", { summary: "School pickup" }),
+        at("untitled", "09:45", "10:00", { summary: null }),
+        at("earlier", "09:00", "10:00", { summary: "Dentist" }),
+      ]);
+      const operations: ReconcileLog[] = [];
+
+      await runtime.reconciler.reconcile({
+        dryRun: true,
+        log: (entry) => operations.push(entry),
+      });
+      expect(operations).toEqual([
+        expect.objectContaining({
+          operation: "create",
+          sourceTitles: ["Dentist", "School pickup"],
+          timeRange: { kind: "timed", start: "2026-08-10T09:00:00Z", end: "2026-08-10T10:30:00Z" },
+        }),
+      ]);
+    });
+
+    it("compares instants, not offsets, when merging", async () => {
+      const runtime = setup([
+        source("pacific", {
+          start: { dateTime: "2026-08-10T02:00:00-07:00" },
+          end: { dateTime: "2026-08-10T03:00:00-07:00" },
+        }),
+        at("utc", "09:30", "10:30"),
+      ]);
+
+      await runtime.reconciler.reconcile();
+      expect(slots(runtime.work.events)).toEqual(["2026-08-10T09:00:00Z/2026-08-10T10:30:00Z"]);
+    });
+
+    it("keeps all-day and timed sources in separate blocks", async () => {
+      const runtime = setup([
+        source("day-off", { start: { date: "2026-08-10" }, end: { date: "2026-08-11" } }),
+        source("trip", { start: { date: "2026-08-11" }, end: { date: "2026-08-13" } }),
+        at("call", "09:00", "10:00"),
+      ]);
+
+      await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({ created: 2 });
+      const allDay = runtime.work.events.filter((event) => event.start?.date != null);
+      expect(allDay.map((event) => [event.start?.date, event.end?.date])).toEqual([
+        ["2026-08-10", "2026-08-13"],
+      ]);
+      expect(slots(runtime.work.events)).toEqual(["2026-08-10T09:00:00Z/2026-08-10T10:00:00Z"]);
+    });
+
+    it("mirrors a block even when the destination's own busy time covers it", async () => {
+      const runtime = setup(
+        [at("inside", "10:15", "10:45"), at("straddles", "11:30", "12:30")],
+        [at("work-meeting", "10:00", "11:00"), at("work-lunch", "12:00", "13:00")],
+      );
+
+      await runtime.reconciler.reconcile();
+      // Blocks are never trimmed or dropped around the destination's own events.
+      expect(slots(runtime.work.events)).toEqual([
+        "2026-08-10T10:15:00Z/2026-08-10T10:45:00Z",
+        "2026-08-10T11:30:00Z/2026-08-10T12:30:00Z",
+      ]);
+    });
+
+    it("swaps the block when a source extends it, then settles", async () => {
+      const runtime = setup([at("a", "09:00", "10:00"), at("b", "10:00", "11:00")]);
+      await runtime.reconciler.reconcile();
+      expect(slots(runtime.work.events)).toEqual(["2026-08-10T09:00:00Z/2026-08-10T11:00:00Z"]);
+
+      const b = runtime.personal.events.find((event) => event.id === "b");
+      if (b == null) {
+        throw new Error("expected source b");
+      }
+      b.end = { dateTime: "2026-08-10T11:30:00Z" };
+      await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
+        created: 1,
+        deleted: 1,
+      });
+      expect(slots(runtime.work.events)).toEqual(["2026-08-10T09:00:00Z/2026-08-10T11:30:00Z"]);
+      expect(runtime.state.listMappings()).toHaveLength(1);
+      await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
+        created: 0,
+        deleted: 0,
+      });
+    });
+
+    it("re-inserts under a replacement ID when a returning slot's ID is a tombstone", async () => {
+      const runtime = setup([at("a", "09:00", "10:00")]);
+      await runtime.reconciler.reconcile();
+      const original = first(runtime.work.events).id;
+      if (original == null) {
+        throw new Error("expected block ID");
+      }
+
+      runtime.personal.events.splice(0);
+      await runtime.reconciler.reconcile();
+      // Google keeps the deleted block as a bare tombstone that holds its ID.
+      runtime.work.events.push({ id: original, status: "cancelled" });
+
+      runtime.personal.events.push(at("a-again", "09:00", "10:00"));
+      await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({ created: 1 });
+      const live = runtime.work.events.filter((event) => event.status !== "cancelled");
+      expect(live).toHaveLength(1);
+      expect(first(live).id).not.toBe(original);
+      expect(first(runtime.state.listMappings()).destinationEventId).toBe(first(live).id);
+      await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({ created: 0 });
+    });
+
+    it("keeps finding a free ID however often a slot is vacated and refilled", async () => {
+      const runtime = setup([at("a", "09:00", "10:00")]);
+      const live = () => runtime.work.events.filter((event) => event.status !== "cancelled");
+      for (let round = 0; round < 4; round += 1) {
+        await runtime.reconciler.reconcile();
+        expect(live()).toHaveLength(1);
+        const id = first(live()).id;
+        runtime.personal.events.splice(0);
+        await runtime.reconciler.reconcile();
+        if (id != null) {
+          runtime.work.events.push({ id, status: "cancelled" });
+        }
+        runtime.personal.events.push(at(`a-${String(round)}`, "09:00", "10:00"));
+      }
+      await runtime.reconciler.reconcile();
+      expect(live()).toHaveLength(1);
+      expect(first(runtime.state.listMappings()).destinationEventId).toBe(first(live()).id);
+    });
+
+    it("replaces legacy one-per-event mirrors with merged blocks", async () => {
+      const runtime = setup([at("a", "09:00", "10:00"), at("b", "09:30", "10:30")]);
+      for (const id of ["a", "b"]) {
+        const legacyKey = `legacy-${id}`;
+        runtime.work.events.push({
+          id: `legacy-block-${id}`,
+          summary: "Busy",
+          start: { dateTime: "2026-08-10T09:00:00Z" },
+          end: { dateTime: "2026-08-10T10:00:00Z" },
+          extendedProperties: { private: { calsyncManaged: "true", calsyncMapping: legacyKey } },
+        });
+        runtime.state.putMapping({
+          mappingKey: legacyKey,
+          sourceRole: "personal",
+          sourceEventId: id,
+          destinationEventId: `legacy-block-${id}`,
+          sourceEtag: null,
+          destinationEtag: null,
+          updatedAt: "2026-01-01T00:00:00.000Z",
+        });
+      }
+
+      await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
+        created: 1,
+        deleted: 2,
+      });
+      expect(slots(runtime.work.events)).toEqual(["2026-08-10T09:00:00Z/2026-08-10T10:30:00Z"]);
+      expect(runtime.state.listMappings().map((mapping) => mapping.sourceEventId)).not.toContain(
+        "a",
+      );
+    });
+  });
+
   it("recovers idempotently from a partial bidirectional API failure", async () => {
-    const runtime = setup([source("personal-source")], [source("work-source")]);
+    const runtime = setup(
+      [source("personal-source")],
+      [
+        source("work-source", {
+          start: { dateTime: "2026-08-10T14:00:00Z" },
+          end: { dateTime: "2026-08-10T15:00:00Z" },
+        }),
+      ],
+    );
     runtime.personal.failNextInsert = true;
     const progress: { phase: string; failed: number }[] = [];
 

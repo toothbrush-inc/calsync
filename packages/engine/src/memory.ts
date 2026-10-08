@@ -47,6 +47,12 @@ export class MemoryCalendar implements CalendarAPI {
       this.failNextInsert = false;
       return Promise.reject(new Error("partial Google API failure"));
     }
+    // Google keeps deleted events as tombstones and refuses their IDs; the
+    // real adapter answers that conflict with whatever holds the ID.
+    const existing = this.events.find((candidate) => candidate.id === event.id);
+    if (existing !== undefined) {
+      return Promise.resolve(structuredClone(existing));
+    }
     this.insertedIds.push(event.id);
     const inserted = { ...structuredClone(event), etag: `"inserted-${event.id}"` };
     this.events.push(inserted);

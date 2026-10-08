@@ -44,10 +44,10 @@ function requireMappingKey(mappingKey: string): void {
   }
 }
 
-export function projectBusyEvent(
-  source: NormalizedSourceEvent,
-  mappingKey: string,
-): ManagedBusyEvent {
+/** Anything with a normalized time projects: a source event or a merged busy block. */
+type ProjectableTime = Pick<NormalizedSourceEvent, "time">;
+
+export function projectBusyEvent(source: ProjectableTime, mappingKey: string): ManagedBusyEvent {
   requireMappingKey(mappingKey);
 
   const start: GoogleEventDateTimeInput =
@@ -97,7 +97,7 @@ export function managedGoogleEventId(mappingKey: string): string {
 }
 
 export function projectBusyEventInsert(
-  source: NormalizedSourceEvent,
+  source: ProjectableTime,
   mappingKey: string,
 ): ManagedBusyEventInsert {
   return {

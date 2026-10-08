@@ -68,9 +68,15 @@ export interface EventDeleteParameters {
   sendUpdates: "none";
 }
 
+export interface EventGetParameters {
+  calendarId: string;
+  eventId: string;
+}
+
 export interface GoogleCalendarApi {
   events: {
     list(parameters: EventListParameters): Promise<ApiResponse<EventListData>>;
+    get(parameters: EventGetParameters): Promise<ApiResponse<GoogleCalendarEvent>>;
     insert(parameters: EventInsertParameters): Promise<ApiResponse<GoogleCalendarEvent>>;
     patch(
       parameters: EventPatchParameters,
@@ -290,11 +296,17 @@ export class CalendarClient implements CalendarAPI {
       return response.data;
     } catch (error: unknown) {
       // The deterministic event ID makes a conflict equivalent to success,
-      // including when a prior insert succeeded but its response was lost.
+      // including when a prior insert succeeded but its response was lost —
+      // unless the ID belongs to a deleted event. Return what holds the ID so
+      // the engine can tell a cancelled tombstone from its own block.
       if (!isStatus(error, 409)) {
         throw error;
       }
-      return undefined;
+      const existing = await withRetries(
+        async () => this.#api.events.get({ calendarId, eventId: event.id }),
+        this.#retryPolicy,
+      );
+      return existing.data;
     }
   }
 

@@ -24,6 +24,7 @@ function createApi(overrides: Partial<GoogleCalendarApi["events"]> = {}): Google
   return {
     events: {
       list: vi.fn(() => Promise.resolve({ data: {} })),
+      get: vi.fn(() => Promise.resolve({ data: { status: "confirmed" } })),
       insert: vi.fn(() => Promise.resolve({ data: {} })),
       patch: vi.fn(() => Promise.resolve({ data: {} })),
       delete: vi.fn(() => Promise.resolve({ data: {} })),
@@ -242,8 +243,25 @@ describe("CalendarClient", () => {
       .mockRejectedValue({ code: 404 });
     const client = new CalendarClient(createApi({ insert, delete: deleteEvent }));
 
-    await expect(client.insertEvent("calendar", managedEvent)).resolves.toBeUndefined();
+    await expect(client.insertEvent("calendar", managedEvent)).resolves.toEqual({
+      status: "confirmed",
+    });
     await expect(client.deleteEvent("calendar", "missing")).resolves.toBeUndefined();
+  });
+
+  it("returns the cancelled tombstone that holds a conflicting insert ID", async () => {
+    const insert = vi
+      .fn<GoogleCalendarApi["events"]["insert"]>()
+      .mockRejectedValue({ response: { status: 409 } });
+    const get = vi
+      .fn<GoogleCalendarApi["events"]["get"]>()
+      .mockResolvedValue({ data: { id: managedEvent.id, status: "cancelled" } });
+    const client = new CalendarClient(createApi({ insert, get }));
+
+    await expect(client.insertEvent("calendar", managedEvent)).resolves.toMatchObject({
+      status: "cancelled",
+    });
+    expect(get).toHaveBeenCalledWith({ calendarId: "calendar", eventId: managedEvent.id });
   });
 
   it("does not retry an actual insufficientPermissions response", async () => {
