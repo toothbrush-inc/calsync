@@ -1004,30 +1004,18 @@ describe("Reconciler", () => {
       expect(slots(runtime.work.events)).toEqual(["2026-08-10T09:00:00Z/2026-08-10T10:00:00Z"]);
     });
 
-    it("skips a block the destination's own busy time covers in full", async () => {
+    it("mirrors a block even when the destination's own busy time covers it", async () => {
       const runtime = setup(
         [at("inside", "10:15", "10:45"), at("straddles", "11:30", "12:30")],
         [at("work-meeting", "10:00", "11:00"), at("work-lunch", "12:00", "13:00")],
       );
 
       await runtime.reconciler.reconcile();
-      // The straddling block is kept whole, not trimmed around work-lunch.
-      expect(slots(runtime.work.events)).toEqual(["2026-08-10T11:30:00Z/2026-08-10T12:30:00Z"]);
-    });
-
-    it("does not let a free or declined native event cover a block", async () => {
-      const runtime = setup(
-        [at("personal", "10:00", "11:00")],
-        [
-          at("free-hold", "09:00", "12:00", { transparency: "transparent" }),
-          at("declined", "09:00", "12:00", {
-            attendees: [{ self: true, responseStatus: "declined" }],
-          }),
-        ],
-      );
-
-      await runtime.reconciler.reconcile();
-      expect(slots(runtime.work.events)).toEqual(["2026-08-10T10:00:00Z/2026-08-10T11:00:00Z"]);
+      // Blocks are never trimmed or dropped around the destination's own events.
+      expect(slots(runtime.work.events)).toEqual([
+        "2026-08-10T10:15:00Z/2026-08-10T10:45:00Z",
+        "2026-08-10T11:30:00Z/2026-08-10T12:30:00Z",
+      ]);
     });
 
     it("swaps the block when a source extends it, then settles", async () => {

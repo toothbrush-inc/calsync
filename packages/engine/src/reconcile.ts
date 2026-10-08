@@ -254,7 +254,6 @@ export class Reconciler {
       "personal",
       events.work,
       normalized.personal,
-      normalized.work,
       duplicateKeys,
       result,
       options,
@@ -265,7 +264,6 @@ export class Reconciler {
       "work",
       events.personal,
       normalized.work,
-      normalized.personal,
       duplicateKeys,
       result,
       options,
@@ -303,12 +301,7 @@ export class Reconciler {
     }
     for (const destinationRole of roles()) {
       const sourceRole = opposite(destinationRole);
-      const blocks = this.planDirection(
-        sourceRole,
-        normalized[sourceRole],
-        normalized[destinationRole],
-        duplicateKeys,
-      ).blocks;
+      const blocks = this.planDirection(sourceRole, normalized[sourceRole], duplicateKeys).blocks;
       for (const destination of activeManagedEvents(events[destinationRole])) {
         const key = managedMappingKey(destination);
         const block = key === undefined ? undefined : blocks.get(key);
@@ -478,7 +471,6 @@ export class Reconciler {
       const { blocks: desired } = this.planDirection(
         sourceRole,
         normalized[sourceRole],
-        normalized[destinationRole],
         duplicateKeys,
       );
       const mappedIds = new Map(
@@ -705,14 +697,12 @@ export class Reconciler {
 
   /**
    * The busy blocks one destination should hold: desired sources merged into
-   * disjoint intervals, minus any interval the destination's own busy events
-   * already cover in full. Partial overlaps keep the whole block rather than
-   * fragmenting it around native events.
+   * disjoint intervals. The destination's own events never suppress a block,
+   * even one they cover in full: the block says another calendar is busy too.
    */
   private planDirection(
     sourceRole: AccountRole,
     sourceEvents: readonly NormalizedSourceEvent[],
-    destinationNatives: readonly NormalizedSourceEvent[],
     duplicateKeys: ReadonlySet<string>,
   ): { evaluatedSources: EvaluatedSource[]; blocks: Map<string, BusyBlock> } {
     const { evaluatedSources, desired } = this.evaluateDirection(
@@ -721,13 +711,12 @@ export class Reconciler {
       duplicateKeys,
     );
     const destinationRole = opposite(sourceRole);
-    const nativeBusy = mergeBusyBlocks(destinationNatives);
-    const blocks = new Map<string, BusyBlock>();
-    for (const block of mergeBusyBlocks(desired)) {
-      if (!coveredBy(block, nativeBusy)) {
-        blocks.set(busyBlockKey(destinationRole, block.time, this.config.tenantId), block);
-      }
-    }
+    const blocks = new Map(
+      mergeBusyBlocks(desired).map((block) => [
+        busyBlockKey(destinationRole, block.time, this.config.tenantId),
+        block,
+      ]),
+    );
     return { evaluatedSources, blocks };
   }
 
@@ -782,7 +771,6 @@ export class Reconciler {
     sourceRole: AccountRole,
     destinationEvents: readonly GoogleCalendarEvent[],
     sourceEvents: readonly NormalizedSourceEvent[],
-    destinationNatives: readonly NormalizedSourceEvent[],
     duplicateKeys: ReadonlySet<string>,
     result: SyncReconcileResult,
     options: ReconcileOptions,
@@ -794,7 +782,6 @@ export class Reconciler {
     const { evaluatedSources, blocks } = this.planDirection(
       sourceRole,
       sourceEvents,
-      destinationNatives,
       duplicateKeys,
     );
     for (const { source, exclusionReason } of evaluatedSources) {
@@ -1308,23 +1295,6 @@ function mergeBusyBlocks(sources: readonly NormalizedSourceEvent[]): BusyBlock[]
     }
   }
   return [...merged, ...unplaced];
-}
-
-/** True when one merged block of the destination's own busy time spans the whole block. */
-function coveredBy(block: BusyBlock, nativeBusy: readonly BusyBlock[]): boolean {
-  const bounds = instantBounds(block.time);
-  return (
-    bounds !== undefined &&
-    nativeBusy.some((native) => {
-      const nativeBounds =
-        native.time.kind === block.time.kind ? instantBounds(native.time) : undefined;
-      return (
-        nativeBounds !== undefined &&
-        nativeBounds.start <= bounds.start &&
-        nativeBounds.end >= bounds.end
-      );
-    })
-  );
 }
 
 function blockFromInstants(
