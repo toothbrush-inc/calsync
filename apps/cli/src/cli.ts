@@ -40,13 +40,13 @@ import { RotatingFileLogger, serviceLogPath } from "./logging.js";
 import { runLiveMcpStdioServer } from "./mcp/server.js";
 import { TerminalProgress } from "./progress.js";
 import { ScanGate } from "./scanlimit.js";
-import { CALSYNC_VERSION, createAuthRuntime } from "./runtime.js";
+import { CALSYNC_VERSION, createAuthRuntime, type AccountRuntime } from "./runtime.js";
 import { StateDatabase, type CalendarRecord, type GoogleAccountRecord } from "./storage/index.js";
 import {
   calendarLabel,
   calendarLabels,
-  CalendarRefError,
   resolveAccountRef,
+  resolveAvailableRef,
   resolveCalendarRef,
   withStoredCalendars,
 } from "./calendars.js";
@@ -66,24 +66,6 @@ export interface AppRuntime {
   sync?: SyncService;
   /** Google sign-ins and calendars beyond the two roles. */
   accounts?: AccountRuntime;
-}
-
-/** What the account and calendar commands need. */
-export interface AccountRuntime {
-  auth: Pick<
-    GoogleAuthService,
-    | "connectAccount"
-    | "availableCalendars"
-    | "connectCalendar"
-    | "checkAccount"
-    | "checkCalendar"
-    | "disconnectAccount"
-  >;
-  state: Pick<StateDatabase, "listGoogleAccounts" | "listCalendars">;
-  removeCalendar(
-    calendarKey: string,
-    options?: { keepBlocks?: boolean },
-  ): Promise<ReconcileResult | undefined>;
 }
 
 export function createProgram(
@@ -167,7 +149,8 @@ function addAuthCommands(
         const rolesOnly = signedIn.every((entry) => isAccountRole(entry.slot));
         const roles = accountRoles.filter(
           (role) =>
-            stored.some((calendar) => calendar.key === role) ||
+            // Its calendar may have moved to a newer sign-in; the calendar checks cover that.
+            stored.some((calendar) => calendar.key === role && calendar.account === role) ||
             (rolesOnly && !signedIn.some((entry) => entry.slot === role)),
         );
         const statuses = await Promise.all(
@@ -344,27 +327,11 @@ function addAccountCommands(
           throw new Error("Use --source-only or --destination-only, not both");
         }
         await withAccounts(runtimeFactory, options.tenant, async (accounts) => {
-          const signedIn = accounts.state.listGoogleAccounts();
-          const slash = ref.indexOf("/");
-          const owner = resolveAccountRef(slash < 0 ? ref : ref.slice(0, slash), signedIn);
-          const wanted =
-            slash < 0
-              ? undefined
-              : ref
-                  .slice(slash + 1)
-                  .trim()
-                  .toLowerCase();
-          const available = await accounts.auth.availableCalendars(owner.slot);
-          const choice = available.find((option) =>
-            wanted === undefined
-              ? option.primary
-              : option.name.toLowerCase() === wanted || option.calendarId.toLowerCase() === wanted,
+          const { account: owner, calendar: choice } = await resolveAvailableRef(
+            ref,
+            accounts.state.listGoogleAccounts(),
+            (slot) => accounts.auth.availableCalendars(slot),
           );
-          if (choice === undefined) {
-            throw new CalendarRefError(
-              `${owner.email ?? owner.slot} has no calendar "${wanted ?? "primary"}"; see \`calsync calendar list --available\``,
-            );
-          }
           const added = await accounts.auth.connectCalendar(owner.slot, choice.calendarId, {
             source: options.destinationOnly !== true,
             destination: options.sourceOnly !== true,
@@ -805,17 +772,33 @@ function addWebCommands(program: Command): void {
         scanGate: new ScanGate(new StateDatabase(databasePath), loadScanGateLimits()),
         runtimeFor: (tenantId) => {
           const runtime = createAuthRuntime(tenantId);
+          const { auth, state } = runtime;
           return {
-            getStatus: (role, calendarId) => runtime.auth.getStatus(role, calendarId),
+            getStatus: (role, calendarId) => auth.getStatus(role, calendarId),
             startConnect: (role, calendarId) =>
-              runtime.auth.startConnect(role, calendarId, { openBrowser: false }),
-            listAccounts: () => runtime.state.listAccounts(),
+              auth.startConnect(role, calendarId, { openBrowser: false }),
+            listGoogleAccounts: () => state.listGoogleAccounts(),
+            listCalendars: () => state.listCalendars(),
+            checkAccount: (slot) => auth.checkAccount(slot),
+            checkCalendar: (calendar) => auth.checkCalendar(calendar),
+            freeAccountSlot: (reserved) => auth.freeAccountSlot(reserved),
+            hasSignedIn: () => state.hasSignedIn(),
+            startAccountConnect: () => auth.startAccountConnect(),
+            adoptSignIn: (slot) => auth.adoptSignIn(slot),
+            availableCalendars: (slot) => auth.availableCalendars(slot),
+            connectCalendar: (slot, calendarId, roles) =>
+              auth.connectCalendar(slot, calendarId, roles),
+            setCalendarRoles: (key, roles) => {
+              state.setCalendarRoles(key, roles);
+            },
+            removeCalendar: (key, options) => runtime.accounts.removeCalendar(key, options),
+            disconnectAccount: (slot) => auth.disconnectAccount(slot),
             syncSummary: () => readSyncSummary(runtime.state, tenantId),
             // Config is re-read per call so .env exclusions show current, as
             // the MCP tools do.
-            listExclusions: () => snapshotExclusions(loadConfig(), runtime.state),
+            listExclusions: () => snapshotExclusions(storedConfig(state), state),
             changeExclusions: (action, input) =>
-              changeExclusions(action, runtime.state, input, exclusionSources(loadConfig()), {
+              changeExclusions(action, state, input, exclusionSources(storedConfig(state)), {
                 allowMix: true,
               }),
             previewSync: async ({ lockTimeoutMs }) => {
@@ -1013,7 +996,7 @@ const EXCLUSION_APPLY_HINT =
 export function formatExclusionList(configured: AppConfig, state: StateDatabase): string {
   const calendars = state.listCalendars();
   const accounts = state.listGoogleAccounts();
-  const config = withStoredCalendars(configured, calendars, accounts);
+  const config = withStoredCalendars(configured, calendars, state.hasSignedIn());
   const labels = calendarLabels(calendars, accounts);
   const snapshot = snapshotExclusions(config, state);
   const origin = (entry: ExclusionListEntry): string => (entry.origin === "cli" ? "cli" : ".env");
@@ -1367,4 +1350,9 @@ if (entrypoint !== undefined) {
   if (import.meta.url === pathToFileURL(resolvedEntrypoint).href) {
     await main();
   }
+}
+
+/** The environment config with the tenant's stored calendars: what its exclusions apply to. */
+function storedConfig(state: Pick<StateDatabase, "listCalendars" | "hasSignedIn">): AppConfig {
+  return withStoredCalendars(loadConfig(), state.listCalendars(), state.hasSignedIn());
 }

@@ -59,16 +59,35 @@ shows a warning without naming it.
 
 ## Onboarding dashboard
 
-`calsync web` serves a small dashboard where a person sees their connected
-calendars (with links into Google Calendar), connects a missing one, checks
-that syncing is actively running, and manages exclusions. It shows
-privacy-safe data — counts, timestamps, the keywords they chose, and opaque
-keys — and event titles only in a dry-run preview they ask for. Its status
-check doubles as brokered onboarding: a passing validation records the
-tenant's accounts, which is what makes the daemon adopt them.
+`calsync web` serves a small dashboard where a person signs in their Google
+accounts, picks which of their calendars to sync (up to six, each sharing
+its busy time, receiving the others', or both), checks that syncing is
+actively running, and manages exclusions. It shows privacy-safe data —
+counts, timestamps, account addresses and calendar names, the keywords they
+chose, and opaque keys — and event titles only in a dry-run preview they ask
+for.
 
-Everything below the two calendars and the sync status lives under a collapsed
-"Advanced" block.
+Signing in goes through `POST /api/accounts`: `{ action: "connect" }` for a
+new account, `{ action: "reconnect", slot }` for one whose token stopped
+working, `{ action: "remove", slot }` for one no calendar uses. Under the
+gateway (`CALSYNC_WEB_CONNECT_URL`) both connect and reconnect hand out the
+gateway's consent link for a fresh, reserved `<tenant>_accountN` slot — never
+an existing account's, since the gateway stores the token before anyone knows
+whose it is. Adoption then goes by the address the token belongs to: a new
+account is recorded; an account already signed in moves to the new slot,
+calendars and all (its old token is forgotten locally); a slot recorded for a
+different address is never rebound. The gateway sends the person back with
+`?connected=<slot>` and the page asks to `adopt` it; status also adopts any
+reserved slot whose person finished elsewhere (a link opened in another
+browser). Calendars are added,
+re-roled and removed with `POST /api/calendars` (`add`, `update`, `remove`);
+`GET /api/calendars/available?account=<slot>` lists what an account can sync.
+A removal runs a pass, so it answers 409 while a live pass holds the lock.
+For a tenant with nothing stored, the status check still records a role
+sign-in the gateway finished, as before.
+
+Everything below the calendars, accounts and sync status lives under a
+collapsed "Advanced" block.
 
 - **Exclusions** mirror `calsync exclude` and the MCP exclusion tools. Each
   source calendar lists its keywords and excluded events with its own keyword box;

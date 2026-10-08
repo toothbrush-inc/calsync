@@ -231,7 +231,7 @@ export class DefaultSyncService implements SyncService {
     const stored = withStoredCalendars(
       this.config,
       this.state.listCalendars(this.config.tenantId),
-      this.state.listGoogleAccounts(this.config.tenantId),
+      this.state.hasSignedIn(this.config.tenantId),
     );
     if (!sameCalendarSet(stored.calendars, this.config.calendars)) {
       throw new ReconciliationError(

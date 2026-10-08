@@ -73,7 +73,20 @@ export interface CalendarStatus {
   calendar: CalendarRecord;
   valid: boolean;
   message: string;
+  /** Another tenant on this host syncs this calendar alongside one of ours. Operator-facing. */
+  conflictsWith?: string;
 }
+
+/** What recording a sign-in someone else finished came to. */
+export type SignInAdoption =
+  /** A new account, now signed in. */
+  | { status: "adopted"; account: GoogleAccountRecord }
+  /** An account already signed in elsewhere, moved onto this sign-in. */
+  | { status: "replaced"; account: GoogleAccountRecord }
+  /** The slot belongs to another address; nothing changed. */
+  | { status: "mismatch"; account: GoogleAccountRecord; email: string }
+  /** No usable token under the slot yet. */
+  | { status: "missing"; message: string };
 
 /** A calendar a signed-in account can see, and whether calsync can use it. */
 export interface AvailableCalendar {
@@ -155,7 +168,8 @@ export class AuthenticationError extends Error {
 }
 
 export class GoogleAuthService {
-  private readonly pending = new Map<AccountRole, GoogleConnectSession>();
+  /** Connects started without waiting for them, by slot. */
+  private readonly pending = new Map<string, GoogleConnectSession<unknown>>();
 
   constructor(
     private readonly oauth: OAuthConfig,
@@ -229,18 +243,111 @@ export class GoogleAuthService {
     };
   }
 
-  cancelConnect(role: AccountRole): void {
-    const session = this.pending.get(role);
+  cancelConnect(slot: string): void {
+    const session = this.pending.get(slot);
     if (session !== undefined) {
       session.cancel();
-      this.pending.delete(role);
+      this.pending.delete(slot);
     }
   }
 
   cancelPendingConnects(): void {
-    for (const role of this.pending.keys()) {
-      this.cancelConnect(role);
+    for (const slot of this.pending.keys()) {
+      this.cancelConnect(slot);
     }
+  }
+
+  /**
+   * Starts signing in one more Google account and returns the consent URL
+   * without waiting: the dashboard's local mode, where the person finishes in
+   * another tab. The account is recorded when they do (see connectAccount).
+   */
+  async startAccountConnect(): Promise<{ slot: string; url: string; expiresAt: string }> {
+    await this.refreshUnknownEmails();
+    const free = this.freeAccountSlot();
+    const slot = free ?? accountSlots[0];
+    this.cancelConnect(slot);
+    const session = await this.createConnectSession(slot, async (client, refreshToken) =>
+      this.adoptAccountToken(await primaryEmail(client), refreshToken),
+    );
+    this.pending.set(slot, session);
+    void session.complete().then(
+      () => {
+        if (this.pending.get(slot) === session) {
+          this.pending.delete(slot);
+        }
+      },
+      (error: unknown) => {
+        if (this.pending.get(slot) === session) {
+          this.pending.delete(slot);
+        }
+        const message = error instanceof Error ? error.message : "connect failed";
+        process.stderr.write(`calsync: account sign-in failed: ${message}\n`);
+      },
+    );
+    return { slot, url: session.url, expiresAt: session.expiresAt.toISOString() };
+  }
+
+  /**
+   * The slot a new sign-in takes, if any is free. `reserved` are slots already
+   * handed to sign-ins still in progress, so two at once never share one.
+   */
+  freeAccountSlot(reserved: Iterable<string> = []): string | undefined {
+    const taken = new Set(reserved);
+    return accountSlots.find(
+      (slot) => !taken.has(slot) && this.state.getGoogleAccount(slot) === null,
+    );
+  }
+
+  /**
+   * Records a sign-in someone else finished — the gateway's connect flow,
+   * which stores the token under `slot` and sends the person back. Learns the
+   * account from the token itself. A Google account already signed in under
+   * another slot moves there, calendars and all, and its old token is
+   * forgotten locally (never revoked at Google, which would cut off this new
+   * one too). A slot recorded for a different address is never rebound to
+   * whoever signed in: that is "mismatch", and nothing changes.
+   */
+  async adoptSignIn(slot: string): Promise<SignInAdoption> {
+    let email: string;
+    try {
+      email = await primaryEmail(await this.calendarApi(slot));
+    } catch (error) {
+      return {
+        status: "missing",
+        message: error instanceof Error ? error.message : authFailureMessage(error),
+      };
+    }
+    const current = this.state.getGoogleAccount(slot);
+    if (current?.email != null && current.email !== email) {
+      return { status: "mismatch", account: current, email };
+    }
+    const existing = this.state.findGoogleAccountByEmail(email);
+    if (existing !== null && existing.slot !== slot) {
+      this.state.moveGoogleAccount(existing.slot, slot);
+      this.state.upsertGoogleAccount(slot, email);
+      await this.tokens.deleteRefreshToken(existing.slot);
+    } else {
+      this.state.upsertGoogleAccount(slot, email);
+    }
+    const account = this.state.getGoogleAccount(slot);
+    if (account === null) {
+      return { status: "missing", message: "the account was not recorded; try again" };
+    }
+    return {
+      status: existing !== null && existing.slot !== slot ? "replaced" : "adopted",
+      account,
+    };
+  }
+
+  /** Sign-ins from before calsync kept emails learn theirs. */
+  private async refreshUnknownEmails(): Promise<void> {
+    await Promise.all(
+      this.state
+        .listGoogleAccounts()
+        .filter((account) => account.email === null)
+        .map((account) => this.checkAccount(account.slot)),
+    );
   }
 
   async getStatus(role: AccountRole, configuredCalendarId: string): Promise<AccountStatus> {
@@ -417,13 +524,8 @@ export class GoogleAuthService {
   async connectAccount(options: AuthorizationOptions = {}): Promise<GoogleAccountRecord> {
     // Sign-ins from before calsync kept emails learn theirs first, so signing
     // the same Google account in again finds its slot instead of taking a new one.
-    await Promise.all(
-      this.state
-        .listGoogleAccounts()
-        .filter((account) => account.email === null)
-        .map((account) => this.checkAccount(account.slot)),
-    );
-    const free = accountSlots.find((slot) => this.state.getGoogleAccount(slot) === null);
+    await this.refreshUnknownEmails();
+    const free = this.freeAccountSlot();
     const session = await this.createConnectSession(
       free ?? accountSlots[0],
       async (client, refreshToken) =>
@@ -613,16 +715,22 @@ export class GoogleAuthService {
           message: `no longer readable (access role: ${accessRole ?? "unknown"})`,
         };
       }
+      const fingerprint = calendarFingerprint(entry, calendar.calendarId);
       this.state.verifyCalendar(calendar.key, {
-        fingerprint: calendarFingerprint(entry, calendar.calendarId),
+        fingerprint,
         name: entry.summaryOverride ?? entry.summary ?? null,
         accessRole: accessRole ?? null,
       });
       const refreshed = this.state.getCalendar(calendar.key) ?? calendar;
+      const conflictsWith =
+        fingerprint === undefined
+          ? undefined
+          : this.state.calendarConflict(fingerprint, calendar.key);
       return {
         calendar: refreshed,
         valid: true,
         message: calendar.destination ? "readable and writable" : "readable",
+        ...(conflictsWith === undefined ? {} : { conflictsWith }),
       };
     } catch (error) {
       return {

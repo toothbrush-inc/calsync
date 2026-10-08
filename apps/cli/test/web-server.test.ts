@@ -4,10 +4,9 @@ import { describe, expect, it } from "vitest";
 
 import type { ReconcileLog, ReconcileSourceDetail, StoredSyncSummary } from "@calsync/engine";
 
-import type { AccountRole } from "../src/config.js";
 import type { ExclusionChangeResult, ExclusionSnapshot } from "../src/exclusions.js";
 import type { AccountStatus, ConnectStartResult } from "../src/google/auth.js";
-import type { AccountRecord } from "../src/storage/index.js";
+import type { CalendarRecord, GoogleAccountRecord } from "../src/storage/index.js";
 import {
   calendarUrl,
   signWebToken,
@@ -37,19 +36,44 @@ function memoryScanStore(): ScanGateStore {
 
 type FakeRuntime = WebTenantRuntime & {
   closed: boolean;
+  everSignedIn: boolean;
   tenantId: string;
+  signIns: GoogleAccountRecord[];
+  calendars: CalendarRecord[];
   exclusionCalls: { action: "add" | "remove"; input: unknown }[];
   dedupeCalls: { dryRun: boolean; lockTimeoutMs: number }[];
   previewCalls: { lockTimeoutMs: number }[];
 };
 
-function accountRecord(role: AccountRole, tenantId: string, calendarId: string): AccountRecord {
+function signIn(tenantId: string, slot: string, email: string): GoogleAccountRecord {
   return {
     tenantId,
-    role,
-    calendarId,
+    slot,
+    email,
     authorizedAt: "2026-08-28T10:00:00.000Z",
     verifiedAt: "2026-08-28T10:00:00.000Z",
+  };
+}
+
+function calendarRecord(
+  tenantId: string,
+  key: string,
+  account: string,
+  calendarId: string,
+  extra: Partial<CalendarRecord> = {},
+): CalendarRecord {
+  return {
+    tenantId,
+    key,
+    account,
+    calendarId,
+    name: null,
+    accessRole: "owner",
+    source: true,
+    destination: true,
+    addedAt: "2026-08-28T10:00:00.000Z",
+    verifiedAt: "2026-08-28T10:00:00.000Z",
+    ...extra,
   };
 }
 
@@ -80,23 +104,27 @@ const duplicateRemoval: ReconcileLog = {
   dryRun: true,
 };
 
-function fakeRuntime(
-  tenantId: string,
-  overrides: Partial<
-    Pick<WebTenantRuntime, "getStatus" | "startConnect" | "listAccounts" | "previewSync" | "dedupe">
-  > = {},
-): FakeRuntime {
+function fakeRuntime(tenantId: string, overrides: Partial<WebTenantRuntime> = {}): FakeRuntime {
   const runtime: FakeRuntime = {
     tenantId,
     closed: false,
+    everSignedIn: true,
+    hasSignedIn: () => runtime.everSignedIn,
+    signIns: [
+      signIn(tenantId, "personal", `${tenantId}-personal@example.com`),
+      signIn(tenantId, "work", `${tenantId}-work@example.com`),
+    ],
+    calendars: [
+      calendarRecord(tenantId, "personal", "personal", "primary"),
+      calendarRecord(tenantId, "work", "work", "primary"),
+    ],
     getStatus: (role, calendarId) =>
       Promise.resolve<AccountStatus>({
         role,
-        configured: true,
-        valid: true,
+        configured: false,
+        valid: false,
         calendarId,
-        message: "authorized and writable",
-        account: `${tenantId}-${role}@example.com`,
+        message: "not authorized",
       }),
     startConnect: (role) =>
       Promise.resolve<ConnectStartResult>({
@@ -105,10 +133,78 @@ function fakeRuntime(
         url: `https://accounts.google.com/consent/${tenantId}/${role}`,
         expiresAt: "2026-08-28T12:00:00.000Z",
       }),
-    listAccounts: () => [
-      accountRecord("personal", tenantId, `${tenantId}-personal@example.com`),
-      accountRecord("work", tenantId, `${tenantId}-work@example.com`),
-    ],
+    listGoogleAccounts: () => runtime.signIns,
+    listCalendars: () => runtime.calendars,
+    checkAccount: (slot) =>
+      Promise.resolve({
+        slot,
+        email: runtime.signIns.find((entry) => entry.slot === slot)?.email ?? null,
+        valid: true,
+        message: "signed in",
+      }),
+    checkCalendar: (calendar) =>
+      Promise.resolve({ calendar, valid: true, message: "readable and writable" }),
+    freeAccountSlot: (reserved = []) => {
+      const taken = new Set(reserved);
+      return ["account1", "account2", "account3"].find(
+        (slot) => !taken.has(slot) && !runtime.signIns.some((entry) => entry.slot === slot),
+      );
+    },
+    startAccountConnect: () =>
+      Promise.resolve({
+        slot: "account1",
+        url: `https://accounts.google.com/consent/${tenantId}/account`,
+        expiresAt: "2026-08-28T12:00:00.000Z",
+      }),
+    adoptSignIn: (slot) => {
+      const account = signIn(tenantId, slot, `${slot}@example.com`);
+      runtime.signIns.push(account);
+      return Promise.resolve({ status: "adopted" as const, account });
+    },
+    availableCalendars: () =>
+      Promise.resolve([
+        {
+          calendarId: "primary-id@example.com",
+          name: "primary-id@example.com",
+          accessRole: "owner",
+          primary: true,
+          writable: true,
+          readable: true,
+        },
+        {
+          calendarId: "team@group.example.com",
+          name: "Team",
+          accessRole: "reader",
+          primary: false,
+          writable: false,
+          readable: true,
+        },
+      ]),
+    connectCalendar: (slot, calendarId, roles) => {
+      const added = calendarRecord(tenantId, "cal-team", slot, calendarId, {
+        name: "Team",
+        accessRole: "reader",
+        source: roles.source,
+        destination: roles.destination,
+      });
+      runtime.calendars.push(added);
+      return Promise.resolve(added);
+    },
+    setCalendarRoles: (key, roles) => {
+      runtime.calendars = runtime.calendars.map((calendar) =>
+        calendar.key === key
+          ? { ...calendar, source: roles.source, destination: roles.destination }
+          : calendar,
+      );
+    },
+    removeCalendar: (key) => {
+      runtime.calendars = runtime.calendars.filter((calendar) => calendar.key !== key);
+      return Promise.resolve({ created: 0, updated: 0, deleted: 3, repaired: 0 });
+    },
+    disconnectAccount: (slot) => {
+      runtime.signIns = runtime.signIns.filter((entry) => entry.slot !== slot);
+      return Promise.resolve();
+    },
     syncSummary: (): StoredSyncSummary => ({
       lastFullSyncAt: "2026-08-28T09:00:00.000Z",
       lastResult: {
@@ -288,16 +384,25 @@ describe("web onboarding server", () => {
       expect(status.tenant).toBe("default");
       expect(status.overall).toBe("syncing");
       expect(status.daemonRunning).toBe(true);
-      expect(status.accounts).toHaveLength(2);
-      expect(status.accounts[0]).toMatchObject({
-        role: "personal",
-        connected: true,
+      expect(status.signIns.map((entry) => [entry.email, entry.calendars])).toEqual([
+        ["default-personal@example.com", 1],
+        ["default-work@example.com", 1],
+      ]);
+      expect(status.calendars[0]).toMatchObject({
+        key: "personal",
+        label: "default-personal@example.com",
+        account: "default-personal@example.com",
+        shares: true,
+        receives: true,
+        writable: true,
         valid: true,
-        calendarId: "default-personal@example.com",
+        conflict: false,
       });
-      expect(status.accounts[0]?.calendarUrl).toContain(
+      expect(status.calendars[0]?.calendarUrl).toContain(
         "https://calendar.google.com/calendar/u/0/r?cid=",
       );
+      expect(status.maxCalendars).toBe(6);
+      expect(status.canAddAccount).toBe(true);
       expect(status.lastFullSyncAt).toBe("2026-08-28T09:00:00.000Z");
       expect(status.lastResult).toEqual({
         converged: true,
@@ -308,34 +413,22 @@ describe("web onboarding server", () => {
     }
   });
 
-  it("reports setup when a calendar is missing and daemon-offline when the daemon is down", async () => {
-    const notConnected = await startServer({
-      runtimeFor: (tenantId) =>
-        fakeRuntime(tenantId, {
-          listAccounts: () => [],
-          getStatus: (role, calendarId) =>
-            Promise.resolve<AccountStatus>({
-              role,
-              configured: role === "personal",
-              valid: role === "personal",
-              calendarId,
-              message: role === "personal" ? "authorized and writable" : "not authorized",
-            }),
-        }),
+  it("reports setup below two calendars and daemon-offline when the daemon is down", async () => {
+    const oneCalendar = await startServer({
+      runtimeFor: (tenantId) => {
+        const runtime = fakeRuntime(tenantId);
+        runtime.calendars = runtime.calendars.slice(0, 1);
+        return runtime;
+      },
     });
     try {
       const status = (await (
-        await fetch(`${notConnected.base}/api/status`)
+        await fetch(`${oneCalendar.base}/api/status`)
       ).json()) as WebStatusView;
       expect(status.overall).toBe("setup");
-      expect(status.accounts[1]).toMatchObject({
-        role: "work",
-        connected: false,
-        calendarId: null,
-        calendarUrl: null,
-      });
+      expect(status.calendars).toHaveLength(1);
     } finally {
-      await notConnected.server.close();
+      await oneCalendar.server.close();
     }
 
     const offline = await startServer({ daemonIsRunning: () => false });
@@ -347,20 +440,48 @@ describe("web onboarding server", () => {
     }
   });
 
-  it("flags a calendar-pair conflict without naming the other tenant", async () => {
+  it("adopts a role the gateway connected before anything was stored", async () => {
+    const adopted: string[] = [];
+    const { base, server } = await startServer({
+      runtimeFor: (tenantId) => {
+        const runtime = fakeRuntime(tenantId, {
+          getStatus: (role, calendarId) => {
+            adopted.push(role);
+            return Promise.resolve<AccountStatus>({
+              role,
+              configured: false,
+              valid: false,
+              calendarId,
+              message: "not authorized",
+            });
+          },
+        });
+        runtime.signIns = [];
+        runtime.calendars = [];
+        runtime.everSignedIn = false;
+        return runtime;
+      },
+    });
+    try {
+      const status = (await (await fetch(`${base}/api/status`)).json()) as WebStatusView;
+      expect(adopted.sort()).toEqual(["personal", "work"]);
+      expect(status.overall).toBe("setup");
+      expect(status.signIns).toEqual([]);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("flags a calendar conflict without naming the other tenant", async () => {
     const { base, server } = await startServer({
       runtimeFor: (tenantId) =>
         fakeRuntime(tenantId, {
-          getStatus: (role, calendarId) =>
-            Promise.resolve<AccountStatus>({
-              role,
-              configured: true,
-              valid: role === "personal",
-              calendarId,
-              message:
-                role === "personal" ? "authorized and writable" : "already syncing elsewhere",
-              account: `${role}@example.com`,
-              ...(role === "work" ? { conflictsWith: "i-someone-elses-tenant" } : {}),
+          checkCalendar: (calendar) =>
+            Promise.resolve({
+              calendar,
+              valid: true,
+              message: "readable and writable",
+              ...(calendar.key === "work" ? { conflictsWith: "i-someone-elses-tenant" } : {}),
             }),
         }),
     });
@@ -368,9 +489,7 @@ describe("web onboarding server", () => {
       const response = await fetch(`${base}/api/status`);
       const text = await response.text();
       const status = JSON.parse(text) as WebStatusView;
-      expect(status.overall).toBe("setup");
-      expect(status.accounts.map((account) => account.conflict)).toEqual([false, true]);
-      expect(status.accounts[1]?.message).toBe("already syncing elsewhere");
+      expect(status.calendars.map((calendar) => calendar.conflict)).toEqual([false, true]);
       expect(text).not.toContain("i-someone-elses-tenant");
     } finally {
       await server.close();
@@ -381,90 +500,217 @@ describe("web onboarding server", () => {
     const { base, server } = await startServer({
       runtimeFor: (tenantId) =>
         fakeRuntime(tenantId, {
-          getStatus: () => Promise.reject(new Error("network down")),
+          checkCalendar: () => Promise.reject(new Error("network down")),
         }),
     });
     try {
       const status = (await (await fetch(`${base}/api/status`)).json()) as WebStatusView;
       expect(status.overall).toBe("setup");
-      expect(status.accounts[0]?.valid).toBe(false);
+      expect(status.calendars[0]?.valid).toBe(false);
     } finally {
       await server.close();
     }
   });
 
-  it("starts a local connect session and keeps the tenant runtime alive for it", async () => {
+  it("starts local sign-ins and keeps the tenant runtime alive for them", async () => {
     const { base, server, runtimes } = await startServer();
-    try {
-      const response = await fetch(`${base}/api/connect`, {
+    const post = (body: unknown) =>
+      fetch(`${base}/api/accounts`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ role: "work" }),
+        body: JSON.stringify(body),
       });
-      const payload = (await response.json()) as { url: string; external: boolean };
-      expect(payload.external).toBe(false);
-      expect(payload.url).toBe("https://accounts.google.com/consent/default/work");
+    try {
+      const added = (await (await post({ action: "connect" })).json()) as {
+        url: string;
+        external: boolean;
+      };
+      expect(added).toMatchObject({
+        external: false,
+        url: "https://accounts.google.com/consent/default/account",
+      });
+      // A role signs in again through its own flow, which re-adds its calendar.
+      const again = (await (await post({ action: "reconnect", slot: "work" })).json()) as {
+        url: string;
+      };
+      expect(again.url).toBe("https://accounts.google.com/consent/default/work");
+      expect((await post({ action: "reconnect", slot: "corporate" })).status).toBe(400);
+      expect((await post({ action: "nonsense" })).status).toBe(400);
       expect(runtimes).toHaveLength(1);
       expect(runtimes[0]?.closed).toBe(false);
-
-      const rejected = await fetch(`${base}/api/connect`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ role: "corporate" }),
-      });
-      expect(rejected.status).toBe(400);
     } finally {
       await server.close();
     }
     expect(runtimes[0]?.closed).toBe(true);
   });
 
-  it("routes connect to the external template under the gateway", async () => {
-    const { base, server } = await startServer({
-      connectUrl: "https://gateway.example.test/connect/{tenant}/{role}",
-    });
-    try {
-      const response = await fetch(`${base}/api/connect`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ role: "personal" }),
-      });
-      const payload = (await response.json()) as { url: string; external: boolean };
-      expect(payload).toEqual({
-        url: "https://gateway.example.test/connect/default/personal",
-        external: true,
-      });
-      const status = (await (await fetch(`${base}/api/status`)).json()) as WebStatusView;
-      expect(status.connectMode).toBe("external");
-    } finally {
-      await server.close();
-    }
-  });
-
-  it("expands {slot} with tenant-scoped broker slots, bare for the default tenant", async () => {
+  it("sends sign-ins to the gateway's template for the tenant's slot, and adopts them back", async () => {
     const secret = "0123456789abcdef";
-    const { base, server } = await startServer({
+    const { base, server, runtimes } = await startServer({
       secret,
       connectUrl: "https://gw.example.test/auth/google/connect?slot={slot}",
     });
     try {
-      const connect = async (tenant: string): Promise<string> => {
-        const response = await fetch(`${base}/api/connect`, {
+      const post = async (tenant: string, body: unknown) => {
+        const response = await fetch(`${base}/api/accounts`, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             cookie: `calsync_web=${signWebToken(tenant, secret, { kind: "session" })}`,
           },
-          body: JSON.stringify({ role: "personal" }),
+          body: JSON.stringify(body),
         });
-        return ((await response.json()) as { url: string }).url;
+        return {
+          status: response.status,
+          body: (await response.json()) as Record<string, unknown>,
+        };
       };
-      expect(await connect("default")).toBe(
-        "https://gw.example.test/auth/google/connect?slot=personal",
+      expect((await post("default", { action: "connect" })).body).toEqual({
+        url: "https://gw.example.test/auth/google/connect?slot=account1",
+        external: true,
+      });
+      expect((await post("acme", { action: "connect" })).body["url"]).toBe(
+        "https://gw.example.test/auth/google/connect?slot=acme_account1",
       );
-      expect(await connect("acme")).toBe(
-        "https://gw.example.test/auth/google/connect?slot=acme_personal",
+      // Reconnecting never hands the gateway an existing account's slot: a
+      // different Google account picked there would take its calendars over.
+      expect((await post("acme", { action: "reconnect", slot: "personal" })).body["url"]).toBe(
+        "https://gw.example.test/auth/google/connect?slot=acme_account2",
       );
+
+      // The gateway sends the person back with ?connected=acme_account1.
+      const adopted = await post("acme", { action: "adopt", slot: "acme_account1" });
+      expect(adopted.body).toEqual({ status: "adopted", email: "account1@example.com" });
+      const acme = runtimes.find((runtime) => runtime.tenantId === "acme");
+      expect(acme?.signIns.map((entry) => entry.slot)).toContain("account1");
+      // Another tenant's slot is not this tenant's to adopt.
+      expect((await post("acme", { action: "adopt", slot: "other_account2" })).status).toBe(400);
+
+      const status = (await (
+        await fetch(`${base}/api/status`, {
+          headers: { cookie: `calsync_web=${signWebToken("acme", secret, { kind: "session" })}` },
+        })
+      ).json()) as WebStatusView;
+      expect(status.connectMode).toBe("external");
+      expect(status.signIns.map((entry) => entry.slot)).toContain("account1");
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("adopts a gateway sign-in on status when the person never came back to say so", async () => {
+    const { base, server, runtimes } = await startServer({
+      connectUrl: "https://gw.example.test/auth/google/connect?slot={slot}",
+    });
+    try {
+      await fetch(`${base}/api/accounts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "connect" }),
+      });
+      // Finished in another browser: no ?connected, no adopt call.
+      const status = (await (await fetch(`${base}/api/status?fresh=1`)).json()) as WebStatusView;
+      expect(status.signIns.map((entry) => entry.slot)).toContain("account1");
+      expect(runtimes[0]?.signIns.filter((entry) => entry.slot === "account1")).toHaveLength(1);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("is not syncing until one calendar shares busy time and another receives it", async () => {
+    const { base, server } = await startServer({
+      runtimeFor: (tenantId) => {
+        const runtime = fakeRuntime(tenantId);
+        runtime.calendars = runtime.calendars.map((calendar) => ({
+          ...calendar,
+          destination: false,
+        }));
+        return runtime;
+      },
+    });
+    try {
+      const status = (await (await fetch(`${base}/api/status`)).json()) as WebStatusView;
+      expect(status.overall).toBe("setup");
+    } finally {
+      await server.close();
+    }
+    // An unused, signed-out sign-in does not hold syncing up.
+    const spare = await startServer({
+      runtimeFor: (tenantId) => {
+        const runtime = fakeRuntime(tenantId);
+        runtime.signIns.push(signIn(tenantId, "account1", "spare@example.com"));
+        runtime.checkAccount = (slot) =>
+          Promise.resolve({ slot, email: null, valid: slot !== "account1", message: "x" });
+        return runtime;
+      },
+    });
+    try {
+      const status = (await (await fetch(`${spare.base}/api/status`)).json()) as WebStatusView;
+      expect(status.overall).toBe("syncing");
+    } finally {
+      await spare.server.close();
+    }
+  });
+
+  it("adds, re-roles and removes calendars, refusing what a calendar cannot do", async () => {
+    let busy = false;
+    const { base, server, runtimes } = await startServer({
+      runtimeFor: (tenantId) => {
+        const runtime = fakeRuntime(tenantId, {});
+        const remove = runtime.removeCalendar.bind(runtime);
+        runtime.removeCalendar = (key, options) =>
+          busy ? Promise.reject(new LockTimeoutError()) : remove(key, options);
+        runtimes.push(runtime);
+        return runtime;
+      },
+    });
+    const post = async (body: unknown) => {
+      const response = await fetch(`${base}/api/calendars`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+    };
+    try {
+      const available = (await (
+        await fetch(`${base}/api/calendars/available?account=work`)
+      ).json()) as { calendars: { name: string; synced: boolean }[] };
+      expect(available.calendars.map((entry) => [entry.name, entry.synced])).toEqual([
+        // The role's own calendar is stored as "primary", and is that account's primary.
+        ["primary-id@example.com", true],
+        ["Team", false],
+      ]);
+      expect((await fetch(`${base}/api/calendars/available?account=nobody`)).status).toBe(400);
+
+      expect(
+        (
+          await post({
+            action: "add",
+            account: "work",
+            calendarId: "team@group.example.com",
+            shares: true,
+            receives: false,
+          })
+        ).body,
+      ).toEqual({ key: "cal-team" });
+      // Read-only: it cannot be made to receive busy blocks.
+      expect((await post({ action: "update", key: "cal-team", receives: true })).status).toBe(400);
+      expect(
+        (await post({ action: "update", key: "personal", shares: true, receives: false })).status,
+      ).toBe(200);
+      expect(runtimes[0]?.calendars.find((entry) => entry.key === "personal")?.destination).toBe(
+        false,
+      );
+
+      busy = true;
+      expect((await post({ action: "remove", key: "cal-team" })).status).toBe(409);
+      busy = false;
+      expect((await post({ action: "remove", key: "cal-team" })).body).toEqual({
+        removed: "cal-team",
+        deleted: 3,
+      });
+      expect((await post({ action: "remove", key: "cal-team" })).status).toBe(404);
     } finally {
       await server.close();
     }
@@ -662,10 +908,10 @@ describe("web onboarding server", () => {
     try {
       const post = async (headers: Record<string, string>): Promise<number> =>
         (
-          await fetch(`${base}/api/connect`, {
+          await fetch(`${base}/api/accounts`, {
             method: "POST",
             headers,
-            body: JSON.stringify({ role: "work" }),
+            body: JSON.stringify({ action: "connect" }),
           })
         ).status;
       // A plain HTML form cannot send JSON, so a non-JSON body is not ours.
@@ -1134,22 +1380,16 @@ describe("web onboarding server", () => {
     const { base, server } = await startServer({
       runtimeFor: (tenantId) =>
         fakeRuntime(tenantId, {
-          getStatus: (role, calendarId) => {
+          checkCalendar: (calendar) => {
             calls += 1;
-            return Promise.resolve<AccountStatus>({
-              role,
-              configured: true,
-              valid: true,
-              calendarId,
-              message: "authorized and writable",
-            });
+            return Promise.resolve({ calendar, valid: true, message: "readable and writable" });
           },
         }),
     });
     try {
       await Promise.all([1, 2, 3].map(() => fetch(`${base}/api/status`)));
       await fetch(`${base}/api/status`);
-      // Two roles, validated once, no matter how many tabs are polling.
+      // Two calendars, validated once, no matter how many tabs are polling.
       expect(calls).toBe(2);
       // Right after a connection lands, the page asks for a fresh answer.
       await fetch(`${base}/api/status?fresh=1`);

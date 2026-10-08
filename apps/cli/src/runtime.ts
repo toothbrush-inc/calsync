@@ -1,3 +1,4 @@
+import type { ReconcileResult } from "@calsync/engine";
 import {
   brokeredToken,
   egressFromEnv,
@@ -48,15 +49,35 @@ function applyTenant(config: AppConfig, tenantId?: string): AppConfig {
   };
 }
 
+/** Google sign-ins and calendars beyond the two roles: what the CLI, dashboard and MCP manage. */
+export interface AccountRuntime {
+  auth: Pick<
+    GoogleAuthService,
+    | "connectAccount"
+    | "startAccountConnect"
+    | "freeAccountSlot"
+    | "adoptSignIn"
+    | "availableCalendars"
+    | "connectCalendar"
+    | "checkAccount"
+    | "checkCalendar"
+    | "disconnectAccount"
+  >;
+  state: Pick<
+    StateDatabase,
+    "listGoogleAccounts" | "listCalendars" | "setCalendarRoles" | "hasSignedIn"
+  >;
+  removeCalendar(
+    calendarKey: string,
+    options?: { keepBlocks?: boolean; lockTimeoutMs?: number },
+  ): Promise<ReconcileResult | undefined>;
+}
+
 export interface LiveAppRuntime {
   auth: GoogleAuthService;
   state: StateDatabase;
   sync: SyncService;
-  accounts: {
-    auth: GoogleAuthService;
-    state: StateDatabase;
-    removeCalendar: DefaultSyncService["removeCalendar"];
-  };
+  accounts: AccountRuntime;
 }
 
 export function createAuthRuntime(tenantId?: string): LiveAppRuntime {
@@ -64,7 +85,7 @@ export function createAuthRuntime(tenantId?: string): LiveAppRuntime {
   const databasePath = stateDatabasePath();
   const configured = applyTenant(loadConfig(), tenantId);
   const state = new StateDatabase(databasePath, configured.tenantId);
-  const config = withStoredCalendars(configured, state.listCalendars(), state.listGoogleAccounts());
+  const config = withStoredCalendars(configured, state.listCalendars(), state.hasSignedIn());
   const vault = openVault();
   // Under the gateway, mint short-lived access tokens from the broker instead
   // of reading refresh tokens in this process. Broker slots follow the same
@@ -77,33 +98,53 @@ export function createAuthRuntime(tenantId?: string): LiveAppRuntime {
     backups: config.logging?.backups ?? 5,
   });
   const writeLog = logger.write.bind(logger);
-  const base = new DefaultSyncService(
-    config,
-    auth,
-    state,
-    syncLockPathFor(databasePath, config.tenantId),
-    writeLog,
-  );
+  // Long-lived callers (the dashboard, the MCP server) keep this runtime
+  // while calendars are added and removed, so the service follows what is
+  // stored instead of what was stored when it was built.
+  let service = { config, instance: newService(config) };
+  function newService(tenantConfig: AppConfig): DefaultSyncService {
+    return new DefaultSyncService(
+      tenantConfig,
+      auth,
+      state,
+      syncLockPathFor(databasePath, tenantConfig.tenantId),
+      writeLog,
+    );
+  }
+  const current = (): DefaultSyncService => {
+    const stored = withStoredCalendars(configured, state.listCalendars(), state.hasSignedIn());
+    if (!sameCalendarSet(stored.calendars, service.config.calendars)) {
+      service = { config: stored, instance: newService(stored) };
+    }
+    return service.instance;
+  };
   return {
     auth,
     state,
     accounts: {
       auth,
       state,
-      removeCalendar: (calendarKey, options) => base.removeCalendar(calendarKey, options),
+      removeCalendar: (calendarKey, options) => current().removeCalendar(calendarKey, options),
     },
     sync: {
-      once: (options) => base.once(options),
-      rebuild: (options) => base.rebuild(options),
-      cleanup: (options) => base.cleanup(options),
-      dedupe: (options) => base.dedupe(options),
-      // One daemon serves every authorized tenant on this host; the accounts
-      // table is re-consulted before every pass round, so tenants signed up
-      // while the daemon runs are picked up without a restart.
+      once: (options) => current().once(options),
+      rebuild: (options) => current().rebuild(options),
+      cleanup: (options) => current().cleanup(options),
+      dedupe: (options) => current().dedupe(options),
+      // One daemon serves every authorized tenant on this host; stored
+      // calendars are re-consulted before every pass round, so tenants signed
+      // up while the daemon runs are picked up without a restart.
       start: (options) =>
-        buildDaemon(oauth, vault, databasePath, configured, base, state, egress, writeLog).start(
-          options,
-        ),
+        buildDaemon(
+          oauth,
+          vault,
+          databasePath,
+          configured,
+          current(),
+          state,
+          egress,
+          writeLog,
+        ).start(options),
     },
   };
 }
@@ -165,7 +206,7 @@ function buildDaemon(
       const tenantConfig = withStoredCalendars(
         tenantId === config.tenantId ? config : configForTenant(config, tenantId),
         baseState.listCalendars(tenantId),
-        baseState.listGoogleAccounts(tenantId),
+        baseState.hasSignedIn(tenantId),
       );
       // Fewer than two calendars is nothing to sync yet, not an error per round.
       if (tenantConfig.calendars.length >= 2) {
