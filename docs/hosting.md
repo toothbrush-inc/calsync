@@ -232,8 +232,11 @@ Google connections it may use: `personal`, `work`, and `account1`…`account6`
 for the sign-ins `calsync account add` makes. Each sign-in stores its refresh
 token in the vault and registers a grant (`calsync:google:<slot>`); tenant
 slots are `<tenant>_<slot>`, which is what lets the gateway connect and broker
-them without knowing tenants ahead of time. `calsync logout` removes the two
-role grants; `calsync account remove` forgets an added one locally. Token reads go through
+them without knowing tenants ahead of time. `calsync logout` deletes a role
+calendar's busy blocks and removes its grant, revoking it at Google unless
+another sign-in on this host is the same Google account (a revoke ends every
+sign-in of that account to this OAuth client); `calsync account remove`
+forgets an added one locally. Token reads go through
 `getSecretFor("calsync", ...)`. The default `VAULT_GRANT_MODE=auto` never
 blocks on a laptop; `VAULT_GRANT_MODE=explicit` enforces the grant rows and is
 useful for hosted-like testing — a missing grant then surfaces as "connected

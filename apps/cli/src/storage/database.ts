@@ -150,7 +150,7 @@ interface WatchChannelRow {
 
 export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSource {
   private readonly db: Database.Database;
-  private readonly tenantId: string;
+  readonly tenantId: string;
 
   constructor(path: string, tenantId = "default") {
     this.tenantId = tenantId;
@@ -251,12 +251,73 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
     return row === undefined ? null : googleAccountFromRow(row);
   }
 
+  /** Every sign-in on this host, in any tenant, that is this Google account. */
+  signInsWithEmail(email: string): { tenantId: string; slot: string }[] {
+    const rows = this.db
+      .prepare(
+        "SELECT tenant_id, slot FROM google_accounts WHERE email = ? ORDER BY tenant_id, slot",
+      )
+      .all(normalizeEmail(email)) as { tenant_id: string; slot: string }[];
+    return rows.map((row) => ({ tenantId: row.tenant_id, slot: row.slot }));
+  }
+
   listGoogleAccounts(tenantId?: string): GoogleAccountRecord[] {
     const tid = tenantId ?? this.tenantId;
     const rows = this.db
       .prepare(`${GOOGLE_ACCOUNT_COLUMNS} WHERE tenant_id = ? ORDER BY ${SLOT_ORDER}`)
       .all(tid) as GoogleAccountRow[];
     return rows.map(googleAccountFromRow);
+  }
+
+  /**
+   * Holds the first of `slots` that no sign-in has and none is waiting on,
+   * until `until`. One immediate transaction, so two processes reserving at
+   * once get different slots. Undefined when every slot is taken.
+   */
+  reserveSignInSlot(
+    slots: readonly string[],
+    until: Date,
+    now = new Date(),
+    tenantId?: string,
+  ): string | undefined {
+    const tid = tenantId ?? this.tenantId;
+    return this.db
+      .transaction((): string | undefined => {
+        const taken = new Set([
+          ...this.listGoogleAccounts(tid).map((account) => account.slot),
+          ...this.listSignInReservations(now, tid),
+        ]);
+        const slot = slots.find((candidate) => !taken.has(candidate));
+        if (slot !== undefined) {
+          this.db
+            .prepare(
+              `INSERT INTO sign_in_reservations (tenant_id, slot, reserved_until) VALUES (?, ?, ?)
+               ON CONFLICT(tenant_id, slot) DO UPDATE SET reserved_until = excluded.reserved_until`,
+            )
+            .run(tid, slot, until.toISOString());
+        }
+        return slot;
+      })
+      .immediate();
+  }
+
+  /** Slots held for sign-ins still in progress, forgetting the expired ones. */
+  listSignInReservations(now = new Date(), tenantId?: string): string[] {
+    const tid = tenantId ?? this.tenantId;
+    this.db
+      .prepare("DELETE FROM sign_in_reservations WHERE tenant_id = ? AND reserved_until <= ?")
+      .run(tid, now.toISOString());
+    const rows = this.db
+      .prepare("SELECT slot FROM sign_in_reservations WHERE tenant_id = ? ORDER BY slot")
+      .all(tid) as { slot: string }[];
+    return rows.map((row) => row.slot);
+  }
+
+  releaseSignInSlot(slot: string, tenantId?: string): void {
+    const tid = tenantId ?? this.tenantId;
+    this.db
+      .prepare("DELETE FROM sign_in_reservations WHERE tenant_id = ? AND slot = ?")
+      .run(tid, slot);
   }
 
   deleteGoogleAccount(slot: string, tenantId?: string): void {
@@ -897,6 +958,15 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
         email TEXT,
         authorized_at TEXT NOT NULL,
         verified_at TEXT,
+        PRIMARY KEY (tenant_id, slot)
+      );
+
+      -- A slot handed to a sign-in still at Google, so no other sign-in takes
+      -- it: the dashboard, the MCP server and the CLI are separate processes.
+      CREATE TABLE IF NOT EXISTS sign_in_reservations (
+        tenant_id TEXT NOT NULL,
+        slot TEXT NOT NULL,
+        reserved_until TEXT NOT NULL,
         PRIMARY KEY (tenant_id, slot)
       );
 

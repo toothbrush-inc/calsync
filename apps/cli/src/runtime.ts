@@ -56,6 +56,8 @@ export interface AccountRuntime {
     | "connectAccount"
     | "startAccountConnect"
     | "freeAccountSlot"
+    | "reserveAccountSlot"
+    | "adoptReservedSignIns"
     | "adoptSignIn"
     | "availableCalendars"
     | "connectCalendar"

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import Database from "better-sqlite3";
-import type { calendar_v3 } from "googleapis";
+import { google, type calendar_v3 } from "googleapis";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -517,6 +517,23 @@ describe("account and calendar connection", () => {
     state.close();
   });
 
+  it("checks a role calendar through the sign-in it moved to", async () => {
+    const state = new StateDatabase(":memory:");
+    state.adoptAccount("personal", "primary", "fp-home", NOW);
+    state.upsertGoogleAccount("personal", "me@work.test", NOW);
+    // Reconnected through the gateway: a fresh slot, adopted by email.
+    state.upsertGoogleAccount("account2", "me@work.test", NOW);
+    state.moveGoogleAccount("personal", "account2");
+    const auth = new FakeAuth(state, tokenStore(), { account2: WORK_CALENDARS });
+    await expect(auth.getStatus("personal", "primary")).resolves.toMatchObject({
+      role: "personal",
+      valid: true,
+      account: "me@work.test",
+      message: "readable and writable, signed in as me@work.test",
+    });
+    state.close();
+  });
+
   it("refuses to log out a role whose sign-in serves other calendars", async () => {
     const state = new StateDatabase(":memory:");
     state.adoptAccount("personal", "primary", "fp-home", NOW);
@@ -526,6 +543,44 @@ describe("account and calendar connection", () => {
     const auth = new FakeAuth(state, tokens, {});
     await expect(auth.logout("personal")).rejects.toThrow(/other calendars/u);
     expect(tokens.stored.get("personal")).toBe("token");
+    state.close();
+  });
+
+  it("cleans up a role's calendar on logout, and revokes only an account no other sign-in uses", async () => {
+    const revoke = vi
+      .spyOn(google.auth.OAuth2.prototype, "revokeToken")
+      .mockResolvedValue({} as never);
+    const state = new StateDatabase(":memory:");
+    state.adoptAccount("personal", "primary", "fp-home", NOW);
+    state.adoptAccount("work", "primary", "fp-office", NOW);
+    state.upsertGoogleAccount("personal", "me@home.test", NOW);
+    state.upsertGoogleAccount("work", "me@work.test", NOW);
+    // The same work account, signed in again for another tenant on this host.
+    state.upsertGoogleAccount("work", "me@work.test", NOW, "other");
+    const tokens = tokenStore();
+    tokens.stored.set("personal", "home-token");
+    tokens.stored.set("work", "work-token");
+    const auth = new FakeAuth(state, tokens, {});
+    const removed: string[] = [];
+    const removeCalendar = (key: string) => {
+      removed.push(key);
+      state.removeCalendar(key, []);
+      return Promise.resolve();
+    };
+
+    await expect(auth.logout("personal", removeCalendar)).resolves.toEqual({
+      removed: true,
+      revokeSkipped: false,
+    });
+    expect(revoke).toHaveBeenCalledWith("home-token");
+    await expect(auth.logout("work", removeCalendar)).resolves.toEqual({
+      removed: true,
+      revokeSkipped: true,
+    });
+    expect(revoke).toHaveBeenCalledTimes(1);
+    expect(removed).toEqual(["personal", "work"]);
+    expect(state.listGoogleAccounts()).toEqual([]);
+    revoke.mockRestore();
     state.close();
   });
 
@@ -575,13 +630,30 @@ describe("account and calendar connection", () => {
     state.close();
   });
 
-  it("keeps a free slot for each sign-in still in progress", () => {
-    const state = new StateDatabase(":memory:");
-    state.upsertGoogleAccount("account1", "a@x.test", NOW);
-    const auth = new FakeAuth(state, tokenStore(), {});
-    expect(auth.freeAccountSlot()).toBe("account2");
-    expect(auth.freeAccountSlot(["account2"])).toBe("account3");
-    state.close();
+  it("keeps a free slot for each sign-in still in progress, across processes", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "calsync-reserve-"));
+    const path = join(directory, "state.sqlite");
+    // The dashboard and the MCP server: two processes on one database.
+    const dashboard = new StateDatabase(path);
+    const assistant = new StateDatabase(path);
+    dashboard.upsertGoogleAccount("account1", "a@x.test", NOW);
+    const web = new FakeAuth(dashboard, tokenStore(), {});
+    const mcp = new FakeAuth(assistant, tokenStore(), {
+      account2: [{ id: "b@x.test", summary: "b@x.test", accessRole: "owner", primary: true }],
+    });
+    expect(web.reserveAccountSlot()).toBe("account2");
+    expect(mcp.reserveAccountSlot()).toBe("account3");
+    expect(web.freeAccountSlot()).toBe("account4");
+
+    // The dashboard's sign-in finished; the MCP server's status records it.
+    await expect(mcp.adoptReservedSignIns()).resolves.toMatchObject([{ status: "adopted" }]);
+    expect(dashboard.getGoogleAccount("account2")?.email).toBe("b@x.test");
+    expect(dashboard.listSignInReservations()).toEqual(["account3"]);
+    // An unfinished one gives its slot back after an hour.
+    expect(dashboard.listSignInReservations(new Date(Date.now() + 61 * 60_000))).toEqual([]);
+    dashboard.close();
+    assistant.close();
+    rmSync(directory, { recursive: true });
   });
 
   it("remembers that a tenant signed in, even after it removed every sign-in", () => {

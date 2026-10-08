@@ -20,8 +20,9 @@ import {
 import type { AccountRole, AppConfig } from "../src/config.js";
 import type { AuthorizationOptions } from "../src/google/auth.js";
 import type { LaunchdService } from "../src/launchd/service.js";
+import type { AccountRuntime } from "../src/runtime.js";
 import { StateDatabase } from "../src/storage/index.js";
-import type { SyncService } from "../src/sync/service.js";
+import { ReconciliationError, type SyncService } from "../src/sync/service.js";
 
 describe("CLI scaffold", () => {
   it("exposes the planned command surface", () => {
@@ -202,7 +203,7 @@ describe("CLI scaffold", () => {
             message: "ok",
           }),
         ),
-        logout: vi.fn(() => Promise.resolve(true)),
+        logout: vi.fn(() => Promise.resolve({ removed: true, revokeSkipped: false })),
       },
       state: { close },
       sync,
@@ -758,7 +759,7 @@ function runtimeWithSync(sync: SyncService): () => AppRuntime {
     auth: {
       authorize: vi.fn(() => Promise.resolve()),
       getStatus: vi.fn(),
-      logout: vi.fn(() => Promise.resolve(true)),
+      logout: vi.fn(() => Promise.resolve({ removed: true, revokeSkipped: false })),
     },
     state: { close: vi.fn() },
     sync,
@@ -899,6 +900,8 @@ describe("account and calendar commands", () => {
           connectCalendar,
           startAccountConnect: vi.fn(),
           freeAccountSlot: vi.fn(),
+          reserveAccountSlot: vi.fn(),
+          adoptReservedSignIns: vi.fn(),
           adoptSignIn: vi.fn(),
           checkAccount: vi.fn(),
           checkCalendar: vi.fn(),
@@ -948,6 +951,34 @@ describe("account and calendar commands", () => {
     const output = await run(runtime, ["calendar", "remove", "me@work.test"]);
     expect(removeCalendar).toHaveBeenCalledWith("cal-mine", {});
     expect(output).toBe("me@work.test: removed; 3 busy blocks deleted.\n");
+  });
+
+  it("logs out a role, cleaning up around a calendar it can no longer reach", async () => {
+    const { runtime: base } = runtimeWith();
+    const removeCalendar = vi
+      .fn<AccountRuntime["removeCalendar"]>()
+      .mockRejectedValueOnce(new ReconciliationError("credentials", "personal is not authorized"))
+      .mockResolvedValueOnce({ created: 0, updated: 0, deleted: 2, repaired: 0 });
+    const logout = vi.fn(async (_role: AccountRole, remove?: (key: string) => Promise<void>) => {
+      await remove?.("personal");
+      return { removed: true, revokeSkipped: true };
+    });
+    const runtime = (): AppRuntime => {
+      const built = base();
+      return {
+        ...built,
+        auth: { ...built.auth, logout },
+        ...(built.accounts === undefined
+          ? {}
+          : { accounts: { ...built.accounts, removeCalendar } }),
+      };
+    };
+    const output = await run(runtime, ["logout", "personal"]);
+    expect(removeCalendar.mock.calls).toEqual([["personal"], ["personal", { keepBlocks: true }]]);
+    expect(output).toBe(
+      "personal: authorization removed; 2 busy blocks deleted\n" +
+        "personal: another sign-in on this host uses the same Google account, so it was not revoked at Google\n",
+    );
   });
 
   it("excludes keywords from a calendar named by account and name", async () => {

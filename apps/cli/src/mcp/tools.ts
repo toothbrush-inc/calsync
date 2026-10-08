@@ -9,7 +9,13 @@ import {
   type SyncReconcileResult,
 } from "@calsync/engine";
 
-import { accountRoles, loadConfig, type AccountRole, type AppConfig } from "../config.js";
+import {
+  accountRoles,
+  accountSlots,
+  loadConfig,
+  type AccountRole,
+  type AppConfig,
+} from "../config.js";
 import {
   changeExclusions,
   exclusionSources,
@@ -153,7 +159,8 @@ export async function handleGetStatus(runtime: McpRuntime): Promise<ToolResult<S
         }),
       );
     } else {
-      await adoptPending(runtime, accounts);
+      // Gateway sign-ins handed out here or by the dashboard; one failing never fails the status.
+      await accounts.auth.adoptReservedSignIns().catch(() => []);
       // A tenant that never signed in may have finished a role connect at the
       // gateway: a passing check is what records it.
       if (!accounts.state.hasSignedIn()) {
@@ -215,37 +222,6 @@ export async function handleGetStatus(runtime: McpRuntime): Promise<ToolResult<S
   }
 }
 
-/** Sign-ins this server sent someone to the gateway for, not yet recorded, with when. */
-const pendingSignIns = new WeakMap<McpRuntime, Map<string, number>>();
-/** How long a sign-in keeps its slot while the person is at Google. */
-const PENDING_SIGN_IN_MS = 60 * 60 * 1_000;
-
-function pendingFor(runtime: McpRuntime): Map<string, number> {
-  let pending = pendingSignIns.get(runtime);
-  if (pending === undefined) {
-    pending = new Map();
-    pendingSignIns.set(runtime, pending);
-  }
-  const cutoff = Date.now() - PENDING_SIGN_IN_MS;
-  for (const [slot, at] of pending) {
-    if (at < cutoff) {
-      pending.delete(slot);
-    }
-  }
-  return pending;
-}
-
-/** Records gateway sign-ins this server handed out; one failing never fails the status. */
-async function adoptPending(runtime: McpRuntime, accounts: AccountRuntime): Promise<void> {
-  const pending = pendingFor(runtime);
-  for (const slot of [...pending.keys()]) {
-    const adopted = await accounts.auth.adoptSignIn(slot).catch(() => undefined);
-    if (adopted !== undefined && adopted.status !== "missing") {
-      pending.delete(slot);
-    }
-  }
-}
-
 export interface ConnectAccountResult {
   url: string;
   expires_at?: string;
@@ -270,16 +246,14 @@ export async function handleConnectAccount(
     if (runtime.connectUrl !== undefined) {
       // A fresh slot every time, never an existing account's: the gateway
       // stores the token before anyone knows whose it is.
-      const pending = pendingFor(runtime);
-      const slot = accounts.auth.freeAccountSlot(pending.keys());
+      const slot = accounts.auth.reserveAccountSlot();
       if (slot === undefined) {
         return unavailable(
           "account_limit",
-          "calsync holds at most 6 added Google accounts; remove one first",
+          `calsync holds at most ${String(accountSlots.length)} added Google accounts; remove one first`,
         );
       }
       const tenant = resolveConfig(runtime).tenantId;
-      pending.set(slot, Date.now());
       return {
         ok: true,
         data: {

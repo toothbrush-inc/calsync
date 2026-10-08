@@ -40,6 +40,8 @@ type FakeRuntime = WebTenantRuntime & {
   tenantId: string;
   signIns: GoogleAccountRecord[];
   calendars: CalendarRecord[];
+  /** Slots handed to gateway sign-ins, as the shared database holds them. */
+  reserved: string[];
   exclusionCalls: { action: "add" | "remove"; input: unknown }[];
   dedupeCalls: { dryRun: boolean; lockTimeoutMs: number }[];
   previewCalls: { lockTimeoutMs: number }[];
@@ -144,11 +146,25 @@ function fakeRuntime(tenantId: string, overrides: Partial<WebTenantRuntime> = {}
       }),
     checkCalendar: (calendar) =>
       Promise.resolve({ calendar, valid: true, message: "readable and writable" }),
-    freeAccountSlot: (reserved = []) => {
-      const taken = new Set(reserved);
-      return ["account1", "account2", "account3"].find(
-        (slot) => !taken.has(slot) && !runtime.signIns.some((entry) => entry.slot === slot),
-      );
+    reserved: [],
+    freeAccountSlot: () =>
+      ["account1", "account2", "account3"].find(
+        (slot) =>
+          !runtime.reserved.includes(slot) && !runtime.signIns.some((entry) => entry.slot === slot),
+      ),
+    reserveAccountSlot: () => {
+      const slot = runtime.freeAccountSlot();
+      if (slot !== undefined) {
+        runtime.reserved.push(slot);
+      }
+      return slot;
+    },
+    adoptReservedSignIns: async () => {
+      const adopted = [];
+      for (const slot of [...runtime.reserved]) {
+        adopted.push(await runtime.adoptSignIn(slot));
+      }
+      return adopted;
     },
     startAccountConnect: () =>
       Promise.resolve({
@@ -157,6 +173,7 @@ function fakeRuntime(tenantId: string, overrides: Partial<WebTenantRuntime> = {}
         expiresAt: "2026-08-28T12:00:00.000Z",
       }),
     adoptSignIn: (slot) => {
+      runtime.reserved = runtime.reserved.filter((reserved) => reserved !== slot);
       const account = signIn(tenantId, slot, `${slot}@example.com`);
       runtime.signIns.push(account);
       return Promise.resolve({ status: "adopted" as const, account });

@@ -53,6 +53,7 @@ import {
 import {
   daemonIsRunning,
   daemonLockPathFor,
+  ReconciliationError,
   syncLockPathFor,
   syncResultFromError,
   type SyncService,
@@ -189,12 +190,29 @@ function addAuthCommands(
       const parsed = value === undefined ? undefined : parseTenantRole(value, options.tenant);
       const tenantId = parsed?.tenantId ?? optionalTenant(options.tenant);
       const roles = parsed === undefined ? accountRoles : [parsed.role];
-      await withRuntime(runtimeFactory, tenantId, async ({ auth }) => {
+      await withRuntime(runtimeFactory, tenantId, async ({ auth, accounts }) => {
         for (const role of roles) {
-          const removed = await auth.logout(role);
-          process.stdout.write(
-            `${role}: ${removed ? "authorization removed" : "not authorized"}\n`,
+          let deleted: number | undefined;
+          const { removed, revokeSkipped } = await auth.logout(
+            role,
+            accounts === undefined
+              ? undefined
+              : async (calendarKey) => {
+                  deleted = (await removeReachable(accounts, calendarKey))?.deleted;
+                },
           );
+          const blocks =
+            deleted === undefined
+              ? ""
+              : `; ${String(deleted)} busy ${deleted === 1 ? "block" : "blocks"} deleted`;
+          process.stdout.write(
+            `${role}: ${removed ? "authorization removed" : "not authorized"}${blocks}\n`,
+          );
+          if (revokeSkipped) {
+            process.stdout.write(
+              `${role}: another sign-in on this host uses the same Google account, so it was not revoked at Google\n`,
+            );
+          }
         }
       });
     });
@@ -350,7 +368,7 @@ function addAccountCommands(
     .argument("<calendar>", "the calendar as `calendar list` shows it, or its key")
     .option(
       "--keep-blocks",
-      "skip the cleanup pass, for a calendar calsync can no longer reach; its busy blocks stay",
+      "for a calendar calsync can no longer reach: leave the busy blocks on it, and clean up only the other calendars",
     )
     .option("--tenant <id>", "tenant identifier (defaults to CALSYNC_TENANT_ID)")
     .action(async (ref: string, options: { keepBlocks?: boolean; tenant?: string }) => {
@@ -361,13 +379,38 @@ function addAccountCommands(
         const result = await accounts.removeCalendar(target.key, {
           ...(options.keepBlocks === true ? { keepBlocks: true } : {}),
         });
-        process.stdout.write(
+        const deleted =
           result === undefined
-            ? `${label}: removed; busy blocks on it were left in place.\n`
-            : `${label}: removed; ${String(result.deleted)} busy ${result.deleted === 1 ? "block" : "blocks"} deleted.\n`,
+            ? ""
+            : `; ${String(result.deleted)} busy ${result.deleted === 1 ? "block" : "blocks"} deleted`;
+        process.stdout.write(
+          options.keepBlocks === true
+            ? `${label}: removed${deleted}; busy blocks on it were left in place.\n`
+            : `${label}: removed${deleted}.\n`,
         );
       });
     });
+}
+
+/**
+ * Removes a calendar with its cleanup pass, or without touching it when its
+ * sign-in no longer works: the other calendars are still cleaned up.
+ */
+async function removeReachable(
+  accounts: AccountRuntime,
+  calendarKey: string,
+): Promise<ReconcileResult | undefined> {
+  try {
+    return await accounts.removeCalendar(calendarKey);
+  } catch (error) {
+    if (
+      error instanceof ReconciliationError &&
+      (error.category === "credentials" || error.category === "permissions")
+    ) {
+      return accounts.removeCalendar(calendarKey, { keepBlocks: true });
+    }
+    throw error;
+  }
 }
 
 async function withAccounts(
@@ -781,7 +824,9 @@ function addWebCommands(program: Command): void {
             listCalendars: () => state.listCalendars(),
             checkAccount: (slot) => auth.checkAccount(slot),
             checkCalendar: (calendar) => auth.checkCalendar(calendar),
-            freeAccountSlot: (reserved) => auth.freeAccountSlot(reserved),
+            freeAccountSlot: () => auth.freeAccountSlot(),
+            reserveAccountSlot: () => auth.reserveAccountSlot(),
+            adoptReservedSignIns: () => auth.adoptReservedSignIns(),
             hasSignedIn: () => state.hasSignedIn(),
             startAccountConnect: () => auth.startAccountConnect(),
             adoptSignIn: (slot) => auth.adoptSignIn(slot),
