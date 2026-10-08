@@ -598,6 +598,32 @@ describe("account and calendar connection", () => {
     state.close();
   });
 
+  it("resolves a role's 'primary' alias, so no account can add that calendar again", async () => {
+    const state = new StateDatabase(":memory:");
+    // Written before calsync kept fingerprints: the alias alone.
+    state.adoptAccount("personal", "primary", undefined, NOW);
+    state.upsertGoogleAccount("personal", "me@work.test", NOW);
+    // A colleague's sign-in that can see the same calendar, shared with them.
+    state.upsertGoogleAccount("account1", "colleague@work.test", NOW);
+    const shared = { id: "me@work.test", summary: "Me", accessRole: "writer" };
+    const auth = new FakeAuth(state, tokenStore(), {
+      personal: WORK_CALENDARS,
+      account1: [
+        { id: "colleague@work.test", summary: "colleague", accessRole: "owner", primary: true },
+        shared,
+      ],
+    });
+
+    const listed = await auth.availableCalendars("account1");
+    expect(listed.map((option) => option.calendarId)).toContain("me@work.test");
+    expect(state.getCalendar("personal")?.calendarId).toBe("me@work.test");
+    expect(state.listUnresolvedCalendars()).toEqual([]);
+    await expect(auth.connectCalendar("account1", "me@work.test")).rejects.toThrow(
+      /already connected/u,
+    );
+    state.close();
+  });
+
   it("adopts a gateway sign-in by the account it turns out to be", async () => {
     const state = new StateDatabase(":memory:");
     state.upsertGoogleAccount("personal", "me@gmail.test", NOW);

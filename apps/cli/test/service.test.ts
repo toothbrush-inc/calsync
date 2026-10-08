@@ -541,6 +541,26 @@ describe("incremental sync orchestration", () => {
     runtime.close();
   });
 
+  it("polls every calendar at once rather than one after another", async () => {
+    const runtime = incrementalRuntime();
+    await runtime.service.once();
+    let inFlight = 0;
+    let peak = 0;
+    for (const calendar of [runtime.personal, runtime.work]) {
+      const listChanges = calendar.listChanges.bind(calendar);
+      calendar.listChanges = async () => {
+        inFlight += 1;
+        peak = Math.max(peak, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        inFlight -= 1;
+        return listChanges();
+      };
+    }
+    await expect(runtime.service.once()).resolves.toMatchObject({ converged: true });
+    expect(peak).toBe(2);
+    runtime.close();
+  });
+
   it("runs a full reconciliation for native changes and managed deletion tombstones", async () => {
     const runtime = incrementalRuntime();
     await runtime.service.once();

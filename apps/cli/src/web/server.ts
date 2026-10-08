@@ -14,7 +14,7 @@ import type {
 } from "@calsync/engine";
 import { tenantForIdentity } from "@dvd-toy-box/vault";
 
-import { calendarLabel } from "../calendars.js";
+import { calendarLabel, isSynced } from "../calendars.js";
 import {
   accountRoles,
   accountSlots,
@@ -540,16 +540,6 @@ export class WebServer {
       );
     }
     // A check that throws (Google unreachable) is an invalid entry, not a failed page.
-    const accountChecks = await Promise.all(
-      runtime.listGoogleAccounts().map((account) =>
-        runtime.checkAccount(account.slot).catch((error: unknown): GoogleAccountStatus => ({
-          slot: account.slot,
-          email: account.email,
-          valid: false,
-          message: errorName(error),
-        })),
-      ),
-    );
     const calendarChecks = await Promise.all(
       runtime.listCalendars().map((calendar) =>
         runtime.checkCalendar(calendar).catch((error: unknown): CalendarStatus => ({
@@ -557,6 +547,28 @@ export class WebServer {
           valid: false,
           message: errorName(error),
         })),
+      ),
+    );
+    // A calendar that just checked out proves its sign-in works, so only a
+    // sign-in with none (or whose email is still unknown) asks Google again.
+    const working = new Set(
+      calendarChecks.filter((check) => check.valid).map((check) => check.calendar.account),
+    );
+    const accountChecks = await Promise.all(
+      runtime.listGoogleAccounts().map((account) =>
+        working.has(account.slot) && account.email !== null
+          ? Promise.resolve<GoogleAccountStatus>({
+              slot: account.slot,
+              email: account.email,
+              valid: true,
+              message: "signed in",
+            })
+          : runtime.checkAccount(account.slot).catch((error: unknown): GoogleAccountStatus => ({
+              slot: account.slot,
+              email: account.email,
+              valid: false,
+              message: errorName(error),
+            })),
       ),
     );
     const accounts = runtime.listGoogleAccounts();
@@ -582,11 +594,7 @@ export class WebServer {
       email: check.email,
       valid: check.valid,
       message: check.message,
-      calendars: calendars.filter(
-        (calendar) =>
-          runtime.listCalendars().find((record) => record.key === calendar.key)?.account ===
-          check.slot,
-      ).length,
+      calendars: calendarChecks.filter(({ calendar }) => calendar.account === check.slot).length,
     }));
     const daemonRunning = this.options.daemonIsRunning(this.options.daemonLockPath);
     // Syncing needs one calendar to share busy time and another to receive
@@ -751,17 +759,13 @@ export class WebServer {
       return;
     }
     try {
+      // Listing first: it resolves stored aliases the synced check compares against.
+      const options = await runtime.availableCalendars(slot);
       const synced = runtime.listCalendars();
-      const calendars = (await runtime.availableCalendars(slot)).map(
-        (option): WebAvailableCalendar => ({
-          ...option,
-          synced: synced.some(
-            (calendar) =>
-              calendar.calendarId.toLowerCase() === option.calendarId.toLowerCase() ||
-              (option.primary && calendar.account === slot && calendar.calendarId === "primary"),
-          ),
-        }),
-      );
+      const calendars = options.map((option): WebAvailableCalendar => ({
+        ...option,
+        synced: isSynced(option, synced),
+      }));
       respondJson(response, 200, { calendars });
     } catch (error) {
       respondJson(response, 502, {

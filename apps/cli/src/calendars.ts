@@ -167,6 +167,15 @@ export function sameCalendarSet(
   return shape(left) === shape(right);
 }
 
+/** Whether a calendar an account can see is one already synced. */
+export function isSynced(
+  option: Pick<AvailableCalendar, "calendarId">,
+  synced: readonly Pick<CalendarRecord, "calendarId">[],
+): boolean {
+  const id = option.calendarId.toLowerCase();
+  return synced.some((calendar) => calendar.calendarId.toLowerCase() === id);
+}
+
 /**
  * The account and Google calendar a person means by `<email>` (that
  * account's own calendar) or `<email>/<calendar name or id>`, among the
