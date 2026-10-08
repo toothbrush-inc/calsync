@@ -82,7 +82,11 @@ export interface WebTenantRuntime {
   listCalendars(): CalendarRecord[];
   checkAccount(slot: string): Promise<GoogleAccountStatus>;
   checkCalendar(calendar: CalendarRecord): Promise<CalendarStatus>;
-  freeAccountSlot(reserved?: Iterable<string>): string | undefined;
+  freeAccountSlot(): string | undefined;
+  /** Holds a free slot for a sign-in the gateway finishes; shared with every process on the host. */
+  reserveAccountSlot(): string | undefined;
+  /** Records the reserved sign-ins that finished, whoever handed them out. */
+  adoptReservedSignIns(): Promise<SignInAdoption[]>;
   /** Local mode: starts signing in another account; recorded when it finishes. */
   startAccountConnect(): Promise<{ slot: string; url: string; expiresAt: string }>;
   /** Records a sign-in the gateway finished under `slot`. */
@@ -276,7 +280,6 @@ const STATUS_CACHE_MS = 5_000;
  */
 const LOCK_TIMEOUT_MS = 5_000;
 /** How long a gateway sign-in keeps its slot while the person is at Google. */
-const RESERVED_SLOT_MS = 60 * 60 * 1_000;
 
 export type WebTokenKind = "link" | "session";
 
@@ -288,13 +291,6 @@ export class WebServer {
   readonly #previews = new Map<string, Promise<WebPreviewView>>();
   /** Likewise for stray-block checks and removals, keyed by tenant and mode. */
   readonly #dedupes = new Map<string, Promise<WebDedupeView>>();
-  /**
-   * Slots handed to gateway sign-ins still in progress, by tenant, with when.
-   * Each sign-in gets a fresh one (never the slot of an account it may be
-   * replacing), and status adopts any the person did not come back from —
-   * a link opened in another browser lands without this dashboard's cookie.
-   */
-  readonly #reserved = new Map<string, Map<string, number>>();
 
   constructor(private readonly options: WebServerOptions) {}
 
@@ -528,7 +524,12 @@ export class WebServer {
 
   async #liveStatus(tenant: string): Promise<WebStatusView> {
     const runtime = this.#runtime(tenant);
-    await this.#adoptReserved(tenant);
+    // Gateway sign-ins the person never came back from — a link opened in
+    // another browser lands without this dashboard's cookie — or that the
+    // MCP server handed out.
+    for (const adopted of await runtime.adoptReservedSignIns().catch(() => [])) {
+      this.#log({ event: "web_account_adopted", tenant, result: adopted.status });
+    }
     // A tenant that never signed in may have finished a role connect at the
     // gateway: a passing check is what records it.
     if (!runtime.hasSignedIn()) {
@@ -667,9 +668,6 @@ export class WebServer {
           return;
         }
         const adopted = await runtime.adoptSignIn(slot);
-        if (adopted.status !== "missing") {
-          this.#reserved.get(tenant)?.delete(slot);
-        }
         this.#statusCache.delete(tenant);
         this.#log({ event: "web_account_adopted", tenant, result: adopted.status });
         if (adopted.status === "missing") {
@@ -715,14 +713,12 @@ export class WebServer {
       // calsync sees whose it is — so never an existing account's slot, even
       // to reconnect it: a different Google account picked at Google would
       // take that account's calendars over. Adoption matches by email.
-      const reserved = this.#reservedFor(tenant);
-      const slot = runtime.freeAccountSlot(reserved.keys());
+      const slot = runtime.reserveAccountSlot();
       if (slot === undefined) {
         throw new Error(
           `calsync holds at most ${String(accountSlots.length)} added Google accounts; remove one first`,
         );
       }
-      reserved.set(slot, Date.now());
       return {
         url: template
           .replaceAll("{slot}", tokenSlot(slot, tenant))
@@ -746,38 +742,6 @@ export class WebServer {
     // account signed in again lands on its own slot.
     const started = await runtime.startAccountConnect();
     return { url: started.url, expiresAt: started.expiresAt, external: false };
-  }
-
-  /** This tenant's in-progress sign-in slots, dropping any left over an hour. */
-  #reservedFor(tenant: string): Map<string, number> {
-    let reserved = this.#reserved.get(tenant);
-    if (reserved === undefined) {
-      reserved = new Map();
-      this.#reserved.set(tenant, reserved);
-    }
-    const cutoff = Date.now() - RESERVED_SLOT_MS;
-    for (const [slot, at] of reserved) {
-      if (at < cutoff) {
-        reserved.delete(slot);
-      }
-    }
-    return reserved;
-  }
-
-  /** Records gateway sign-ins whose person never came back to say so. */
-  async #adoptReserved(tenant: string): Promise<void> {
-    const runtime = this.#runtime(tenant);
-    for (const slot of [...this.#reservedFor(tenant).keys()]) {
-      if (runtime.listGoogleAccounts().some((account) => account.slot === slot)) {
-        this.#reserved.get(tenant)?.delete(slot);
-        continue;
-      }
-      const adopted = await runtime.adoptSignIn(slot).catch(() => undefined);
-      if (adopted !== undefined && adopted.status !== "missing") {
-        this.#reserved.get(tenant)?.delete(slot);
-        this.#log({ event: "web_account_adopted", tenant, result: adopted.status });
-      }
-    }
   }
 
   async #available(tenant: string, slot: string | null, response: ServerResponse): Promise<void> {

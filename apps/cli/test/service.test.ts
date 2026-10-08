@@ -1612,14 +1612,55 @@ describe("calendars beyond the two roles", () => {
     runtime.close();
   });
 
-  it("leaves blocks behind when told the calendar is unreachable", async () => {
+  it("leaves blocks on an unreachable calendar but cleans up the others", async () => {
     const runtime = threeCalendarService();
     await runtime.service.once();
     await expect(
       runtime.service.removeCalendar("cal-family", { keepBlocks: true }),
-    ).resolves.toBeUndefined();
-    expect(busy(runtime.family)).toBe(2);
+    ).resolves.toMatchObject({ deleted: 2 });
+    expect([busy(runtime.personal), busy(runtime.work), busy(runtime.family)]).toEqual([1, 1, 2]);
     expect(runtime.state.getCalendar("cal-family")).toBeNull();
+    runtime.close();
+  });
+
+  it("cleans up the last calendars, though fewer than two are left to sync", async () => {
+    const runtime = threeCalendarService();
+    await runtime.service.once();
+    const without = async (key: string, keepBlocks: boolean) => {
+      // The service a runtime builds once the stored calendars change.
+      const remaining = runtime.state.listCalendars().map((calendar) => ({
+        key: calendar.key,
+        account: calendar.account,
+        calendarId: calendar.calendarId,
+        source: calendar.source,
+        destination: calendar.destination,
+      }));
+      const service = new DefaultSyncService(
+        { ...testConfig(), calendars: remaining },
+        {
+          createCalendarClient: (slot) =>
+            Promise.resolve(
+              slot === "personal"
+                ? runtime.personal
+                : slot === "work"
+                  ? runtime.work
+                  : runtime.family,
+            ),
+        },
+        runtime.state,
+        join(mkdtempSync(join(tmpdir(), "calsync-last-")), "sync.lock"),
+        () => undefined,
+      );
+      return service.removeCalendar(key, keepBlocks ? { keepBlocks: true } : {});
+    };
+
+    await without("cal-family", false);
+    // Unreachable work: its blocks stay, and personal loses the standup it mirrored.
+    await without("work", true);
+    expect([busy(runtime.personal), busy(runtime.work)]).toEqual([0, 1]);
+    expect(runtime.state.listMappings("personal")).toEqual([]);
+    await without("personal", false);
+    expect(runtime.state.listCalendars()).toEqual([]);
     runtime.close();
   });
 

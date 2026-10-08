@@ -119,7 +119,7 @@ export interface DedupeResult extends ReconcileResult {
 
 export type StrayBlockKind = "duplicate" | "phantom";
 
-/** Timer seams for the prune's pacing and backoff; tests swap in fakes. */
+/** Timer seams for paced writes and their backoff; tests swap in fakes. */
 export interface ReconcilePacing {
   now: () => number;
   sleep: (milliseconds: number) => Promise<void>;
@@ -216,8 +216,16 @@ const MAX_COOLDOWN_MS = 60_000;
  * often within Google's tombstone retention is not plausible.
  */
 const MAX_TOMBSTONE_LINKS = 32;
-/** Tries per block across cooldowns, on top of the adapter's own quick retries. */
-const MAX_DELETE_ATTEMPTS = 6;
+/** Tries per write across cooldowns, on top of the adapter's own quick retries. */
+const MAX_WRITE_ATTEMPTS = 6;
+/**
+ * A pass's writes to one calendar go one at a time, which a handful of
+ * changes never pushes near a limit. A pass rewriting many blocks at once —
+ * the first after an upgrade that changes block identity, or after a long
+ * outage — is the sustained burst that trips Google's per-calendar write
+ * limit, so it starts at the long prune's spacing.
+ */
+const BULK_WRITES = LONG_PRUNE_BLOCKS;
 
 export class ReconcilePassError extends Error {
   override readonly name = "ReconcilePassError";
@@ -515,7 +523,7 @@ export class Reconciler {
       });
     };
     progress();
-    const pacer = new DeletePacer(
+    const pacer = new WritePacer(
       removals.length > LONG_PRUNE_BLOCKS ? LONG_PRUNE_SPACING_MS : DELETE_SPACING_MS,
       options.pacing ?? SYSTEM_PACING,
       (pauseMs) => {
@@ -534,7 +542,12 @@ export class Reconciler {
       // A dry run deletes nothing, so it has nothing to pace.
       const deleted =
         options.dryRun === true ||
-        (await this.deleteWithBackoff(calendarKey, block.id, pacer, result, failures));
+        (await writeWithBackoff(
+          () => this.client(calendarKey).deleteEvent(this.calendarId(calendarKey), block.id),
+          pacer,
+          result,
+          failures,
+        ));
       if (deleted) {
         if (options.dryRun !== true && mappingKey !== undefined) {
           this.mappings.deleteMapping(mappingKey, this.config.tenantId);
@@ -565,34 +578,6 @@ export class Reconciler {
       throw new DedupePassError(result, failures[0]);
     }
     return result;
-  }
-
-  /**
-   * One paced delete. A throttled or transient reply cools every worker down
-   * through the shared pacer and tries this block again; anything else, or
-   * running out of tries, counts as a failure the caller reports at the end.
-   */
-  private async deleteWithBackoff(
-    calendarKey: CalendarKey,
-    eventId: string,
-    pacer: DeletePacer,
-    result: { failed: number },
-    failures: unknown[],
-  ): Promise<boolean> {
-    for (let attempt = 1; ; attempt += 1) {
-      const startedAt = await pacer.turn();
-      try {
-        await this.client(calendarKey).deleteEvent(this.calendarId(calendarKey), eventId);
-        return true;
-      } catch (error) {
-        if (attempt >= MAX_DELETE_ATTEMPTS || !isRetryableGoogleError(error)) {
-          result.failed += 1;
-          failures.push(error);
-          return false;
-        }
-        pacer.throttled(startedAt, googleApiErrorInfo(error).retryAfterMs);
-      }
-    }
   }
 
   private destinations(): CalendarConfig[] {
@@ -814,38 +799,26 @@ export class Reconciler {
       progress();
     };
     progress();
-
-    for (const mapping of mappings.values()) {
-      if (blocks.has(mapping.mappingKey)) {
-        continue;
-      }
-      const failuresBefore = result.failed;
-      const operationsBefore = operationCount(result);
-      const destination =
-        destinationEvents.find((event) => event.id === mapping.destinationEventId) ??
-        managedByKey.get(mapping.mappingKey)?.[0];
-      if (
-        options.dryRun !== true &&
-        !(await attemptOperation(
-          () => client.deleteEvent(destinationCalendarId, mapping.destinationEventId),
-          result,
-          failures,
-        ))
-      ) {
-        finishItem(failuresBefore, operationsBefore);
-        continue;
-      }
-      if (options.dryRun !== true) {
-        options.onDestinationDeleted?.(destinationKey, mapping.destinationEventId);
-      }
-      record(result, "delete", destinationKey, "source-no-longer-desired", options, {
-        timeRange: destination === undefined ? undefined : eventTimeRange(destination),
-      });
-      if (options.dryRun !== true) {
-        this.mappings.deleteMapping(mapping.mappingKey, this.config.tenantId);
-      }
-      finishItem(failuresBefore, operationsBefore);
-    }
+    const stale = [...mappings.keys()].filter((key) => !blocks.has(key)).length;
+    const missing = [...blocks.keys()].filter(
+      (key) =>
+        !mappings.has(key) &&
+        !(managedByKey.get(key) ?? []).some((event) => event.status !== "cancelled"),
+    ).length;
+    const pacer = new WritePacer(
+      stale + missing > BULK_WRITES ? LONG_PRUNE_SPACING_MS : 0,
+      options.pacing ?? SYSTEM_PACING,
+      (pauseMs) => {
+        reportProgress(options, {
+          phase: "applying",
+          label: `Google asked us to slow down; pausing ${String(Math.ceil(pauseMs / 1000))}s`,
+          completed,
+          total,
+          succeeded,
+          failed,
+        });
+      },
+    );
 
     for (const [key, block] of blocks) {
       const failuresBefore = result.failed;
@@ -879,8 +852,9 @@ export class Reconciler {
         }
         if (
           options.dryRun !== true &&
-          !(await attemptOperation(
+          !(await writeWithBackoff(
             () => client.deleteEvent(destinationCalendarId, extraId),
+            pacer,
             result,
             failures,
           ))
@@ -912,7 +886,7 @@ export class Reconciler {
         let inserted: GoogleCalendarEvent | undefined;
         if (
           options.dryRun !== true &&
-          !(await attemptOperation(
+          !(await writeWithBackoff(
             async () => {
               inserted = await client.insertEvent(destinationCalendarId, insert);
               // A slot that comes back reuses its interval key, and the ID it
@@ -932,6 +906,7 @@ export class Reconciler {
                 throw new Error("Every replacement ID for this busy block is a deleted event");
               }
             },
+            pacer,
             result,
             failures,
           ))
@@ -953,7 +928,7 @@ export class Reconciler {
         let patched: GoogleCalendarEvent | undefined;
         if (
           options.dryRun !== true &&
-          !(await attemptOperation(
+          !(await writeWithBackoff(
             async () => {
               patched = await client.patchEvent(
                 destinationCalendarId,
@@ -962,10 +937,12 @@ export class Reconciler {
                 destinationEtag ?? undefined,
               );
             },
+            pacer,
             result,
             failures,
           ))
         ) {
+          finishItem(failuresBefore, operationsBefore);
           continue;
         }
         destination = { ...destination, ...(patched ?? {}) };
@@ -986,6 +963,40 @@ export class Reconciler {
       }
       finishItem(failuresBefore, operationsBefore);
     }
+    // Old blocks go last, so busy time a pass rewrites stays covered meanwhile.
+    for (const mapping of mappings.values()) {
+      if (blocks.has(mapping.mappingKey)) {
+        continue;
+      }
+      const failuresBefore = result.failed;
+      const operationsBefore = operationCount(result);
+      const destination =
+        destinationEvents.find((event) => event.id === mapping.destinationEventId) ??
+        managedByKey.get(mapping.mappingKey)?.[0];
+      if (
+        options.dryRun !== true &&
+        !(await writeWithBackoff(
+          () => client.deleteEvent(destinationCalendarId, mapping.destinationEventId),
+          pacer,
+          result,
+          failures,
+        ))
+      ) {
+        finishItem(failuresBefore, operationsBefore);
+        continue;
+      }
+      if (options.dryRun !== true) {
+        options.onDestinationDeleted?.(destinationKey, mapping.destinationEventId);
+      }
+      record(result, "delete", destinationKey, "source-no-longer-desired", options, {
+        timeRange: destination === undefined ? undefined : eventTimeRange(destination),
+      });
+      if (options.dryRun !== true) {
+        this.mappings.deleteMapping(mapping.mappingKey, this.config.tenantId);
+      }
+      finishItem(failuresBefore, operationsBefore);
+    }
+
     return summary;
   }
 }
@@ -1014,18 +1025,30 @@ export function calendarWindow(config: SyncConfig, now: Date): CalendarWindow {
   };
 }
 
-async function attemptOperation(
-  operation: () => Promise<void>,
+/**
+ * One paced write. A throttled or transient reply cools every writer down
+ * through the shared pacer and tries this one again; anything else, or
+ * running out of tries, counts as a failure the caller reports at the end.
+ */
+async function writeWithBackoff(
+  operation: () => Promise<unknown>,
+  pacer: WritePacer,
   result: { failed: number },
   failures: unknown[],
 ): Promise<boolean> {
-  try {
-    await operation();
-    return true;
-  } catch (error) {
-    result.failed += 1;
-    failures.push(error);
-    return false;
+  for (let attempt = 1; ; attempt += 1) {
+    const startedAt = await pacer.turn();
+    try {
+      await operation();
+      return true;
+    } catch (error) {
+      if (attempt >= MAX_WRITE_ATTEMPTS || !isRetryableGoogleError(error)) {
+        result.failed += 1;
+        failures.push(error);
+        return false;
+      }
+      pacer.throttled(startedAt, googleApiErrorInfo(error).retryAfterMs);
+    }
   }
 }
 
@@ -1063,7 +1086,7 @@ const SYSTEM_PACING: ReconcilePacing = {
 };
 
 /**
- * Shared by every delete worker: hands out start times no closer together
+ * Shared by every writer: hands out start times no closer together
  * than the spacing, so a burst can never exceed `1000 / spacing` a second
  * however fast the calls return, and holds all of them back during a
  * cooldown. Each new throttle doubles the next cooldown and the spacing, up
@@ -1071,7 +1094,7 @@ const SYSTEM_PACING: ReconcilePacing = {
  * current cooldown ended belongs to that same episode, however late it
  * lands, and does not escalate it again.
  */
-class DeletePacer {
+class WritePacer {
   #spacingMs: number;
   #cooldownMs = INITIAL_COOLDOWN_MS;
   #nextStartAt = 0;
@@ -1105,7 +1128,10 @@ class DeletePacer {
     this.#cooldownUntil = now + pauseMs;
     this.#nextStartAt = Math.max(this.#nextStartAt, this.#cooldownUntil);
     this.#cooldownMs = Math.min(MAX_COOLDOWN_MS, this.#cooldownMs * 2);
-    this.#spacingMs = Math.min(MAX_DELETE_SPACING_MS, this.#spacingMs * 2);
+    this.#spacingMs = Math.min(
+      MAX_DELETE_SPACING_MS,
+      Math.max(DELETE_SPACING_MS, this.#spacingMs * 2),
+    );
     this.onPause(pauseMs);
   }
 }

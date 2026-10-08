@@ -66,8 +66,8 @@ calsync calendar remove me@work.example/Team
 
 This runs one pass that deletes the blocks calsync wrote to it and the blocks
 its events put on the others, then forgets its exclusions and sync state. If
-calsync can no longer reach it, add `--keep-blocks` to skip that pass; its own
-blocks stay and the others are cleaned up on the next pass.
+calsync can no longer reach it, add `--keep-blocks`: the pass then skips it, so
+the blocks on it stay, and the others are still cleaned up.
 `calsync account remove <email>` then forgets the sign-in locally; remove
 calsync from that Google account's third-party access to revoke it there.
 

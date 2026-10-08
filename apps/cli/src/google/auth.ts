@@ -122,6 +122,12 @@ export function calendarFingerprint(
         .digest("hex");
 }
 
+export interface LogoutResult {
+  removed: boolean;
+  /** Another sign-in on this host is the same Google account, so Google was not asked to revoke. */
+  revokeSkipped: boolean;
+}
+
 export interface AuthorizationOptions {
   openBrowser?: boolean;
   onAuthorizationUrl?: (url: string) => void;
@@ -166,6 +172,9 @@ type TokenHandler<T> = (
 export class AuthenticationError extends Error {
   override readonly name = "AuthenticationError";
 }
+
+/** How long a sign-in keeps its slot while the person is at Google. */
+const SIGN_IN_RESERVATION_MS = 60 * 60 * 1_000;
 
 export class GoogleAuthService {
   /** Connects started without waiting for them, by slot. */
@@ -264,23 +273,29 @@ export class GoogleAuthService {
    */
   async startAccountConnect(): Promise<{ slot: string; url: string; expiresAt: string }> {
     await this.refreshUnknownEmails();
-    const free = this.freeAccountSlot();
-    const slot = free ?? accountSlots[0];
-    this.cancelConnect(slot);
-    const session = await this.createConnectSession(slot, async (client, refreshToken) =>
-      this.adoptAccountToken(await primaryEmail(client), refreshToken),
-    );
+    const { slot, release } = this.signInSlot();
+    let session: GoogleConnectSession<GoogleAccountRecord>;
+    try {
+      session = await this.createConnectSession(slot, async (client, refreshToken) =>
+        this.adoptAccountToken(await primaryEmail(client), refreshToken, slot),
+      );
+    } catch (error) {
+      release();
+      throw error;
+    }
     this.pending.set(slot, session);
     void session.complete().then(
       () => {
         if (this.pending.get(slot) === session) {
           this.pending.delete(slot);
         }
+        release();
       },
       (error: unknown) => {
         if (this.pending.get(slot) === session) {
           this.pending.delete(slot);
         }
+        release();
         const message = error instanceof Error ? error.message : "connect failed";
         process.stderr.write(`calsync: account sign-in failed: ${message}\n`);
       },
@@ -289,14 +304,64 @@ export class GoogleAuthService {
   }
 
   /**
-   * The slot a new sign-in takes, if any is free. `reserved` are slots already
-   * handed to sign-ins still in progress, so two at once never share one.
+   * The slot a local sign-in waits under. A free one is reserved, so a second
+   * sign-in started meanwhile, here or in another process, takes another.
+   * With none free, only an account already signed in can finish (it lands
+   * on its own slot), so the wait shares the first slot's key and replaces
+   * any other such wait.
    */
-  freeAccountSlot(reserved: Iterable<string> = []): string | undefined {
-    const taken = new Set(reserved);
+  private signInSlot(): { slot: string; release: () => void } {
+    const reserved = this.reserveAccountSlot();
+    if (reserved !== undefined) {
+      return {
+        slot: reserved,
+        release: () => {
+          this.state.releaseSignInSlot(reserved);
+        },
+      };
+    }
+    const slot = accountSlots[0];
+    this.cancelConnect(slot);
+    return { slot, release: () => undefined };
+  }
+
+  /** The slot a new sign-in would take, if any is free: no account has it and no sign-in is waiting on it. */
+  freeAccountSlot(): string | undefined {
+    const reserved = new Set(this.state.listSignInReservations());
     return accountSlots.find(
-      (slot) => !taken.has(slot) && this.state.getGoogleAccount(slot) === null,
+      (slot) => !reserved.has(slot) && this.state.getGoogleAccount(slot) === null,
     );
+  }
+
+  /**
+   * Holds a free slot for a sign-in that finishes elsewhere (the gateway's
+   * consent flow) for an hour; undefined when none is free. Every process on
+   * this host sees the hold, and adoptReservedSignIns records the sign-in.
+   */
+  reserveAccountSlot(): string | undefined {
+    return this.state.reserveSignInSlot(
+      accountSlots,
+      new Date(Date.now() + SIGN_IN_RESERVATION_MS),
+    );
+  }
+
+  /**
+   * Records the reserved sign-ins that finished, whichever process handed
+   * them out. One that has not finished stays reserved until it expires.
+   */
+  async adoptReservedSignIns(): Promise<SignInAdoption[]> {
+    const adopted: SignInAdoption[] = [];
+    for (const slot of this.state.listSignInReservations()) {
+      if (this.state.getGoogleAccount(slot) !== null) {
+        this.state.releaseSignInSlot(slot);
+        continue;
+      }
+      const result = await this.adoptSignIn(slot).catch(() => undefined);
+      if (result !== undefined && result.status !== "missing") {
+        adopted.push(result);
+      }
+    }
+    return adopted;
   }
 
   /**
@@ -320,6 +385,7 @@ export class GoogleAuthService {
     }
     const current = this.state.getGoogleAccount(slot);
     if (current?.email != null && current.email !== email) {
+      this.state.releaseSignInSlot(slot);
       return { status: "mismatch", account: current, email };
     }
     const existing = this.state.findGoogleAccountByEmail(email);
@@ -330,6 +396,7 @@ export class GoogleAuthService {
     } else {
       this.state.upsertGoogleAccount(slot, email);
     }
+    this.state.releaseSignInSlot(slot);
     const account = this.state.getGoogleAccount(slot);
     if (account === null) {
       return { status: "missing", message: "the account was not recorded; try again" };
@@ -351,6 +418,12 @@ export class GoogleAuthService {
   }
 
   async getStatus(role: AccountRole, configuredCalendarId: string): Promise<AccountStatus> {
+    const stored = this.state.getCalendar(role);
+    if (stored !== null && stored.account !== role) {
+      // The role's account signed in again under another slot (a gateway
+      // reconnect always takes a fresh one): that sign-in syncs it now.
+      return this.roleStatusThrough(role, stored);
+    }
     const account = this.state.getAccount(role);
     const calendarId = account?.calendarId ?? configuredCalendarId;
     // A check only adopts a role never signed in (a connect the gateway
@@ -467,7 +540,36 @@ export class GoogleAuthService {
     }
   }
 
-  async logout(role: AccountRole): Promise<boolean> {
+  private async roleStatusThrough(
+    role: AccountRole,
+    calendar: CalendarRecord,
+  ): Promise<AccountStatus> {
+    const checked = await this.checkCalendar(calendar);
+    const email = this.state.getGoogleAccount(calendar.account)?.email ?? null;
+    return {
+      role,
+      configured: true,
+      valid: checked.valid,
+      calendarId: calendar.calendarId,
+      message: checked.valid
+        ? `${checked.message}, signed in as ${email ?? calendar.account}`
+        : checked.message,
+      ...(email === null ? {} : { account: email }),
+      ...(checked.conflictsWith === undefined ? {} : { conflictsWith: checked.conflictsWith }),
+    };
+  }
+
+  /**
+   * Signs a role out. `removeCalendar` runs first, while the sign-in still
+   * works, to delete the role calendar's busy blocks and what calsync kept
+   * for it. Google revokes every token this OAuth client holds for the
+   * account, not only this one, so the revoke is skipped while another
+   * sign-in on this host (in any tenant) is the same account.
+   */
+  async logout(
+    role: AccountRole,
+    removeCalendar?: (calendarKey: string) => Promise<void>,
+  ): Promise<LogoutResult> {
     // Revoking would cut off every calendar this sign-in serves, not only the role's.
     if (
       this.state
@@ -478,7 +580,17 @@ export class GoogleAuthService {
         `other calendars sync through the ${role} sign-in; remove them with calsync calendar remove first`,
       );
     }
+    if (removeCalendar !== undefined && this.state.getCalendar(role) !== null) {
+      await removeCalendar(role);
+    }
     this.cancelConnect(role);
+    const email = this.state.getGoogleAccount(role)?.email ?? null;
+    const sharedWith =
+      email === null
+        ? []
+        : this.state
+            .signInsWithEmail(email)
+            .filter((other) => other.tenantId !== this.state.tenantId || other.slot !== role);
     let refreshToken: string | null;
     try {
       refreshToken = await this.tokens.getRefreshToken(role);
@@ -489,7 +601,8 @@ export class GoogleAuthService {
       // Token unreadable in this process; skip the Google revoke but still remove local state.
       refreshToken = null;
     }
-    if (refreshToken !== null) {
+    const revoke = sharedWith.length === 0;
+    if (refreshToken !== null && revoke) {
       const client = new google.auth.OAuth2(this.oauth.clientId, this.oauth.clientSecret);
       try {
         await client.revokeToken(refreshToken);
@@ -499,7 +612,10 @@ export class GoogleAuthService {
     }
     const deleted = await this.tokens.deleteRefreshToken(role);
     this.state.deleteAccount(role);
-    return deleted || refreshToken !== null;
+    return {
+      removed: deleted || refreshToken !== null,
+      revokeSkipped: refreshToken !== null && !revoke,
+    };
   }
 
   /** Calendar API client for the sign-in in `slot`. */
@@ -525,32 +641,41 @@ export class GoogleAuthService {
     // Sign-ins from before calsync kept emails learn theirs first, so signing
     // the same Google account in again finds its slot instead of taking a new one.
     await this.refreshUnknownEmails();
-    const free = this.freeAccountSlot();
-    const session = await this.createConnectSession(
-      free ?? accountSlots[0],
-      async (client, refreshToken) =>
-        this.adoptAccountToken(await primaryEmail(client), refreshToken),
-    );
+    const { slot, release } = this.signInSlot();
     try {
-      await presentAuthorizationUrl(session.url, options, this.openBrowser);
-      return await session.complete();
-    } catch (error) {
-      session.cancel();
-      if (error instanceof AuthenticationError) {
-        throw error;
+      const session = await this.createConnectSession(slot, async (client, refreshToken) =>
+        this.adoptAccountToken(await primaryEmail(client), refreshToken, slot),
+      );
+      try {
+        await presentAuthorizationUrl(session.url, options, this.openBrowser);
+        return await session.complete();
+      } catch (error) {
+        session.cancel();
+        if (error instanceof AuthenticationError) {
+          throw error;
+        }
+        throw new AuthenticationError(authFailureMessage(error));
       }
-      throw new AuthenticationError(authFailureMessage(error));
+    } finally {
+      release();
     }
   }
 
   /**
    * Keeps a freshly signed-in account's token: under the slot that email
-   * already has, or the first free account slot.
+   * already has, else the slot reserved for this sign-in, else the first
+   * free one.
    */
-  async adoptAccountToken(email: string, refreshToken: string): Promise<GoogleAccountRecord> {
+  async adoptAccountToken(
+    email: string,
+    refreshToken: string,
+    reserved?: string,
+  ): Promise<GoogleAccountRecord> {
     const slot =
       this.state.findGoogleAccountByEmail(email)?.slot ??
-      accountSlots.find((candidate) => this.state.getGoogleAccount(candidate) === null);
+      (reserved !== undefined && this.state.getGoogleAccount(reserved) === null
+        ? reserved
+        : this.freeAccountSlot());
     if (slot === undefined) {
       throw new AuthenticationError(
         `calsync holds at most ${String(accountSlots.length)} added Google accounts; remove one first`,

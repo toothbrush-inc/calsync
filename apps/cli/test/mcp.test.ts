@@ -816,9 +816,21 @@ describe("MCP calendar tools", () => {
         connectAccount: vi.fn(),
         startAccountConnect: () =>
           Promise.resolve({ slot: "account2", url: "https://consent", expiresAt: "later" }),
-        freeAccountSlot: (reserved: Iterable<string>) =>
-          [...reserved].includes("account2") ? "account3" : "account2",
+        freeAccountSlot: vi.fn(),
+        reserveAccountSlot: () =>
+          state.reserveSignInSlot(
+            ["account1", "account2", "account3"],
+            new Date(Date.now() + 60_000),
+          ),
+        adoptReservedSignIns: async () => {
+          const adopted = [];
+          for (const slot of state.listSignInReservations()) {
+            adopted.push(await accounts.auth.adoptSignIn(slot));
+          }
+          return adopted;
+        },
         adoptSignIn: (slot: string) => {
+          state.releaseSignInSlot(slot);
           state.upsertGoogleAccount(slot, "colleague@work.test");
           const account = state.getGoogleAccount(slot);
           return account === null

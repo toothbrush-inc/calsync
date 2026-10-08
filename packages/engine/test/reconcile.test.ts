@@ -52,6 +52,33 @@ function first<T>(values: readonly T[]): T {
   return value;
 }
 
+/** A clock the fake sleep advances, so pacing runs instantly and is observable. */
+function fakePacing() {
+  let at = 1_000_000;
+  const sleeps: number[] = [];
+  return {
+    sleeps,
+    pacing: {
+      now: () => at,
+      sleep: (milliseconds: number) => {
+        sleeps.push(milliseconds);
+        at += milliseconds;
+        return Promise.resolve();
+      },
+    },
+  };
+}
+
+function rateLimited(retryAfterSeconds?: number): Error {
+  return Object.assign(new Error("Rate Limit Exceeded"), {
+    code: 403,
+    errors: [{ reason: "rateLimitExceeded" }],
+    ...(retryAfterSeconds === undefined
+      ? {}
+      : { response: { headers: { "retry-after": String(retryAfterSeconds) } } }),
+  });
+}
+
 describe("Reconciler", () => {
   it("reports zero active mirrors when both source calendars are empty", async () => {
     const runtime = setup([]);
@@ -757,33 +784,6 @@ describe("Reconciler", () => {
       expect(runtime.work.events).toHaveLength(1);
     });
 
-    /** A clock the fake sleep advances, so pacing runs instantly and is observable. */
-    function fakePacing() {
-      let at = 1_000_000;
-      const sleeps: number[] = [];
-      return {
-        sleeps,
-        pacing: {
-          now: () => at,
-          sleep: (milliseconds: number) => {
-            sleeps.push(milliseconds);
-            at += milliseconds;
-            return Promise.resolve();
-          },
-        },
-      };
-    }
-
-    function rateLimited(retryAfterSeconds?: number): Error {
-      return Object.assign(new Error("Rate Limit Exceeded"), {
-        code: 403,
-        errors: [{ reason: "rateLimitExceeded" }],
-        ...(retryAfterSeconds === undefined
-          ? {}
-          : { response: { headers: { "retry-after": String(retryAfterSeconds) } } }),
-      });
-    }
-
     it("backs off and retries a throttled delete instead of failing it", async () => {
       const runtime = setup([source("personal-source")]);
       await runtime.reconciler.reconcile();
@@ -1377,5 +1377,78 @@ describe("Reconciler with more than two calendars", () => {
     expect(busy(runtime.family)).toEqual([]);
     expect(busy(runtime.work)).toHaveLength(1);
     expect(runtime.state.listMappings("family")).toEqual([]);
+  });
+});
+
+describe("paced destination writes", () => {
+  /** One event an hour, ten a day from 08:00, each starting at `minute` past. */
+  function hourly(count: number, minute: string): GoogleCalendarEvent[] {
+    return Array.from({ length: count }, (_, index) => {
+      const day = `2026-08-${String(10 + Math.floor(index / 10))}`;
+      const hour = String(8 + (index % 10)).padStart(2, "0");
+      return source(`event-${String(index)}`, {
+        start: { dateTime: `${day}T${hour}:${minute}:00Z` },
+        end: { dateTime: `${day}T${hour}:45:00Z` },
+      });
+    });
+  }
+
+  it("spaces out a pass that rewrites many blocks, writing the new ones before deleting the old", async () => {
+    const runtime = setup(hourly(120, "00"));
+    await runtime.reconciler.reconcile({ pacing: fakePacing().pacing });
+    expect(runtime.work.events).toHaveLength(120);
+
+    // Every block changes identity, as the first pass after an upgrade does.
+    runtime.personal.events.splice(0, runtime.personal.events.length, ...hourly(120, "05"));
+    const writes: string[] = [];
+    const insertEvent = runtime.work.insertEvent.bind(runtime.work);
+    const deleteEvent = runtime.work.deleteEvent.bind(runtime.work);
+    runtime.work.insertEvent = (calendarId, event) => {
+      writes.push("insert");
+      return insertEvent(calendarId, event);
+    };
+    runtime.work.deleteEvent = (calendarId, eventId) => {
+      writes.push("delete");
+      return deleteEvent(calendarId, eventId);
+    };
+    const { pacing, sleeps } = fakePacing();
+
+    await expect(runtime.reconciler.reconcile({ pacing })).resolves.toMatchObject({
+      created: 120,
+      deleted: 120,
+      failed: 0,
+    });
+    expect(writes.lastIndexOf("insert")).toBeLessThan(writes.indexOf("delete"));
+    expect(sleeps).toHaveLength(239);
+    expect(new Set(sleeps)).toEqual(new Set([300]));
+  });
+
+  it("does not wait between the few writes of an ordinary pass", async () => {
+    const runtime = setup(hourly(3, "00"));
+    const { pacing, sleeps } = fakePacing();
+    await expect(runtime.reconciler.reconcile({ pacing })).resolves.toMatchObject({ created: 3 });
+    expect(sleeps).toEqual([]);
+  });
+
+  it("backs off and retries a throttled write instead of failing the pass", async () => {
+    const runtime = setup([source("personal-source")]);
+    const insertEvent = runtime.work.insertEvent.bind(runtime.work);
+    let throttles = 1;
+    runtime.work.insertEvent = (calendarId, event) => {
+      if (throttles > 0) {
+        throttles -= 1;
+        return Promise.reject(rateLimited());
+      }
+      return insertEvent(calendarId, event);
+    };
+    const { pacing, sleeps } = fakePacing();
+
+    await expect(runtime.reconciler.reconcile({ pacing })).resolves.toMatchObject({
+      created: 1,
+      failed: 0,
+      converged: true,
+    });
+    expect(sleeps).toEqual([5_000]);
+    expect(runtime.work.events).toHaveLength(1);
   });
 });

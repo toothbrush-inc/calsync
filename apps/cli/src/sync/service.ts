@@ -106,9 +106,12 @@ export class DefaultSyncService implements SyncService {
    * Disconnects one calendar. First a full pass with it neither sharing nor
    * receiving busy time, which deletes the blocks calsync wrote to it and the
    * blocks its events put on the others; then its channel is stopped and
-   * everything calsync kept for it is forgotten. `keepBlocks` skips the pass,
-   * for a calendar calsync can no longer reach: its blocks stay behind, and
-   * the next pass still removes the ones its events put elsewhere.
+   * everything calsync kept for it is forgotten. `keepBlocks`, for a calendar
+   * calsync can no longer reach, runs the pass without it: its own blocks
+   * stay behind, and the ones its events put elsewhere are deleted.
+   *
+   * The pass runs however few calendars remain: the daemon stops syncing a
+   * tenant with fewer than two, so a later pass would never clean up.
    */
   async removeCalendar(
     calendarKey: string,
@@ -119,7 +122,15 @@ export class DefaultSyncService implements SyncService {
         throw new Error(`Unknown calendar "${calendarKey}"`);
       }
       let result: ReconcileResult | undefined;
-      if (options.keepBlocks !== true) {
+      if (options.keepBlocks === true) {
+        const without: AppConfig = {
+          ...this.config,
+          calendars: this.config.calendars.filter((calendar) => calendar.key !== calendarKey),
+        };
+        if (without.calendars.length > 0) {
+          result = await this.withEngine((engine) => engine.once(), without, 1);
+        }
+      } else {
         const detached: AppConfig = {
           ...this.config,
           calendars: this.config.calendars.map((calendar) =>
@@ -128,7 +139,7 @@ export class DefaultSyncService implements SyncService {
               : calendar,
           ),
         };
-        result = await this.withEngine((engine) => engine.once(), detached);
+        result = await this.withEngine((engine) => engine.once(), detached, 1);
         const createClient = this.channelClientFactory();
         if (createClient !== undefined) {
           await stopWatchChannels({
@@ -224,6 +235,7 @@ export class DefaultSyncService implements SyncService {
   private async withEngine<T>(
     run: (engine: SyncEngine) => Promise<T>,
     config: AppConfig = this.config,
+    minimumCalendars = 2,
   ): Promise<T> {
     // A tenant's calendars are read when its service is built; a pass that
     // waited on the lock while someone added or removed one would otherwise
@@ -239,7 +251,7 @@ export class DefaultSyncService implements SyncService {
         "the connected calendars changed since this pass was planned; the next pass uses them",
       );
     }
-    if (config.calendars.length < 2) {
+    if (config.calendars.length < minimumCalendars) {
       throw new ReconciliationError(
         "credentials",
         `${String(config.calendars.length)} calendar connected; connect at least two (calsync auth personal|work, or calsync account add and calsync calendar add)`,

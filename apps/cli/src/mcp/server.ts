@@ -120,10 +120,10 @@ export function createCalsyncMcpServer(runtime: McpRuntime): McpServer {
     "remove_calendar",
     {
       description:
-        "Stop syncing a calendar. Runs one pass that deletes the busy blocks calsync wrote to it and the blocks its events put on the others. keep_blocks skips that pass, for a calendar calsync can no longer reach.",
+        "Stop syncing a calendar. Runs one pass that deletes the busy blocks calsync wrote to it and the blocks its events put on the others. keep_blocks, for a calendar calsync can no longer reach, leaves the blocks on it and cleans up only the others.",
       inputSchema: z.object({
         calendar: z.string().describe("The calendar as get_status names it"),
-        keep_blocks: z.boolean().optional().describe("Leave its busy blocks in place"),
+        keep_blocks: z.boolean().optional().describe("Leave the busy blocks on it in place"),
       }),
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
     },
