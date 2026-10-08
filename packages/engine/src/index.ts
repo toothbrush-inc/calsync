@@ -49,6 +49,7 @@ export {
   type ManagedProjectionField,
 } from "./project.js";
 export {
+  busyBlockKey,
   calendarWindow,
   CleanupPassError,
   DedupePassError,

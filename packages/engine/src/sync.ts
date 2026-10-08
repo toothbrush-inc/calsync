@@ -292,7 +292,9 @@ function changesRequireFull(
 
 function syncFingerprint(config: SyncConfig): string {
   const fingerprintInput = {
-    version: 1,
+    // 2: merged busy blocks replaced one mirror per source event. The bump
+    // forces a full pass on upgrade, which swaps the old mirrors for blocks.
+    version: 2,
     calendars: {
       personal: config.accounts.personal.calendarId,
       work: config.accounts.work.calendarId,
