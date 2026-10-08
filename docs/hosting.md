@@ -39,18 +39,19 @@ event's own start, end, and timezone, event identity is canonicalized to UTC
 instants, and the rolling window is bounded by absolute instants. The shared
 `CALSYNC_TIMEZONE` only shapes how Google formats API responses.
 
-### One calendar pair, one tenant
+### One set of calendars, one tenant
 
-Two tenants on the same pair would mirror every event twice and see each
-other's busy blocks as strays, so the connection that would complete an
-already-synced pair is refused: the account is not recorded, the tenant never
-becomes ready, and the daemon never adopts it. This is the usual result of one
+Two tenants syncing the same two calendars would mirror every event twice and
+see each other's busy blocks as strays, so a connection that would give a
+tenant two calendars another tenant already syncs is refused: the calendar is
+not recorded, and the daemon never adopts it. A tenant also syncs any one
+calendar once, and at most six. This is the usual result of one
 person signing in under a second email; they should open the first tenant's
 dashboard instead, or map both emails to it with
 `CALSYNC_WEB_IDENTITY_TENANTS`.
 
 The comparison uses a SHA-256 fingerprint of each validated calendar, stored
-with the account row, so sharing one calendar between tenants (a family
+with the calendar row, so sharing one calendar between tenants (a family
 calendar mirrored against two different work calendars) stays allowed. Two
 tenants that already share a pair from before this check are left running and
 reported instead: `calsync status` names the other tenant, and the dashboard
@@ -192,9 +193,13 @@ clear.
 Normally calsync opens an ephemeral loopback port on 127.0.0.1 for the
 duration of one consent, which is what a Desktop OAuth client expects. Set
 `CALSYNC_CONNECT_BASE_URL` only where consent has to return through a public
-address; calsync then holds a fixed per-role port
-(`CALSYNC_CONNECT_PORT_PERSONAL`, `CALSYNC_CONNECT_PORT_WORK`, default 8801 and 8802) and advertises `<base>/oauth2callback/<role>`, which must be a
-registered redirect URI on the OAuth client.
+address; calsync then holds a fixed per-slot port
+(`CALSYNC_CONNECT_PORT_PERSONAL`, `CALSYNC_CONNECT_PORT_WORK`, default 8801 and 8802) and advertises `<base>/oauth2callback/<slot>`, which must be a
+registered redirect URI on the OAuth client. `calsync account add` signs in
+under `account1`…`account6`, which have no default port: set
+`CALSYNC_CONNECT_PORT_ACCOUNT1` (and so on) and route
+`/oauth2callback/account1` to it, or sign those accounts in from a machine
+with a browser.
 
 That mode binds `0.0.0.0` by default, so the raw port answers on every
 interface. Put the reverse proxy on the same host and pin the listener to
@@ -203,10 +208,13 @@ loopback with `CALSYNC_CONNECT_BIND_HOST=127.0.0.1`.
 ## Capability grants and the gateway
 
 calsync is a capability on the shared local vault. Its manifest
-([`apps/cli/capability.json`](../apps/cli/capability.json)) declares the two
-Google connections it may use. `calsync auth personal|work` stores the refresh
-token in the vault and registers a grant (`calsync:google:personal|work`);
-`calsync logout` removes both. Token reads go through
+([`apps/cli/capability.json`](../apps/cli/capability.json)) declares the
+Google connections it may use: `personal`, `work`, and `account1`…`account6`
+for the sign-ins `calsync account add` makes. Each sign-in stores its refresh
+token in the vault and registers a grant (`calsync:google:<slot>`); tenant
+slots are `<tenant>_<slot>`, which is what lets the gateway connect and broker
+them without knowing tenants ahead of time. `calsync logout` removes the two
+role grants; `calsync account remove` forgets an added one locally. Token reads go through
 `getSecretFor("calsync", ...)`. The default `VAULT_GRANT_MODE=auto` never
 blocks on a laptop; `VAULT_GRANT_MODE=explicit` enforces the grant rows and is
 useful for hosted-like testing — a missing grant then surfaces as "connected

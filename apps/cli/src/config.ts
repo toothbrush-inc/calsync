@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { config as loadDotenv } from "dotenv";
 import { z } from "zod";
 
-import { legacyCalendarKeys, type SyncConfig } from "@calsync/engine";
+import { legacyCalendarKeys, type CalendarConfig, type SyncConfig } from "@calsync/engine";
 import type { ScanGateLimits } from "./scanlimit.js";
 
 export type { SyncConfig } from "@calsync/engine";
@@ -16,6 +16,27 @@ export type { SyncConfig } from "@calsync/engine";
  */
 export const accountRoles = legacyCalendarKeys;
 export type AccountRole = (typeof accountRoles)[number];
+
+/**
+ * Sign-in slots for Google accounts beyond the two original roles, one per
+ * account. capability.json declares each, which is what lets the gateway
+ * connect and broker "<tenant>_accountN" for a tenant.
+ */
+export const accountSlots = [
+  "account1",
+  "account2",
+  "account3",
+  "account4",
+  "account5",
+  "account6",
+] as const;
+
+/**
+ * Calendars one tenant can sync. Every change is written to each other
+ * calendar, and Google limits sustained writes per calendar, so the fan-out
+ * stays bounded.
+ */
+export const MAX_CALENDARS = 6;
 
 export interface AccountConfig {
   tenantId: string;
@@ -119,8 +140,18 @@ export interface WebhookConfig {
   pollIntervalMs: number;
 }
 
+/** A calendar to sync, and the sign-in slot that reads and writes it. */
+export interface AppCalendar extends CalendarConfig {
+  account: string;
+}
+
 export interface AppConfig extends SyncConfig {
-  /** The sign-in behind each calendar; `calendars` lists the same two by key. */
+  calendars: readonly AppCalendar[];
+  /**
+   * The two original sign-ins, from the environment: what `calsync auth
+   * personal|work` connects. A tenant's synced calendars come from its
+   * stored calendars once any are connected.
+   */
   accounts: Record<AccountRole, AccountConfig>;
   pollIntervalMs: number;
   webhook?: WebhookConfig;
@@ -182,6 +213,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     tenantId: values.CALSYNC_TENANT_ID,
     calendars: accountRoles.map((role) => ({
       key: role,
+      account: role,
       calendarId: calendarIds[role],
       source: true,
       destination: true,

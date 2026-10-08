@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import type { AccountRole } from "../config.js";
+import type { CalendarKey } from "@calsync/engine";
 
 import type { WatchChannelRecord } from "../storage/index.js";
 
@@ -21,7 +21,7 @@ export interface WebhookReceiverOptions {
   port: number;
   path: string;
   lookupChannel: (channelId: string) => WatchChannelRecord | null;
-  onNotification: (role: AccountRole, tenantId: string) => void;
+  onNotification: (calendarKey: CalendarKey, tenantId: string) => void;
   onLog?: (line: string) => void;
 }
 
@@ -110,17 +110,21 @@ export class WebhookReceiver {
       !matchesTokenHash(token, channel.tokenHash) ||
       resourceId !== channel.resourceId
     ) {
-      this.#log({ event: "webhook_rejected", role: channel.role });
+      this.#log({ event: "webhook_rejected", calendar: channel.calendarKey });
       return "rejected";
     }
     // The first message on a new channel is a handshake, not a change.
     const state = headerValue(request, "x-goog-resource-state");
     if (state === "sync") {
-      this.#log({ event: "webhook_channel_ready", role: channel.role });
+      this.#log({ event: "webhook_channel_ready", calendar: channel.calendarKey });
       return "handshake";
     }
-    this.#log({ event: "webhook_notification", role: channel.role, state: state ?? "unknown" });
-    this.options.onNotification(channel.role, channel.tenantId);
+    this.#log({
+      event: "webhook_notification",
+      calendar: channel.calendarKey,
+      state: state ?? "unknown",
+    });
+    this.options.onNotification(channel.calendarKey, channel.tenantId);
     return "accepted";
   }
 

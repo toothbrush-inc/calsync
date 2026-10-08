@@ -73,6 +73,7 @@ export {
 export {
   LAST_FULL_SYNC_KEY,
   LAST_RESULT_KEY,
+  calendarStateKeys,
   parseStoredResult,
   readSyncSummary,
   stateKey,

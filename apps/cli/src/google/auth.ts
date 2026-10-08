@@ -6,8 +6,14 @@ import { CodeChallengeMethod } from "google-auth-library";
 import { google } from "googleapis";
 import type { calendar_v3 } from "googleapis";
 
-import type { AccountRole, OAuthConfig } from "../config.js";
-import { StateDatabase } from "../storage/database.js";
+import { accountSlots, MAX_CALENDARS, type AccountRole, type OAuthConfig } from "../config.js";
+import { calendarKeyFor } from "../calendars.js";
+import {
+  StateDatabase,
+  type CalendarRecord,
+  type CalendarRefusal,
+  type GoogleAccountRecord,
+} from "../storage/database.js";
 import type { TokenStore } from "../storage/keychain.js";
 import {
   createGoogleCalendarClient,
@@ -39,8 +45,47 @@ export interface AccountStatus {
 }
 
 export const PAIR_CONFLICT_MESSAGE =
-  "these two calendars are already syncing under another calsync tenant on this host; " +
+  "these calendars are already syncing under another calsync tenant on this host; " +
   "open that tenant's dashboard instead, or have it removed before connecting here";
+
+/** Why a calendar could not be added, in words for the person adding it. */
+export function calendarRefusalMessage(refusal: CalendarRefusal): string {
+  switch (refusal.reason) {
+    case "conflict":
+      return PAIR_CONFLICT_MESSAGE;
+    case "duplicate":
+      return "that calendar is already connected; each calendar can be synced once";
+    case "limit":
+      return `calsync syncs at most ${String(MAX_CALENDARS)} calendars; remove one first`;
+  }
+}
+
+/** A Google sign-in this tenant holds, and how its last check went. */
+export interface GoogleAccountStatus {
+  slot: string;
+  email: string | null;
+  valid: boolean;
+  message: string;
+}
+
+/** A connected calendar and how its last check went. */
+export interface CalendarStatus {
+  calendar: CalendarRecord;
+  valid: boolean;
+  message: string;
+}
+
+/** A calendar a signed-in account can see, and whether calsync can use it. */
+export interface AvailableCalendar {
+  calendarId: string;
+  name: string;
+  accessRole: string;
+  primary: boolean;
+  /** Writable, so it can receive busy blocks as well as share them. */
+  writable: boolean;
+  /** Readable in full, so its busy time can be shared. */
+  readable: boolean;
+}
 
 /**
  * Identifies a calendar for equality across tenants without storing its id:
@@ -87,14 +132,23 @@ export interface ExchangedToken {
  * Broker-side token exchange: mints a short-lived access token for a role.
  * When set, API clients never read the refresh token in this process.
  */
-export type TokenExchange = (role: AccountRole) => Promise<ExchangedToken>;
+export type TokenExchange = (slot: string) => Promise<ExchangedToken>;
 
-interface GoogleConnectSession {
+interface GoogleConnectSession<T = void> {
   url: string;
   expiresAt: Date;
-  complete(): Promise<void>;
+  complete(): Promise<T>;
   cancel(): void;
 }
+
+/**
+ * What a connect does with the refresh token Google returned, given an API
+ * client already holding it. Throws AuthenticationError to refuse it.
+ */
+type TokenHandler<T> = (
+  client: InstanceType<typeof google.auth.OAuth2>,
+  refreshToken: string,
+) => Promise<T>;
 
 export class AuthenticationError extends Error {
   override readonly name = "AuthenticationError";
@@ -108,10 +162,10 @@ export class GoogleAuthService {
     private readonly tokens: TokenStore,
     private readonly state: StateDatabase,
     private readonly openBrowser: (url: string) => Promise<void> = openSystemBrowser,
-    private readonly startLoopback: (
-      role: AccountRole,
-      state: string,
-    ) => Promise<LoopbackServer> = (role, state) => startGoogleLoopback(role, process.env, state),
+    private readonly startLoopback: (slot: string, state: string) => Promise<LoopbackServer> = (
+      slot,
+      state,
+    ) => startGoogleLoopback(slot, process.env, state),
     private readonly tokenExchange?: TokenExchange,
     private readonly validateAccess: typeof validateCalendarAccess = validateCalendarAccess,
   ) {}
@@ -122,7 +176,7 @@ export class GoogleAuthService {
     options: AuthorizationOptions = {},
   ): Promise<void> {
     this.cancelConnect(role);
-    const session = await this.createConnectSession(role, calendarId);
+    const session = await this.roleConnectSession(role, calendarId);
     try {
       await presentAuthorizationUrl(session.url, options, this.openBrowser);
       await session.complete();
@@ -141,7 +195,7 @@ export class GoogleAuthService {
     options: AuthorizationOptions = {},
   ): Promise<ConnectStartResult> {
     this.cancelConnect(role);
-    const session = await this.createConnectSession(role, calendarId);
+    const session = await this.roleConnectSession(role, calendarId);
     this.pending.set(role, session);
     try {
       await presentAuthorizationUrl(session.url, options, this.openBrowser);
@@ -192,6 +246,17 @@ export class GoogleAuthService {
   async getStatus(role: AccountRole, configuredCalendarId: string): Promise<AccountStatus> {
     const account = this.state.getAccount(role);
     const calendarId = account?.calendarId ?? configuredCalendarId;
+    // A check only adopts a role never signed in (a connect the gateway
+    // finished): one whose calendar was removed stays removed.
+    if (account === null && this.state.getGoogleAccount(role) !== null) {
+      return {
+        role,
+        configured: true,
+        valid: false,
+        calendarId,
+        message: `signed in, but its calendar is not synced; run calsync auth ${role} to sync it again`,
+      };
+    }
 
     let client: InstanceType<typeof google.auth.OAuth2>;
     if (this.tokenExchange !== undefined) {
@@ -265,9 +330,11 @@ export class GoogleAuthService {
             configured: true,
             valid: false,
             calendarId,
-            message: PAIR_CONFLICT_MESSAGE,
+            message: calendarRefusalMessage(adoption.refusal),
             account: resolvedAccount,
-            conflictsWith: adoption.conflictsWith,
+            ...(adoption.refusal.reason === "conflict"
+              ? { conflictsWith: adoption.refusal.tenant }
+              : {}),
           };
         }
       } else {
@@ -294,6 +361,16 @@ export class GoogleAuthService {
   }
 
   async logout(role: AccountRole): Promise<boolean> {
+    // Revoking would cut off every calendar this sign-in serves, not only the role's.
+    if (
+      this.state
+        .listCalendars()
+        .some((calendar) => calendar.account === role && calendar.key !== role)
+    ) {
+      throw new AuthenticationError(
+        `other calendars sync through the ${role} sign-in; remove them with calsync calendar remove first`,
+      );
+    }
     this.cancelConnect(role);
     let refreshToken: string | null;
     try {
@@ -318,33 +395,274 @@ export class GoogleAuthService {
     return deleted || refreshToken !== null;
   }
 
-  async createCalendarClient(role: AccountRole): Promise<CalendarClient> {
-    return createGoogleCalendarClient(await this.calendarApi(role));
+  /** Calendar API client for the sign-in in `slot`. */
+  async createCalendarClient(slot: string): Promise<CalendarClient> {
+    return createGoogleCalendarClient(await this.calendarApi(slot));
   }
 
   /**
    * Push channels ride the same grant as reads, so no extra scope is needed —
    * and under the broker the watch call mints its token the same way.
    */
-  async createChannelClient(role: AccountRole): Promise<ChannelClient> {
-    return createGoogleChannelClient(await this.calendarApi(role));
+  async createChannelClient(slot: string): Promise<ChannelClient> {
+    return createGoogleChannelClient(await this.calendarApi(slot));
   }
 
-  private async calendarApi(role: AccountRole): Promise<calendar_v3.Calendar> {
+  /**
+   * Signs in one more Google account. The slot is settled once Google says
+   * which account it is: an account already signed in keeps its slot (its
+   * token is replaced), anything else takes the first free account slot.
+   * Calendars are added separately, with connectCalendar.
+   */
+  async connectAccount(options: AuthorizationOptions = {}): Promise<GoogleAccountRecord> {
+    // Sign-ins from before calsync kept emails learn theirs first, so signing
+    // the same Google account in again finds its slot instead of taking a new one.
+    await Promise.all(
+      this.state
+        .listGoogleAccounts()
+        .filter((account) => account.email === null)
+        .map((account) => this.checkAccount(account.slot)),
+    );
+    const free = accountSlots.find((slot) => this.state.getGoogleAccount(slot) === null);
+    const session = await this.createConnectSession(
+      free ?? accountSlots[0],
+      async (client, refreshToken) =>
+        this.adoptAccountToken(await primaryEmail(client), refreshToken),
+    );
+    try {
+      await presentAuthorizationUrl(session.url, options, this.openBrowser);
+      return await session.complete();
+    } catch (error) {
+      session.cancel();
+      if (error instanceof AuthenticationError) {
+        throw error;
+      }
+      throw new AuthenticationError(authFailureMessage(error));
+    }
+  }
+
+  /**
+   * Keeps a freshly signed-in account's token: under the slot that email
+   * already has, or the first free account slot.
+   */
+  async adoptAccountToken(email: string, refreshToken: string): Promise<GoogleAccountRecord> {
+    const slot =
+      this.state.findGoogleAccountByEmail(email)?.slot ??
+      accountSlots.find((candidate) => this.state.getGoogleAccount(candidate) === null);
+    if (slot === undefined) {
+      throw new AuthenticationError(
+        `calsync holds at most ${String(accountSlots.length)} added Google accounts; remove one first`,
+      );
+    }
+    await this.tokens.setRefreshToken(slot, refreshToken);
+    this.state.upsertGoogleAccount(slot, email);
+    const account = this.state.getGoogleAccount(slot);
+    if (account === null) {
+      throw new AuthenticationError("the account was not recorded; try again");
+    }
+    return account;
+  }
+
+  /** Every calendar the account in `slot` can see, with what calsync could do with it. */
+  async availableCalendars(slot: string): Promise<AvailableCalendar[]> {
+    const api = await this.calendarApi(slot);
+    const calendars: AvailableCalendar[] = [];
+    let pageToken: string | undefined;
+    try {
+      do {
+        const response = await api.calendarList.list({
+          minAccessRole: "reader",
+          showHidden: true,
+          ...(pageToken === undefined ? {} : { pageToken }),
+        });
+        for (const entry of response.data.items ?? []) {
+          if (typeof entry.id !== "string" || entry.id === "") {
+            continue;
+          }
+          const accessRole = entry.accessRole ?? "unknown";
+          calendars.push({
+            calendarId: entry.id,
+            name: entry.summaryOverride ?? entry.summary ?? entry.id,
+            accessRole,
+            primary: entry.primary === true,
+            writable: isWritableAccessRole(accessRole),
+            readable: isReadableAccessRole(accessRole),
+          });
+        }
+        pageToken = response.data.nextPageToken ?? undefined;
+      } while (pageToken !== undefined);
+    } catch (error) {
+      throw new AuthenticationError(authFailureMessage(error));
+    }
+    return calendars.sort(
+      (left, right) =>
+        Number(right.primary) - Number(left.primary) || left.name.localeCompare(right.name),
+    );
+  }
+
+  /**
+   * Adds a calendar the account in `slot` can see. Receiving busy blocks
+   * needs write access; sharing busy time needs to read its events.
+   */
+  async connectCalendar(
+    slot: string,
+    calendarId: string,
+    roles: { source: boolean; destination: boolean } = { source: true, destination: true },
+  ): Promise<CalendarRecord> {
+    if (!roles.source && !roles.destination) {
+      throw new AuthenticationError("a calendar must share busy time, receive it, or both");
+    }
+    if (this.state.getGoogleAccount(slot) === null) {
+      throw new AuthenticationError("that Google account is not signed in");
+    }
+    const api = await this.calendarApi(slot);
+    let entry: calendar_v3.Schema$CalendarListEntry;
+    try {
+      entry = (await api.calendarList.get({ calendarId })).data;
+    } catch (error) {
+      throw new AuthenticationError(authFailureMessage(error));
+    }
+    const accessRole = entry.accessRole ?? undefined;
+    if (roles.destination && !isWritableAccessRole(accessRole)) {
+      throw new AuthenticationError(
+        `calsync cannot write busy blocks to that calendar (access role: ${accessRole ?? "unknown"}); add it with --source-only to share its busy time only`,
+      );
+    }
+    if (!isReadableAccessRole(accessRole)) {
+      throw new AuthenticationError(
+        `calsync cannot read that calendar's events (access role: ${accessRole ?? "unknown"})`,
+      );
+    }
+    const resolvedId = typeof entry.id === "string" && entry.id !== "" ? entry.id : calendarId;
+    // A role's calendar is stored by its alias, "primary"; it is the same
+    // calendar as this account's primary, whatever its fingerprint says.
+    const role = this.state
+      .listCalendars()
+      .find((calendar) => calendar.account === slot && calendar.calendarId === "primary");
+    if (role !== undefined && entry.primary === true) {
+      throw new AuthenticationError(
+        calendarRefusalMessage({ added: false, reason: "duplicate", key: role.key }),
+      );
+    }
+    const key = calendarKeyFor(resolvedId);
+    const existing = this.state.getCalendar(key);
+    if (existing !== null && existing.account !== slot) {
+      const through = this.state.getGoogleAccount(existing.account)?.email ?? existing.account;
+      throw new AuthenticationError(
+        `that calendar is already synced through ${through}; remove it first to switch accounts`,
+      );
+    }
+    const result = this.state.addCalendar({
+      key,
+      account: slot,
+      calendarId: resolvedId,
+      name: entry.summaryOverride ?? entry.summary ?? null,
+      accessRole: accessRole ?? null,
+      source: roles.source,
+      destination: roles.destination,
+      fingerprint: calendarFingerprint(entry, calendarId),
+    });
+    if (!result.added) {
+      throw new AuthenticationError(calendarRefusalMessage(result));
+    }
+    const record = this.state.getCalendar(key);
+    if (record === null) {
+      throw new AuthenticationError("the calendar was not recorded; try again");
+    }
+    return record;
+  }
+
+  /**
+   * Checks one sign-in: that its token still works, and which account it is.
+   * Learns the email of sign-ins recorded before calsync kept it.
+   */
+  async checkAccount(slot: string): Promise<GoogleAccountStatus> {
+    const account = this.state.getGoogleAccount(slot);
+    try {
+      const api = await this.calendarApi(slot);
+      const email = await primaryEmail(api);
+      this.state.verifyGoogleAccount(slot, email);
+      return { slot, email, valid: true, message: "signed in" };
+    } catch (error) {
+      return {
+        slot,
+        email: account?.email ?? null,
+        valid: false,
+        message: error instanceof AuthenticationError ? error.message : authFailureMessage(error),
+      };
+    }
+  }
+
+  /** Checks one connected calendar is still reachable with the access its roles need. */
+  async checkCalendar(calendar: CalendarRecord): Promise<CalendarStatus> {
+    try {
+      const api = await this.calendarApi(calendar.account);
+      const entry = (await api.calendarList.get({ calendarId: calendar.calendarId })).data;
+      const accessRole = entry.accessRole ?? undefined;
+      if (calendar.destination && !isWritableAccessRole(accessRole)) {
+        return {
+          calendar,
+          valid: false,
+          message: `no longer writable (access role: ${accessRole ?? "unknown"})`,
+        };
+      }
+      if (!isReadableAccessRole(accessRole)) {
+        return {
+          calendar,
+          valid: false,
+          message: `no longer readable (access role: ${accessRole ?? "unknown"})`,
+        };
+      }
+      this.state.verifyCalendar(calendar.key, {
+        fingerprint: calendarFingerprint(entry, calendar.calendarId),
+        name: entry.summaryOverride ?? entry.summary ?? null,
+        accessRole: accessRole ?? null,
+      });
+      const refreshed = this.state.getCalendar(calendar.key) ?? calendar;
+      return {
+        calendar: refreshed,
+        valid: true,
+        message: calendar.destination ? "readable and writable" : "readable",
+      };
+    } catch (error) {
+      return {
+        calendar,
+        valid: false,
+        message: error instanceof AuthenticationError ? error.message : authFailureMessage(error),
+      };
+    }
+  }
+
+  /**
+   * Forgets a sign-in that no calendar uses any more: its local token and its
+   * row. Google's grant is left alone — revoking it would also cut off every
+   * other tenant or device signed in to the same Google account with this
+   * client.
+   */
+  async disconnectAccount(slot: string): Promise<void> {
+    if (this.state.listCalendars().some((calendar) => calendar.account === slot)) {
+      throw new AuthenticationError("remove that account's calendars first");
+    }
+    await this.tokens.deleteRefreshToken(slot);
+    this.state.deleteGoogleAccount(slot);
+  }
+
+  /** The Calendar API as the sign-in in `slot`. Tests substitute a fake. */
+  protected async calendarApi(slot: string): Promise<calendar_v3.Calendar> {
     if (this.tokenExchange !== undefined) {
       try {
-        await this.tokenExchange(role);
+        await this.tokenExchange(slot);
       } catch (error) {
-        throw new AuthenticationError(describeExchangeFailure(role, error).message);
+        throw new AuthenticationError(describeExchangeFailure(slot, error).message);
       }
-      return google.calendar({ version: "v3", auth: this.exchangeClient(role) });
+      return google.calendar({ version: "v3", auth: this.exchangeClient(slot) });
     }
     let refreshToken: string | null;
     try {
-      refreshToken = await this.tokens.getRefreshToken(role);
+      refreshToken = await this.tokens.getRefreshToken(slot);
     } catch (error) {
       if (error instanceof GrantError) {
-        throw new AuthenticationError(grantMissingMessage(role));
+        throw new AuthenticationError(grantMissingMessage(slot));
       }
       if (error instanceof EgressRequiredError) {
         throw new AuthenticationError(brokerOnlyMessage());
@@ -352,7 +670,7 @@ export class GoogleAuthService {
       throw error;
     }
     if (refreshToken === null) {
-      throw new AuthenticationError(`${role} is not authorized; run calsync auth ${role}`);
+      throw new AuthenticationError(`${slot} is not authorized; ${reauthorizeHint(slot)}`);
     }
     const client = new google.auth.OAuth2(this.oauth.clientId, this.oauth.clientSecret);
     client.setCredentials({ refresh_token: refreshToken });
@@ -360,25 +678,48 @@ export class GoogleAuthService {
   }
 
   /** API client whose tokens come from the broker; never reads the refresh token. */
-  private exchangeClient(role: AccountRole): InstanceType<typeof google.auth.OAuth2> {
+  private exchangeClient(slot: string): InstanceType<typeof google.auth.OAuth2> {
     const exchange = this.tokenExchange;
     if (exchange === undefined) {
       throw new Error("token exchange is not configured");
     }
     const client = new google.auth.OAuth2(this.oauth.clientId, this.oauth.clientSecret);
-    client.refreshHandler = () => exchange(role);
+    client.refreshHandler = () => exchange(slot);
     return client;
   }
 
-  private async createConnectSession(
-    role: AccountRole,
-    calendarId: string,
-  ): Promise<GoogleConnectSession> {
+  /** A role's sign-in, which also adds the role's one calendar. */
+  private roleConnectSession(role: AccountRole, calendarId: string): Promise<GoogleConnectSession> {
+    return this.createConnectSession(role, async (client, refreshToken) => {
+      const entry = await this.validateAccess(client, calendarId);
+      const fingerprint = calendarFingerprint(entry, calendarId);
+      // Checked before the token is touched, and again as the row is written.
+      const refusal = this.state.calendarRefusal(role, fingerprint);
+      if (refusal !== undefined) {
+        throw new AuthenticationError(calendarRefusalMessage(refusal));
+      }
+      const previous = await this.tokens.getRefreshToken(role).catch(() => null);
+      await this.tokens.setRefreshToken(role, refreshToken);
+      const adoption = this.state.adoptAccount(role, calendarId, fingerprint);
+      if (!adoption.adopted) {
+        // Lost a race: put back the sign-in other calendars may still use.
+        await (previous === null
+          ? this.tokens.deleteRefreshToken(role)
+          : this.tokens.setRefreshToken(role, previous));
+        throw new AuthenticationError(calendarRefusalMessage(adoption.refusal));
+      }
+    });
+  }
+
+  private async createConnectSession<T>(
+    slot: string,
+    onToken: TokenHandler<T>,
+  ): Promise<GoogleConnectSession<T>> {
     // The state is minted first so the callback listener can refuse anything
     // that does not carry it: on a public callback URL that is what stops a
     // stranger from aborting or racing a pending authorization.
     const oauthState = base64Url(randomBytes(24));
-    const callback = await this.startLoopback(role, oauthState);
+    const callback = await this.startLoopback(slot, oauthState);
     const client = new google.auth.OAuth2(
       this.oauth.clientId,
       this.oauth.clientSecret,
@@ -421,20 +762,7 @@ export class GoogleAuthService {
             );
           }
           client.setCredentials({ refresh_token: refreshToken });
-          const entry = await this.validateAccess(client, calendarId);
-          const fingerprint = calendarFingerprint(entry, calendarId);
-          // Checked before the token is kept, and again as the row is written.
-          if (
-            fingerprint !== undefined &&
-            this.state.pairConflict(role, fingerprint) !== undefined
-          ) {
-            throw new AuthenticationError(PAIR_CONFLICT_MESSAGE);
-          }
-          await this.tokens.setRefreshToken(role, refreshToken);
-          if (!this.state.adoptAccount(role, calendarId, fingerprint).adopted) {
-            await this.tokens.deleteRefreshToken(role);
-            throw new AuthenticationError(PAIR_CONFLICT_MESSAGE);
-          }
+          return await onToken(client, refreshToken);
         } catch (error) {
           if (error instanceof AuthenticationError) {
             throw error;
@@ -500,6 +828,38 @@ export function isWritableAccessRole(role: string | null | undefined): boolean {
   return role === "writer" || role === "owner";
 }
 
+/** Can read event details; a free/busy reader sees only busy times. */
+export function isReadableAccessRole(role: string | null | undefined): boolean {
+  return role === "reader" || isWritableAccessRole(role);
+}
+
+/**
+ * The signed-in account's address: the id of its primary calendar. Needs
+ * only the calendar-list scope calsync already holds.
+ */
+async function primaryEmail(
+  source: InstanceType<typeof google.auth.OAuth2> | calendar_v3.Calendar,
+): Promise<string> {
+  const api = "calendarList" in source ? source : google.calendar({ version: "v3", auth: source });
+  let id: string | null | undefined;
+  try {
+    id = (await api.calendarList.get({ calendarId: "primary" })).data.id;
+  } catch (error) {
+    throw new AuthenticationError(authFailureMessage(error));
+  }
+  if (typeof id !== "string" || id === "") {
+    throw new AuthenticationError("Google did not say which account this is");
+  }
+  return id.trim().toLowerCase();
+}
+
+/** How to sign a slot in again. */
+function reauthorizeHint(slot: string): string {
+  return slot === "personal" || slot === "work"
+    ? `run calsync auth ${slot}`
+    : "run calsync account add and sign in to that account again";
+}
+
 function authFailureMessage(error: unknown): string {
   const candidate = error as {
     code?: unknown;
@@ -532,8 +892,8 @@ function authFailureMessage(error: unknown): string {
     : "Google authorization failed";
 }
 
-function grantMissingMessage(role: AccountRole): string {
-  return `connected but not granted to calsync; run calsync auth ${role} to re-grant`;
+function grantMissingMessage(slot: string): string {
+  return `connected but not granted to calsync; ${reauthorizeHint(slot)} to re-grant`;
 }
 
 function brokerOnlyMessage(): string {
@@ -541,7 +901,7 @@ function brokerOnlyMessage(): string {
 }
 
 function describeExchangeFailure(
-  role: AccountRole,
+  slot: string,
   error: unknown,
 ): { configured: boolean; message: string } {
   const code = (error as { code?: unknown } | null)?.code;
@@ -549,12 +909,12 @@ function describeExchangeFailure(
     return { configured: false, message: "not authorized" };
   }
   if (code === "grant_missing") {
-    return { configured: true, message: grantMissingMessage(role) };
+    return { configured: true, message: grantMissingMessage(slot) };
   }
   if (code === "token_revoked") {
     return {
       configured: true,
-      message: `credentials were revoked or expired; run calsync auth ${role} again`,
+      message: `credentials were revoked or expired; ${reauthorizeHint(slot)}`,
     };
   }
   const detail = error instanceof Error ? error.message : "token exchange failed";
@@ -581,16 +941,17 @@ function openSystemBrowser(url: string): Promise<void> {
 }
 
 const CONNECT_SUCCESS_TEXT = "calsync authorization complete. You can close this window.";
-const DEFAULT_CONNECT_PORTS: Record<AccountRole, number> = { personal: 8801, work: 8802 };
+const DEFAULT_CONNECT_PORTS: Readonly<Record<string, number>> = { personal: 8801, work: 8802 };
 
 /**
  * Local default: ephemeral loopback on 127.0.0.1 (desktop OAuth client).
- * Hosted (CALSYNC_CONNECT_BASE_URL set): fixed per-role port behind a reverse
- * proxy, advertising https://<base>/oauth2callback/<role> — which must be
- * pre-registered on a WEB-type Google OAuth client.
+ * Hosted (CALSYNC_CONNECT_BASE_URL set): fixed per-slot port behind a reverse
+ * proxy, advertising https://<base>/oauth2callback/<slot> — which must be
+ * pre-registered on a WEB-type Google OAuth client. Only the two role slots
+ * have default ports; an account slot needs CALSYNC_CONNECT_PORT_<SLOT>.
  */
 export function startGoogleLoopback(
-  role: AccountRole,
+  slot: string,
   env: NodeJS.ProcessEnv = process.env,
   state: string,
 ): Promise<LoopbackServer> {
@@ -605,16 +966,24 @@ export function startGoogleLoopback(
       successText: CONNECT_SUCCESS_TEXT,
     });
   }
-  const configuredPort = env[`CALSYNC_CONNECT_PORT_${role.toUpperCase()}`];
+  const configuredPort = env[`CALSYNC_CONNECT_PORT_${slot.toUpperCase()}`];
+  const port =
+    configuredPort !== undefined && configuredPort.trim() !== ""
+      ? Number(configuredPort)
+      : DEFAULT_CONNECT_PORTS[slot];
+  if (port === undefined) {
+    return Promise.reject(
+      new AuthenticationError(
+        `no callback port for ${slot} behind CALSYNC_CONNECT_BASE_URL; set CALSYNC_CONNECT_PORT_${slot.toUpperCase()} and route /oauth2callback/${slot} to it`,
+      ),
+    );
+  }
   return LoopbackServer.start({
     ...gate,
-    path: `/oauth2callback/${role}`,
+    path: `/oauth2callback/${slot}`,
     successText: CONNECT_SUCCESS_TEXT,
     host: env["CALSYNC_CONNECT_BIND_HOST"] ?? "0.0.0.0",
-    port:
-      configuredPort !== undefined && configuredPort.trim() !== ""
-        ? Number(configuredPort)
-        : DEFAULT_CONNECT_PORTS[role],
+    port,
     publicBaseUrl: base.trim(),
   });
 }

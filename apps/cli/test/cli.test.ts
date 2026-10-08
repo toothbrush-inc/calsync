@@ -32,6 +32,8 @@ describe("CLI scaffold", () => {
       "auth",
       "status",
       "logout",
+      "account",
+      "calendar",
       "sync",
       "start",
       "rebuild",
@@ -651,8 +653,14 @@ describe("exclude commands", () => {
     const config: AppConfig = {
       tenantId: "default",
       calendars: [
-        { key: "personal", calendarId: "personal", source: true, destination: true },
-        { key: "work", calendarId: "work", source: true, destination: true },
+        {
+          key: "personal",
+          account: "personal",
+          calendarId: "personal",
+          source: true,
+          destination: true,
+        },
+        { key: "work", account: "work", calendarId: "work", source: true, destination: true },
       ],
       accounts: {
         personal: { tenantId: "default", role: "personal", calendarId: "personal" },
@@ -813,3 +821,145 @@ function syncResult(
     },
   };
 }
+
+describe("account and calendar commands", () => {
+  let directory: string;
+  let state: StateDatabase;
+
+  beforeEach(() => {
+    directory = mkdtempSync(join(tmpdir(), "calsync-calendars-"));
+    vi.stubEnv("CALSYNC_DATABASE_PATH", join(directory, "state.sqlite3"));
+    vi.stubEnv("CALSYNC_PERSONAL_CALENDAR_ID", "primary");
+    vi.stubEnv("CALSYNC_WORK_CALENDAR_ID", "primary");
+    vi.stubEnv("CALSYNC_TIMEZONE", "UTC");
+    state = new StateDatabase(join(directory, "state.sqlite3"));
+    state.upsertGoogleAccount("account1", "me@work.test");
+    state.addCalendar({
+      key: "cal-mine",
+      account: "account1",
+      calendarId: "me@work.test",
+      name: "me@work.test",
+      fingerprint: "fp-mine",
+    });
+  });
+
+  afterEach(() => {
+    state.close();
+    vi.unstubAllEnvs();
+    rmSync(directory, { recursive: true, force: true });
+  });
+
+  function runtimeWith(overrides: Partial<NonNullable<AppRuntime["accounts"]>["auth"]> = {}) {
+    const connectCalendar = vi.fn(
+      (slot: string, calendarId: string, roles?: { source: boolean; destination: boolean }) => {
+        state.addCalendar({
+          key: "cal-team",
+          account: slot,
+          calendarId,
+          name: "Team",
+          source: roles?.source ?? true,
+          destination: roles?.destination ?? true,
+        });
+        const added = state.getCalendar("cal-team");
+        if (added === null) {
+          throw new Error("not recorded");
+        }
+        return Promise.resolve(added);
+      },
+    );
+    const removeCalendar = vi.fn(() =>
+      Promise.resolve({ created: 0, updated: 0, deleted: 3, repaired: 0 }),
+    );
+    const runtime = (): AppRuntime => ({
+      auth: { authorize: vi.fn(), getStatus: vi.fn(), logout: vi.fn() },
+      state: { close: vi.fn() },
+      accounts: {
+        auth: {
+          connectAccount: vi.fn(),
+          availableCalendars: vi.fn(() =>
+            Promise.resolve([
+              {
+                calendarId: "me@work.test",
+                name: "me@work.test",
+                accessRole: "owner",
+                primary: true,
+                writable: true,
+                readable: true,
+              },
+              {
+                calendarId: "team@group.test",
+                name: "Team",
+                accessRole: "reader",
+                primary: false,
+                writable: false,
+                readable: true,
+              },
+            ]),
+          ),
+          connectCalendar,
+          checkAccount: vi.fn(),
+          checkCalendar: vi.fn(),
+          disconnectAccount: vi.fn(),
+          ...overrides,
+        },
+        state,
+        removeCalendar,
+      },
+    });
+    return { runtime, connectCalendar, removeCalendar };
+  }
+
+  async function run(runtime: () => AppRuntime, args: string[]): Promise<string> {
+    const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    try {
+      await createProgram(runtime).parseAsync(["node", "calsync", ...args]);
+      return output.mock.calls.map(([value]) => String(value)).join("");
+    } finally {
+      output.mockRestore();
+    }
+  }
+
+  it("lists what each account offers, marking calendars already synced", async () => {
+    const { runtime } = runtimeWith();
+    const listed = await run(runtime, ["calendar", "list", "--available"]);
+    expect(listed).toContain("me@work.test:");
+    expect(listed).toContain("  me@work.test  (synced)");
+    expect(listed).toContain("  me@work.test/Team  (can only share busy time (--source-only))");
+  });
+
+  it("adds a calendar by account and name, with the roles asked for", async () => {
+    const { runtime, connectCalendar } = runtimeWith();
+    const output = await run(runtime, ["calendar", "add", "ME@work.test/team", "--source-only"]);
+    expect(connectCalendar).toHaveBeenCalledWith("account1", "team@group.test", {
+      source: true,
+      destination: false,
+    });
+    expect(output).toContain("me@work.test / Team: added (shares busy time only)");
+    expect(await run(runtime, ["calendar", "list"])).toBe(
+      "me@work.test  (shares and receives busy time)\nme@work.test / Team  (shares busy time only)\n",
+    );
+  });
+
+  it("removes a calendar named the way the list shows it", async () => {
+    const { runtime, removeCalendar } = runtimeWith();
+    const output = await run(runtime, ["calendar", "remove", "me@work.test"]);
+    expect(removeCalendar).toHaveBeenCalledWith("cal-mine", {});
+    expect(output).toBe("me@work.test: removed; 3 busy blocks deleted.\n");
+  });
+
+  it("excludes keywords from a calendar named by account and name", async () => {
+    const { runtime } = runtimeWith();
+    const output = await run(runtime, [
+      "exclude",
+      "add",
+      "--from",
+      "me@work.test",
+      "--keyword",
+      "standup",
+    ]);
+    expect(output).toContain('keyword "standup" (from me@work.test)');
+    expect(state.listExclusionKeywords()).toEqual([
+      expect.objectContaining({ sourceKey: "cal-mine", keyword: "standup" }),
+    ]);
+  });
+});

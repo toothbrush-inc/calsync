@@ -6,8 +6,6 @@ import {
   type Vault,
 } from "@dvd-toy-box/vault";
 
-import type { AccountRole } from "./config.js";
-
 import {
   loadConfig,
   loadOAuthConfig,
@@ -15,6 +13,7 @@ import {
   type AppConfig,
   type OAuthConfig,
 } from "./config.js";
+import { sameCalendarSet, withStoredCalendars } from "./calendars.js";
 import { GOOGLE_CALENDAR_SCOPES, GoogleAuthService, type TokenExchange } from "./google/auth.js";
 import { RotatingFileLogger, serviceLogPath } from "./logging.js";
 import {
@@ -22,7 +21,6 @@ import {
   StateDatabase,
   tokenSlot,
   VaultTokenStore,
-  type AccountRecord,
 } from "./storage/index.js";
 import {
   daemonLockPathFor,
@@ -54,13 +52,19 @@ export interface LiveAppRuntime {
   auth: GoogleAuthService;
   state: StateDatabase;
   sync: SyncService;
+  accounts: {
+    auth: GoogleAuthService;
+    state: StateDatabase;
+    removeCalendar: DefaultSyncService["removeCalendar"];
+  };
 }
 
 export function createAuthRuntime(tenantId?: string): LiveAppRuntime {
   const oauth = loadOAuthConfig();
   const databasePath = stateDatabasePath();
-  const config = applyTenant(loadConfig(), tenantId);
-  const state = new StateDatabase(databasePath, config.tenantId);
+  const configured = applyTenant(loadConfig(), tenantId);
+  const state = new StateDatabase(databasePath, configured.tenantId);
+  const config = withStoredCalendars(configured, state.listCalendars(), state.listGoogleAccounts());
   const vault = openVault();
   // Under the gateway, mint short-lived access tokens from the broker instead
   // of reading refresh tokens in this process. Broker slots follow the same
@@ -83,6 +87,11 @@ export function createAuthRuntime(tenantId?: string): LiveAppRuntime {
   return {
     auth,
     state,
+    accounts: {
+      auth,
+      state,
+      removeCalendar: (calendarKey, options) => base.removeCalendar(calendarKey, options),
+    },
     sync: {
       once: (options) => base.once(options),
       rebuild: (options) => base.rebuild(options),
@@ -92,7 +101,7 @@ export function createAuthRuntime(tenantId?: string): LiveAppRuntime {
       // table is re-consulted before every pass round, so tenants signed up
       // while the daemon runs are picked up without a restart.
       start: (options) =>
-        buildDaemon(oauth, vault, databasePath, config, base, state, egress, writeLog).start(
+        buildDaemon(oauth, vault, databasePath, configured, base, state, egress, writeLog).start(
           options,
         ),
     },
@@ -127,8 +136,8 @@ export function brokeredExchangeFor(
   tenantId: string,
   mint: typeof brokeredToken = brokeredToken,
 ): TokenExchange {
-  return async (role: AccountRole) => {
-    const token = await mint(egress, { provider: "google", slot: tokenSlot(role, tenantId) });
+  return async (slot: string) => {
+    const token = await mint(egress, { provider: "google", slot: tokenSlot(slot, tenantId) });
     return { access_token: token.accessToken, expiry_date: Date.parse(token.expiresAt) };
   };
 }
@@ -143,41 +152,48 @@ function buildDaemon(
   egress: EgressEndpoint | null,
   writeLog: (line: string) => void,
 ): SyncDaemon {
-  const baseTenant = base.daemonTenant();
-  const extras = new Map<string, { tenant: DaemonTenant; close: () => void }>();
+  const entries = new Map<string, { tenant: DaemonTenant; close: () => void }>();
+  entries.set(config.tenantId, { tenant: base.daemonTenant(), close: () => undefined });
 
-  // Re-consulted before every pass round, so a tenant that authorizes while
-  // the daemon runs joins the loop without a restart — and one whose accounts
-  // go away (or change calendars) is rebuilt or retired.
+  // Re-consulted before every pass round, so a tenant that connects while the
+  // daemon runs joins the loop without a restart, one whose calendars change
+  // is rebuilt, and one left with fewer than two is retired. The env tenant
+  // is always served, from its stored calendars once it has any.
   const liveTenants = (): readonly DaemonTenant[] => {
-    const ready = new Set(baseState.listReadyTenants());
-    ready.delete(config.tenantId);
-    for (const [tenantId, entry] of extras) {
-      if (!ready.has(tenantId)) {
-        extras.delete(tenantId);
+    const configs = new Map<string, AppConfig>();
+    for (const tenantId of new Set([config.tenantId, ...baseState.listReadyTenants()])) {
+      const tenantConfig = withStoredCalendars(
+        tenantId === config.tenantId ? config : configForTenant(config, tenantId),
+        baseState.listCalendars(tenantId),
+        baseState.listGoogleAccounts(tenantId),
+      );
+      // Fewer than two calendars is nothing to sync yet, not an error per round.
+      if (tenantConfig.calendars.length >= 2) {
+        configs.set(tenantId, tenantConfig);
+      }
+    }
+    for (const [tenantId, entry] of entries) {
+      if (!configs.has(tenantId)) {
+        entries.delete(tenantId);
         entry.close();
         writeLog(JSON.stringify({ event: "tenant_retired", tenant: tenantId }));
       }
     }
-    for (const tenantId of ready) {
-      const tenantConfig = configForTenant(config, tenantId, baseState.listAccounts(tenantId));
-      if (tenantConfig === undefined) {
+    for (const [tenantId, tenantConfig] of configs) {
+      const cached = entries.get(tenantId);
+      if (
+        cached !== undefined &&
+        sameCalendarSet(cached.tenant.calendars, tenantConfig.calendars)
+      ) {
         continue;
       }
-      const cached = extras.get(tenantId);
-      if (cached !== undefined) {
-        if (sameCalendars(cached.tenant.calendarIds, tenantConfig)) {
-          continue;
-        }
-        extras.delete(tenantId);
-        cached.close();
-      }
+      cached?.close();
       // Each tenant authenticates with its own vault tokens — or, under the
       // gateway, its own tenant-scoped broker slots. State connections live
-      // until the tenant retires.
+      // until the tenant retires or is rebuilt.
       const tenantState = new StateDatabase(databasePath, tenantId);
       const tenantAuth = authServiceFor(oauth, vault, tenantState, tenantId, egress);
-      extras.set(tenantId, {
+      entries.set(tenantId, {
         tenant: new DefaultSyncService(
           tenantConfig,
           tenantAuth,
@@ -196,7 +212,7 @@ function buildDaemon(
         }),
       );
     }
-    return [baseTenant, ...[...extras.values()].map((entry) => entry.tenant)];
+    return [...entries.values()].map((entry) => entry.tenant);
   };
 
   return new SyncDaemon(
@@ -209,42 +225,16 @@ function buildDaemon(
   );
 }
 
-function sameCalendars(
-  calendarIds: Record<"personal" | "work", string>,
-  config: AppConfig,
-): boolean {
-  return (
-    calendarIds.personal === config.accounts.personal.calendarId &&
-    calendarIds.work === config.accounts.work.calendarId
-  );
-}
-
 /**
- * Per-tenant sync configuration: shared env settings plus the calendar IDs
- * the tenant's accounts were authorized against.
+ * Per-tenant sync configuration: shared env settings under another tenant
+ * id. Its calendars come from what the tenant connected (withStoredCalendars).
  *
  * The shared `timezone` is safe for tenants in different timezones: it only
  * shapes how Google formats list responses and feeds the sync fingerprint.
  * Event identity canonicalizes datetimes to UTC instants, window bounds are
- * absolute instants, and mirrored busy blocks copy each source event's own
- * times and timezone — so nothing tenant-visible depends on it.
+ * absolute instants, and busy blocks carry absolute instants — so nothing
+ * tenant-visible depends on it.
  */
-function configForTenant(
-  base: AppConfig,
-  tenantId: string,
-  accounts: readonly AccountRecord[],
-): AppConfig | undefined {
-  const personal = accounts.find((account) => account.role === "personal");
-  const work = accounts.find((account) => account.role === "work");
-  if (personal === undefined || work === undefined) {
-    return undefined;
-  }
-  return {
-    ...base,
-    tenantId,
-    accounts: {
-      personal: { tenantId, role: "personal", calendarId: personal.calendarId },
-      work: { tenantId, role: "work", calendarId: work.calendarId },
-    },
-  };
+function configForTenant(base: AppConfig, tenantId: string): AppConfig {
+  return applyTenant(base, tenantId);
 }

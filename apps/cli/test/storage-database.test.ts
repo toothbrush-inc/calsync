@@ -57,7 +57,7 @@ describe("StateDatabase", () => {
     database.upsertWatchChannel(
       {
         tenantId: "acme",
-        role: "personal",
+        calendarKey: "personal",
         calendarId: "acme-personal",
         channelId: "channel-acme",
         resourceId: "resource-acme",
@@ -251,7 +251,7 @@ describe("StateDatabase", () => {
       expect(second.adoptAccount("personal", "primary", "fp-home")).toEqual({ adopted: true });
       expect(second.adoptAccount("work", "primary", "fp-office")).toEqual({
         adopted: false,
-        conflictsWith: "first",
+        refusal: { added: false, reason: "conflict", tenant: "first" },
       });
       expect(second.getAccount("work")).toBeNull();
       expect(second.listReadyTenants()).toEqual(["first"]);
@@ -265,7 +265,7 @@ describe("StateDatabase", () => {
       expect(third.adoptAccount("work", "primary", "fp-home")).toEqual({ adopted: true });
       expect(third.adoptAccount("personal", "primary", "fp-office")).toEqual({
         adopted: false,
-        conflictsWith: "first",
+        refusal: { added: false, reason: "conflict", tenant: "first" },
       });
       // An unidentifiable calendar cannot be compared, so it is let through.
       expect(third.adoptAccount("personal", "primary", undefined)).toEqual({ adopted: true });

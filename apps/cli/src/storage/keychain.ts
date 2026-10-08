@@ -1,13 +1,12 @@
 import { KeychainError, KeychainSecretStore, type CommandRunner } from "@dvd-toy-box/vault";
 
-import type { AccountRole } from "../config.js";
-
 const DEFAULT_SERVICE = "com.local.calsync.oauth";
 
+/** Refresh tokens by sign-in slot: "personal", "work", or account1..account6. */
 export interface TokenStore {
-  getRefreshToken(role: AccountRole): Promise<string | null>;
-  setRefreshToken(role: AccountRole, refreshToken: string): Promise<void>;
-  deleteRefreshToken(role: AccountRole): Promise<boolean>;
+  getRefreshToken(slot: string): Promise<string | null>;
+  setRefreshToken(slot: string, refreshToken: string): Promise<void>;
+  deleteRefreshToken(slot: string): Promise<boolean>;
 }
 
 export type { CommandRunner };
@@ -15,12 +14,12 @@ export { KeychainError };
 
 /**
  * Storage slot for one account's refresh token. The default tenant keeps the
- * bare role so existing installs retain their credentials; other tenants get
- * "<tenant>_<role>", which is unambiguous because tenant ids cannot contain
+ * bare slot so existing installs retain their credentials; other tenants get
+ * "<tenant>_<slot>", which is unambiguous because tenant ids cannot contain
  * underscores and must satisfy the vault's slot charset.
  */
-export function tokenSlot(role: AccountRole, tenantId = "default"): string {
-  return tenantId === "default" ? role : `${tenantId}_${role}`;
+export function tokenSlot(slot: string, tenantId = "default"): string {
+  return tenantId === "default" ? slot : `${tenantId}_${slot}`;
 }
 
 export class MacOsKeychainTokenStore implements TokenStore {
@@ -39,18 +38,18 @@ export class MacOsKeychainTokenStore implements TokenStore {
     });
   }
 
-  async getRefreshToken(role: AccountRole): Promise<string | null> {
-    return this.secrets.get(tokenSlot(role, this.tenantId));
+  async getRefreshToken(slot: string): Promise<string | null> {
+    return this.secrets.get(tokenSlot(slot, this.tenantId));
   }
 
-  async setRefreshToken(role: AccountRole, refreshToken: string): Promise<void> {
+  async setRefreshToken(slot: string, refreshToken: string): Promise<void> {
     if (refreshToken.trim() === "") {
       throw new KeychainError("Refusing to store an empty refresh token");
     }
-    await this.secrets.set(tokenSlot(role, this.tenantId), refreshToken);
+    await this.secrets.set(tokenSlot(slot, this.tenantId), refreshToken);
   }
 
-  async deleteRefreshToken(role: AccountRole): Promise<boolean> {
-    return this.secrets.delete(tokenSlot(role, this.tenantId));
+  async deleteRefreshToken(slot: string): Promise<boolean> {
+    return this.secrets.delete(tokenSlot(slot, this.tenantId));
   }
 }

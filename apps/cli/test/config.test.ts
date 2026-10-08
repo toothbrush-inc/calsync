@@ -70,8 +70,20 @@ describe("loadConfig", () => {
     expect(config.logging).toEqual({ maxBytes: 5 * 1024 * 1024, backups: 5 });
     expect(config.window).toEqual({ pastDays: 30, futureDays: 365 });
     expect(config.calendars).toEqual([
-      { key: "personal", calendarId: "personal@example.com", source: true, destination: true },
-      { key: "work", calendarId: "work@example.com", source: true, destination: true },
+      {
+        key: "personal",
+        account: "personal",
+        calendarId: "personal@example.com",
+        source: true,
+        destination: true,
+      },
+      {
+        key: "work",
+        account: "work",
+        calendarId: "work@example.com",
+        source: true,
+        destination: true,
+      },
     ]);
     expect(config.exclusions.keys["personal"]).toEqual([]);
     expect(config.exclusions.keywords["personal"]).toEqual([]);

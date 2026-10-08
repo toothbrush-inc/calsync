@@ -720,8 +720,20 @@ function configFixture(tenantId = "default"): AppConfig {
   return {
     tenantId,
     calendars: [
-      { key: "personal", calendarId: "personal@example.com", source: true, destination: true },
-      { key: "work", calendarId: "work@example.com", source: true, destination: true },
+      {
+        key: "personal",
+        account: "personal",
+        calendarId: "personal@example.com",
+        source: true,
+        destination: true,
+      },
+      {
+        key: "work",
+        account: "work",
+        calendarId: "work@example.com",
+        source: true,
+        destination: true,
+      },
     ],
     accounts: {
       personal: { tenantId, role: "personal", calendarId: "personal@example.com" },

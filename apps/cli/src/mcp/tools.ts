@@ -75,7 +75,8 @@ export interface SyncAggregates {
 /** Push-notification health: whether channels are configured and when they expire. */
 export interface PushStatusResult {
   configured: boolean;
-  channels: { role: AccountRole; expiresAt: string }[];
+  /** One per calendar, by calendar key. */
+  channels: { calendar: string; expiresAt: string }[];
 }
 
 export interface StatusResult {
@@ -141,7 +142,7 @@ export async function handleGetStatus(runtime: McpRuntime): Promise<ToolResult<S
         push: {
           configured: config.webhook !== undefined,
           channels: (runtime.state.listWatchChannels?.() ?? []).map((channel) => ({
-            role: channel.role,
+            calendar: channel.calendarKey,
             expiresAt: channel.expiresAt,
           })),
         },
