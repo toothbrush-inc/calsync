@@ -1,7 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { AccountRole } from "@calsync/engine";
-
 import type { WatchChannelRecord } from "../src/storage/index.js";
 import { channelTokenHash, SyncTrigger, WebhookReceiver } from "../src/sync/webhook.js";
 
@@ -17,12 +15,12 @@ afterEach(async () => {
 
 interface Harness {
   url: string;
-  notified: AccountRole[];
+  notified: string[];
   logs: string[];
 }
 
 async function startReceiver(channel: WatchChannelRecord | null): Promise<Harness> {
-  const notified: AccountRole[] = [];
+  const notified: string[] = [];
   const logs: string[] = [];
   const receiver = new WebhookReceiver({
     host: "127.0.0.1",
@@ -45,7 +43,7 @@ async function startReceiver(channel: WatchChannelRecord | null): Promise<Harnes
 function testChannel(overrides: Partial<WatchChannelRecord> = {}): WatchChannelRecord {
   return {
     tenantId: "default",
-    role: "personal",
+    calendarKey: "personal",
     calendarId: "personal-calendar",
     channelId: "channel-1",
     resourceId: "resource-1",

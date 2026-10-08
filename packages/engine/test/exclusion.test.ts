@@ -1,4 +1,8 @@
+import { createHash } from "node:crypto";
+
 import { describe, expect, it } from "vitest";
+
+import type { SyncConfig } from "../src/types.js";
 
 import { MemoryExclusionSource } from "../src/memory.js";
 import {
@@ -90,16 +94,53 @@ describe("title keyword exclusions", () => {
   });
 });
 
+describe("exclusion keys per source calendar", () => {
+  const event = {
+    id: "event",
+    occurrenceKey: "event",
+    seriesKey: "event",
+    isRecurring: false,
+    time: {
+      kind: "timed" as const,
+      startDateTime: "2026-08-10T10:00:00Z",
+      endDateTime: "2026-08-10T11:00:00Z",
+    },
+  };
+
+  it("keeps v1 keys byte-for-byte for the two original calendars", () => {
+    const digest = createHash("sha256")
+      .update("calsync-exclude\0v1\0p2w\0occ\0event")
+      .digest("base64url");
+    expect(sourceExclusionKeys("personal", event).occurrence).toBe(
+      `calsync-exclude:v1:p2w:occ:${digest}`,
+    );
+  });
+
+  it("names any other calendar with a v2 tag and resolves it back", () => {
+    const keys = sourceExclusionKeys("calendar-family", event);
+    expect(keys.occurrence).toMatch(/^calsync-exclude:v2:[A-Za-z0-9_-]{11}:occ:[A-Za-z0-9_-]{43}$/);
+    expect(keys.occurrence).not.toBe(sourceExclusionKeys("calendar-other", event).occurrence);
+    expect(parseOpaqueExclusionKey(keys.series, ["personal", "work", "calendar-family"])).toBe(
+      "calendar-family",
+    );
+    expect(() => parseOpaqueExclusionKey(keys.series, ["personal", "work"])).toThrow(
+      /not connected/,
+    );
+  });
+});
+
 describe("CLI-managed exclusion storage", () => {
   it("parses opaque keys and rejects raw Google identifiers", () => {
     const occurrence = `calsync-exclude:v1:p2w:occ:${"a".repeat(43)}`;
     const series = `calsync-exclude:v1:w2p:series:${"b".repeat(43)}`;
 
-    expect(parseOpaqueExclusionKey(occurrence)).toBe("personalToWork");
-    expect(parseOpaqueExclusionKey(` ${series} `)).toBe("workToPersonal");
-    expect(() => parseOpaqueExclusionKey("google-event-id")).toThrow(
+    const connected = ["personal", "work"];
+    expect(parseOpaqueExclusionKey(occurrence, connected)).toBe("personal");
+    expect(parseOpaqueExclusionKey(` ${series} `, connected)).toBe("work");
+    expect(() => parseOpaqueExclusionKey("google-event-id", connected)).toThrow(
       /opaque occurrence or series key/,
     );
+    expect(() => parseOpaqueExclusionKey(occurrence, ["work"])).toThrow(/not connected/);
     expect(normalizeExclusionKeyword(" Dentist ")).toBe("dentist");
     expect(() => normalizeExclusionKeyword("   ")).toThrow(/blank/);
     expect(parseExclusionKeywords(["Dentist, therapy,,school pickup", "internal"])).toEqual([
@@ -115,40 +156,35 @@ describe("CLI-managed exclusion storage", () => {
     const source = new MemoryExclusionSource(
       [
         {
-          direction: "workToPersonal",
+          sourceKey: "work",
           value: `calsync-exclude:v1:w2p:occ:${"d".repeat(43)}`,
           createdAt: "2026-08-10T20:00:00.000Z",
         },
       ],
       [
         {
-          direction: "personalToWork",
+          sourceKey: "personal",
           keyword: "dentist",
           createdAt: "2026-08-10T20:00:00.000Z",
         },
       ],
     );
-    const merged = applyStoredExclusions(
+    const merged: SyncConfig = applyStoredExclusions<SyncConfig>(
       {
         tenantId: "default",
-        accounts: {
-          personal: { tenantId: "default", role: "personal", calendarId: "personal" },
-          work: { tenantId: "default", role: "work", calendarId: "work" },
-        },
+        calendars: [
+          { key: "personal", calendarId: "personal", source: true, destination: true },
+          { key: "work", calendarId: "work", source: true, destination: true },
+        ],
         window: { pastDays: 30, futureDays: 365 },
         timezone: "UTC",
-        exclusions: {
-          personalToWork: [],
-          workToPersonal: [],
-          personalToWorkKeywords: ["focus time"],
-          workToPersonalKeywords: [],
-        },
+        exclusions: { keys: {}, keywords: { personal: ["focus time"] } },
       },
       source,
     );
 
-    expect(merged.exclusions.personalToWorkKeywords).toEqual(["focus time", "dentist"]);
-    expect(merged.exclusions.workToPersonal).toEqual([
+    expect(merged.exclusions.keywords["personal"]).toEqual(["focus time", "dentist"]);
+    expect(merged.exclusions.keys["work"]).toEqual([
       `calsync-exclude:v1:w2p:occ:${"d".repeat(43)}`,
     ]);
   });

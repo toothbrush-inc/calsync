@@ -129,14 +129,17 @@ This still discloses that the time is busy:
   and their time ranges.
 - Google receives the API traffic.
 - Anyone with access to this account on this machine can inspect local
-  configuration, logs, and database metadata.
+  configuration, logs, and database metadata, including the signed-in
+  accounts' addresses and the synced calendars' names.
 - With push notifications configured, Google also learns your receiver's
   address.
 
 ## Commands
 
 ```sh
-calsync status                        # both accounts and calendar access
+calsync status                        # accounts and calendar access
+calsync account add                   # sign in another Google account
+calsync calendar add me@work.example  # sync one of its calendars (up to six)
 calsync sync --once --dry-run         # plan a pass, write nothing
 calsync sync --once                   # run one pass
 calsync exclude list                  # what never gets mirrored

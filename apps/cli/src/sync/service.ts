@@ -1,13 +1,13 @@
 import { closeSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 
 import {
+  calendarStateKeys,
   CleanupPassError,
   DedupePassError,
   ReconcilePassError,
   SyncEngine,
   googleApiErrorInfo,
   systemClock,
-  type AccountRole,
   type CalendarAPI,
   type Clock,
   type DedupeResult,
@@ -19,18 +19,20 @@ import {
   type SyncStatus,
 } from "@calsync/engine";
 
-import type { AppConfig, WebhookConfig } from "../config.js";
+import type { AppCalendar, AppConfig, WebhookConfig } from "../config.js";
 import type { ChannelAPI } from "../google/channels.js";
 import type { StateDatabase, WatchChannelRecord } from "../storage/index.js";
+import { sameCalendarSet, withStoredCalendars } from "../calendars.js";
 import { ChannelManager, stopWatchChannels, type WatchChannelStore } from "./channels.js";
 import { SyncTrigger, WebhookReceiver, type SyncTriggerReason } from "./webhook.js";
 
 export type { FullSyncReason, SyncRunOptions, SyncStatus };
 
+/** API clients by sign-in slot; several calendars can share one sign-in. */
 export interface CalendarClientFactory {
-  createCalendarClient(role: "personal" | "work"): Promise<CalendarAPI>;
+  createCalendarClient(slot: string): Promise<CalendarAPI>;
   /** Present once the factory can arm Google push channels. */
-  createChannelClient?: (role: "personal" | "work") => Promise<ChannelAPI>;
+  createChannelClient?: (slot: string) => Promise<ChannelAPI>;
 }
 
 export interface SyncLockOptions {
@@ -100,6 +102,55 @@ export class DefaultSyncService implements SyncService {
     return this.withLock(() => this.withEngine((engine) => engine.dedupe(options)), options);
   }
 
+  /**
+   * Disconnects one calendar. First a full pass with it neither sharing nor
+   * receiving busy time, which deletes the blocks calsync wrote to it and the
+   * blocks its events put on the others; then its channel is stopped and
+   * everything calsync kept for it is forgotten. `keepBlocks` skips the pass,
+   * for a calendar calsync can no longer reach: its blocks stay behind, and
+   * the next pass still removes the ones its events put elsewhere.
+   */
+  async removeCalendar(
+    calendarKey: string,
+    options: SyncLockOptions & { keepBlocks?: boolean } = {},
+  ): Promise<ReconcileResult | undefined> {
+    return this.withLock(async () => {
+      if (!this.config.calendars.some((calendar) => calendar.key === calendarKey)) {
+        throw new Error(`Unknown calendar "${calendarKey}"`);
+      }
+      let result: ReconcileResult | undefined;
+      if (options.keepBlocks !== true) {
+        const detached: AppConfig = {
+          ...this.config,
+          calendars: this.config.calendars.map((calendar) =>
+            calendar.key === calendarKey
+              ? { ...calendar, source: false, destination: false }
+              : calendar,
+          ),
+        };
+        result = await this.withEngine((engine) => engine.once(), detached);
+        const createClient = this.channelClientFactory();
+        if (createClient !== undefined) {
+          await stopWatchChannels({
+            store: this.state,
+            createClient,
+            tenantId: this.config.tenantId,
+            calendarKey,
+            onLog: (line) => {
+              this.writeLog(line);
+            },
+          });
+        }
+      }
+      this.state.removeCalendar(
+        calendarKey,
+        calendarStateKeys(calendarKey, this.config.tenantId),
+        this.config.tenantId,
+      );
+      return result;
+    }, options);
+  }
+
   /** Leaves nothing armed at Google once the mirrors are gone. */
   private async stopPushChannels(): Promise<void> {
     const createClient = this.channelClientFactory();
@@ -121,7 +172,7 @@ export class DefaultSyncService implements SyncService {
       this.writeLog(
         JSON.stringify({
           event: "webhook_channel_stop_failed",
-          role: failure.role,
+          calendar: failure.calendarKey,
           error: errorName(failure.error),
         }),
       );
@@ -148,16 +199,18 @@ export class DefaultSyncService implements SyncService {
       tenantId: this.config.tenantId,
       service: this,
       store: this.state,
-      calendarIds: {
-        personal: this.config.accounts.personal.calendarId,
-        work: this.config.accounts.work.calendarId,
-      },
+      calendars: this.config.calendars,
       ...(createChannelClient === undefined ? {} : { createChannelClient }),
     };
   }
 
-  private channelClientFactory(): ((role: AccountRole) => Promise<ChannelAPI>) | undefined {
-    return this.auth.createChannelClient?.bind(this.auth);
+  /** Channel clients by calendar key, through the calendar's sign-in. */
+  private channelClientFactory(): ((calendarKey: string) => Promise<ChannelAPI>) | undefined {
+    const create = this.auth.createChannelClient?.bind(this.auth);
+    if (create === undefined) {
+      return undefined;
+    }
+    return (calendarKey) => create(accountFor(this.config.calendars, calendarKey));
   }
 
   private get daemonLockPath(): string {
@@ -168,21 +221,46 @@ export class DefaultSyncService implements SyncService {
     return this.withEngine((engine) => engine.once(options));
   }
 
-  private async withEngine<T>(run: (engine: SyncEngine) => Promise<T>): Promise<T> {
+  private async withEngine<T>(
+    run: (engine: SyncEngine) => Promise<T>,
+    config: AppConfig = this.config,
+  ): Promise<T> {
+    // A tenant's calendars are read when its service is built; a pass that
+    // waited on the lock while someone added or removed one would otherwise
+    // run on the old set, writing blocks to a calendar that is gone.
+    const stored = withStoredCalendars(
+      this.config,
+      this.state.listCalendars(this.config.tenantId),
+      this.state.hasSignedIn(this.config.tenantId),
+    );
+    if (!sameCalendarSet(stored.calendars, this.config.calendars)) {
+      throw new ReconciliationError(
+        "conflict",
+        "the connected calendars changed since this pass was planned; the next pass uses them",
+      );
+    }
+    if (config.calendars.length < 2) {
+      throw new ReconciliationError(
+        "credentials",
+        `${String(config.calendars.length)} calendar connected; connect at least two (calsync auth personal|work, or calsync account add and calsync calendar add)`,
+      );
+    }
     try {
-      const [personal, work] = await Promise.all([
-        this.auth.createCalendarClient("personal"),
-        this.auth.createCalendarClient("work"),
-      ]);
+      // One client per sign-in, shared by every calendar it serves.
+      const bySlot = new Map<string, Promise<CalendarAPI>>();
+      const clients: Record<string, CalendarAPI> = {};
+      await Promise.all(
+        config.calendars.map(async (calendar) => {
+          let client = bySlot.get(calendar.account);
+          if (client === undefined) {
+            client = this.auth.createCalendarClient(calendar.account);
+            bySlot.set(calendar.account, client);
+          }
+          clients[calendar.key] = await client;
+        }),
+      );
       return await run(
-        new SyncEngine(
-          this.config,
-          this.state,
-          this.state,
-          this.state,
-          { personal, work },
-          this.clock,
-        ),
+        new SyncEngine(config, this.state, this.state, this.state, clients, this.clock),
       );
     } catch (error) {
       throw classifyReconciliationError(error);
@@ -210,9 +288,9 @@ export interface DaemonTenant {
   service: SyncService;
   /** The tenant's watch-channel rows. */
   store: WatchChannelStore;
-  calendarIds: Record<AccountRole, string>;
-  /** Absent when this tenant cannot arm Google push channels. */
-  createChannelClient?: (role: AccountRole) => Promise<ChannelAPI>;
+  calendars: readonly AppCalendar[];
+  /** Channel clients by calendar key. Absent when this tenant cannot arm push channels. */
+  createChannelClient?: (calendarKey: string) => Promise<ChannelAPI>;
 }
 
 /**
@@ -422,7 +500,9 @@ export class SyncDaemon {
     }
     // Managers are cached per tenant and rebuilt from the live tenant list on
     // every re-arm check, so a tenant discovered mid-run gets channels too.
-    const managerCache = new Map<string, ChannelManager>();
+    // Keyed by tenant, and rebuilt whenever the daemon rebuilds the tenant:
+    // a manager outlives neither its calendars nor its state connection.
+    const managerCache = new Map<string, { tenant: DaemonTenant; manager: ChannelManager }>();
     const managersFor = (): { tenantId: string; manager: ChannelManager }[] => {
       const current = this.tenants();
       const active = new Set(current.map((tenant) => tenant.tenantId));
@@ -436,10 +516,13 @@ export class SyncDaemon {
         if (createClient === undefined) {
           return [];
         }
-        let manager = managerCache.get(tenant.tenantId);
-        manager ??= new ChannelManager({
+        const cached = managerCache.get(tenant.tenantId);
+        if (cached?.tenant === tenant) {
+          return [{ tenantId: tenant.tenantId, manager: cached.manager }];
+        }
+        const manager = new ChannelManager({
           address: webhook.address,
-          calendarIds: tenant.calendarIds,
+          calendars: tenant.calendars,
           ttlSeconds: webhook.channelTtlSeconds,
           renewBeforeMs: webhook.renewBeforeMs,
           createClient,
@@ -450,7 +533,7 @@ export class SyncDaemon {
           },
           tenantId: tenant.tenantId,
         });
-        managerCache.set(tenant.tenantId, manager);
+        managerCache.set(tenant.tenantId, { tenant, manager });
         return [{ tenantId: tenant.tenantId, manager }];
       });
     };
@@ -470,7 +553,7 @@ export class SyncDaemon {
       port: webhook.port,
       path: webhook.path,
       lookupChannel: this.lookupChannel,
-      onNotification: (role, tenantId) => {
+      onNotification: (_calendarKey, tenantId) => {
         this.#dirty.add(tenantId);
         trigger.notify();
       },
@@ -550,7 +633,7 @@ class PushSession {
           JSON.stringify({
             event: "webhook_arm_failed",
             ...(tenantId === "default" ? {} : { tenant: tenantId }),
-            role: failure.role,
+            calendar: failure.calendarKey,
             error:
               classified instanceof ReconciliationError
                 ? classified.category
@@ -987,4 +1070,13 @@ function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<voi
       { once: true },
     );
   });
+}
+
+/** The sign-in slot serving a calendar. */
+function accountFor(calendars: readonly AppCalendar[], calendarKey: string): string {
+  const calendar = calendars.find((candidate) => candidate.key === calendarKey);
+  if (calendar === undefined) {
+    throw new Error(`Unknown calendar "${calendarKey}"`);
+  }
+  return calendar.account;
 }

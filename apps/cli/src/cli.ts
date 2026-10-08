@@ -28,9 +28,11 @@ import {
 } from "./config.js";
 import {
   changeExclusions,
+  exclusionSources,
   snapshotExclusions,
   type ExclusionChangeResult,
   type ExclusionItem,
+  type ExclusionListEntry,
 } from "./exclusions.js";
 import type { GoogleAuthService } from "./google/auth.js";
 import { LaunchdServiceManager, type LaunchdService } from "./launchd/service.js";
@@ -38,8 +40,16 @@ import { RotatingFileLogger, serviceLogPath } from "./logging.js";
 import { runLiveMcpStdioServer } from "./mcp/server.js";
 import { TerminalProgress } from "./progress.js";
 import { ScanGate } from "./scanlimit.js";
-import { CALSYNC_VERSION, createAuthRuntime } from "./runtime.js";
-import { StateDatabase, type ExclusionDirection } from "./storage/index.js";
+import { CALSYNC_VERSION, createAuthRuntime, type AccountRuntime } from "./runtime.js";
+import { StateDatabase, type CalendarRecord, type GoogleAccountRecord } from "./storage/index.js";
+import {
+  calendarLabel,
+  calendarLabels,
+  resolveAccountRef,
+  resolveAvailableRef,
+  resolveCalendarRef,
+  withStoredCalendars,
+} from "./calendars.js";
 import {
   daemonIsRunning,
   daemonLockPathFor,
@@ -54,6 +64,8 @@ export interface AppRuntime {
   auth: Pick<GoogleAuthService, "authorize" | "getStatus" | "logout">;
   state: Pick<StateDatabase, "close">;
   sync?: SyncService;
+  /** Google sign-ins and calendars beyond the two roles. */
+  accounts?: AccountRuntime;
 }
 
 export function createProgram(
@@ -79,6 +91,7 @@ export function createProgram(
     });
 
   addAuthCommands(program, runtimeFactory);
+  addAccountCommands(program, runtimeFactory);
   addSyncCommands(program, runtimeFactory);
   addExcludeCommands(program);
   addServiceCommands(program, serviceFactory);
@@ -126,12 +139,29 @@ function addAuthCommands(
     .option("--tenant <id>", "tenant identifier (defaults to CALSYNC_TENANT_ID)")
     .action(async (options: { tenant?: string }) => {
       const config = loadConfig();
-      await withRuntime(runtimeFactory, optionalTenant(options.tenant), async ({ auth }) => {
+      await withRuntime(runtimeFactory, optionalTenant(options.tenant), async (runtime) => {
+        const { auth, accounts } = runtime;
+        const stored = accounts?.state.listCalendars() ?? [];
+        const signedIn = accounts?.state.listGoogleAccounts() ?? [];
+        // A role is checked while its calendar is synced, or — for a tenant
+        // that uses only the roles — until it is first signed in, to say how
+        // to start. A role whose calendar was removed is left alone.
+        const rolesOnly = signedIn.every((entry) => isAccountRole(entry.slot));
+        const roles = accountRoles.filter(
+          (role) =>
+            // Its calendar may have moved to a newer sign-in; the calendar checks cover that.
+            stored.some((calendar) => calendar.key === role && calendar.account === role) ||
+            (rolesOnly && !signedIn.some((entry) => entry.slot === role)),
+        );
         const statuses = await Promise.all(
-          accountRoles.map((role) => auth.getStatus(role, config.accounts[role].calendarId)),
+          roles.map((role) => auth.getStatus(role, config.accounts[role].calendarId)),
         );
         for (const status of statuses) {
           process.stdout.write(`${status.role}: ${status.message}\n`);
+        }
+        let othersValid = true;
+        if (accounts !== undefined) {
+          othersValid = await printAccountStatus(accounts);
         }
         // Operator-facing: name the other tenant, which the dashboard never does.
         const rival = statuses.find((status) => status.conflictsWith !== undefined)?.conflictsWith;
@@ -141,7 +171,7 @@ function addAuthCommands(
               "two tenants on one pair mirror every event twice. Remove one of them.\n",
           );
         }
-        if (statuses.some((status) => !status.valid)) {
+        if (statuses.some((status) => !status.valid) || !othersValid) {
           process.exitCode = 1;
         }
       });
@@ -168,6 +198,243 @@ function addAuthCommands(
         }
       });
     });
+}
+
+function addAccountCommands(
+  program: Command,
+  runtimeFactory: (tenantId?: string) => AppRuntime,
+): void {
+  const account = program
+    .command("account")
+    .description("Sign in Google accounts whose calendars calsync syncs");
+
+  account
+    .command("add")
+    .description("Sign in one more Google account; then add its calendars with `calendar add`")
+    .option("--tenant <id>", "tenant identifier (defaults to CALSYNC_TENANT_ID)")
+    .option("--no-open", "do not open a browser; print the authorization URL for copy/paste")
+    .action(async (options: { open: boolean; tenant?: string }) => {
+      await withAccounts(runtimeFactory, options.tenant, async (accounts) => {
+        const added = await accounts.auth.connectAccount({
+          openBrowser: options.open,
+          onAuthorizationUrl: (url) => {
+            process.stdout.write(
+              `${options.open ? "Use this URL if you need a different browser or profile:" : "Open this authorization URL in the browser and profile you want to sign in with:"}\n${url}\n`,
+            );
+          },
+          onBrowserOpenFailure: (url, error) => {
+            const detail = error instanceof Error ? `: ${error.message}` : "";
+            process.stderr.write(
+              `Could not open the system browser${detail}\nOpen this authorization URL manually:\n${url}\n`,
+            );
+          },
+        });
+        const email = added.email ?? added.slot;
+        process.stdout.write(
+          `${email}: signed in. See its calendars with \`calsync calendar list --available\`, then \`calsync calendar add ${email}/<calendar>\`.\n`,
+        );
+      });
+    });
+
+  account
+    .command("list")
+    .description("List signed-in Google accounts")
+    .option("--tenant <id>", "tenant identifier (defaults to CALSYNC_TENANT_ID)")
+    .action(async (options: { tenant?: string }) => {
+      await withAccounts(runtimeFactory, options.tenant, (accounts) => {
+        const signedIn = accounts.state.listGoogleAccounts();
+        const calendars = accounts.state.listCalendars();
+        if (signedIn.length === 0) {
+          process.stdout.write("No Google accounts signed in.\n");
+        }
+        for (const entry of signedIn) {
+          const count = calendars.filter((calendar) => calendar.account === entry.slot).length;
+          process.stdout.write(
+            `${entry.email ?? `${entry.slot} (email not checked yet; run calsync status)`}: ${String(count)} ${count === 1 ? "calendar" : "calendars"}\n`,
+          );
+        }
+        return Promise.resolve();
+      });
+    });
+
+  account
+    .command("remove")
+    .description("Forget a signed-in Google account once none of its calendars are synced")
+    .argument("<account>", "the account's email")
+    .option("--tenant <id>", "tenant identifier (defaults to CALSYNC_TENANT_ID)")
+    .action(async (ref: string, options: { tenant?: string }) => {
+      await withAccounts(runtimeFactory, options.tenant, async (accounts) => {
+        const target = resolveAccountRef(ref, accounts.state.listGoogleAccounts());
+        await accounts.auth.disconnectAccount(target.slot);
+        process.stdout.write(
+          `${target.email ?? target.slot}: removed from calsync. Google still lists calsync under that account's third-party access until you remove it there.\n`,
+        );
+      });
+    });
+
+  const calendar = program.command("calendar").description("Choose which calendars calsync syncs");
+
+  calendar
+    .command("list")
+    .description("List synced calendars, or with --available every calendar the accounts can use")
+    .option("--available", "list every calendar on the signed-in accounts")
+    .option("--tenant <id>", "tenant identifier (defaults to CALSYNC_TENANT_ID)")
+    .action(async (options: { available?: boolean; tenant?: string }) => {
+      await withAccounts(runtimeFactory, options.tenant, async (accounts) => {
+        const signedIn = accounts.state.listGoogleAccounts();
+        const synced = accounts.state.listCalendars();
+        if (options.available !== true) {
+          process.stdout.write(formatCalendarList(synced, signedIn));
+          return;
+        }
+        for (const entry of signedIn) {
+          const email = entry.email ?? entry.slot;
+          process.stdout.write(`${email}:\n`);
+          const available = await accounts.auth.availableCalendars(entry.slot);
+          for (const option of available) {
+            const connected = synced.some(
+              (record) =>
+                record.calendarId.toLowerCase() === option.calendarId.toLowerCase() ||
+                (option.primary &&
+                  record.account === entry.slot &&
+                  record.calendarId === "primary"),
+            );
+            const ref = option.primary ? email : `${email}/${option.name}`;
+            const use = connected
+              ? "synced"
+              : option.writable
+                ? "can share and receive busy time"
+                : "can only share busy time (--source-only)";
+            process.stdout.write(`  ${ref}  (${use})\n`);
+          }
+        }
+      });
+    });
+
+  calendar
+    .command("add")
+    .description("Sync one more calendar from a signed-in account")
+    .argument("<calendar>", "<email> for the account's own calendar, or <email>/<calendar name>")
+    .option("--source-only", "share its busy time, but write no busy blocks to it")
+    .option("--destination-only", "receive busy blocks, but share none of its own busy time")
+    .option("--tenant <id>", "tenant identifier (defaults to CALSYNC_TENANT_ID)")
+    .action(
+      async (
+        ref: string,
+        options: { sourceOnly?: boolean; destinationOnly?: boolean; tenant?: string },
+      ) => {
+        if (options.sourceOnly === true && options.destinationOnly === true) {
+          throw new Error("Use --source-only or --destination-only, not both");
+        }
+        await withAccounts(runtimeFactory, options.tenant, async (accounts) => {
+          const { account: owner, calendar: choice } = await resolveAvailableRef(
+            ref,
+            accounts.state.listGoogleAccounts(),
+            (slot) => accounts.auth.availableCalendars(slot),
+          );
+          const added = await accounts.auth.connectCalendar(owner.slot, choice.calendarId, {
+            source: options.destinationOnly !== true,
+            destination: options.sourceOnly !== true,
+          });
+          const label = calendarLabel(added, accounts.state.listGoogleAccounts());
+          process.stdout.write(
+            `${label}: added (${formatCalendarRoles(added)}). The next sync pass mirrors it.\n`,
+          );
+        });
+      },
+    );
+
+  calendar
+    .command("remove")
+    .description("Stop syncing a calendar and remove the busy blocks calsync wrote for it")
+    .argument("<calendar>", "the calendar as `calendar list` shows it, or its key")
+    .option(
+      "--keep-blocks",
+      "skip the cleanup pass, for a calendar calsync can no longer reach; its busy blocks stay",
+    )
+    .option("--tenant <id>", "tenant identifier (defaults to CALSYNC_TENANT_ID)")
+    .action(async (ref: string, options: { keepBlocks?: boolean; tenant?: string }) => {
+      await withAccounts(runtimeFactory, options.tenant, async (accounts) => {
+        const signedIn = accounts.state.listGoogleAccounts();
+        const target = resolveCalendarRef(ref, accounts.state.listCalendars(), signedIn);
+        const label = calendarLabel(target, signedIn);
+        const result = await accounts.removeCalendar(target.key, {
+          ...(options.keepBlocks === true ? { keepBlocks: true } : {}),
+        });
+        process.stdout.write(
+          result === undefined
+            ? `${label}: removed; busy blocks on it were left in place.\n`
+            : `${label}: removed; ${String(result.deleted)} busy ${result.deleted === 1 ? "block" : "blocks"} deleted.\n`,
+        );
+      });
+    });
+}
+
+async function withAccounts(
+  factory: (tenantId?: string) => AppRuntime,
+  tenant: string | undefined,
+  action: (accounts: AccountRuntime) => Promise<void>,
+): Promise<void> {
+  await withRuntime(factory, optionalTenant(tenant), async (runtime) => {
+    if (runtime.accounts === undefined) {
+      throw new Error("Account management is unavailable in this runtime");
+    }
+    await action(runtime.accounts);
+  });
+}
+
+/** Checks the sign-ins and calendars beyond the two roles; true when all pass. */
+async function printAccountStatus(accounts: AccountRuntime): Promise<boolean> {
+  const others = accounts.state.listGoogleAccounts().filter((entry) => !isAccountRole(entry.slot));
+  const accountChecks = await Promise.all(
+    others.map((entry) => accounts.auth.checkAccount(entry.slot)),
+  );
+  for (const check of accountChecks) {
+    process.stdout.write(`${check.email ?? check.slot}: ${check.message}\n`);
+  }
+  const calendars = accounts.state.listCalendars();
+  const calendarChecks = await Promise.all(
+    calendars
+      .filter((calendar) => !isAccountRole(calendar.key))
+      .map((calendar) => accounts.auth.checkCalendar(calendar)),
+  );
+  const signedIn = accounts.state.listGoogleAccounts();
+  if (calendars.length > 0) {
+    process.stdout.write("Calendars:\n");
+    for (const calendar of accounts.state.listCalendars()) {
+      const check = calendarChecks.find((entry) => entry.calendar.key === calendar.key);
+      process.stdout.write(
+        `  ${calendarLabel(calendar, signedIn)} — ${formatCalendarRoles(calendar)}${check === undefined ? "" : `: ${check.message}`}\n`,
+      );
+    }
+  }
+  return (
+    accountChecks.every((check) => check.valid) && calendarChecks.every((check) => check.valid)
+  );
+}
+
+export function formatCalendarList(
+  calendars: readonly CalendarRecord[],
+  accounts: readonly GoogleAccountRecord[],
+): string {
+  if (calendars.length === 0) {
+    return "No calendars synced yet. Sign in with `calsync account add`, then `calsync calendar add`.\n";
+  }
+  const lines = calendars.map(
+    (calendar) => `${calendarLabel(calendar, accounts)}  (${formatCalendarRoles(calendar)})`,
+  );
+  return `${lines.join("\n")}\n`;
+}
+
+function formatCalendarRoles(calendar: Pick<CalendarRecord, "source" | "destination">): string {
+  if (calendar.source && calendar.destination) {
+    return "shares and receives busy time";
+  }
+  return calendar.source ? "shares busy time only" : "receives busy time only";
+}
+
+function isAccountRole(value: string): value is AccountRole {
+  return (accountRoles as readonly string[]).includes(value);
 }
 
 function addSyncCommands(program: Command, runtimeFactory: () => AppRuntime): void {
@@ -221,7 +488,9 @@ Totals:
               onStatus: printSyncStatus,
               ...(showDetails ? { onSourceEvent: (entry) => sources.push(entry) } : {}),
             });
-            process.stdout.write(formatDryRunReport(operations, result, showDetails, sources));
+            process.stdout.write(
+              formatDryRunReport(operations, result, showDetails, sources, labelsFor(runtime)),
+            );
           } else {
             try {
               const result = await withTerminalProgress(
@@ -233,11 +502,11 @@ Totals:
                     ...(onProgress === undefined ? {} : { onProgress }),
                   }),
               );
-              printSyncResult(result);
+              printSyncResult(result, labelsFor(runtime));
             } catch (error) {
               const result = syncResultFromError(error);
               if (result !== undefined) {
-                printSyncResult(result);
+                printSyncResult(result, labelsFor(runtime));
               }
               throw error;
             }
@@ -332,8 +601,8 @@ function addExcludeCommands(program: Command): void {
     .description("Exclude source event keys or title keywords")
     .argument("[keys...]", "opaque occurrence or series keys from a detailed dry run")
     .option(
-      "--from <role>",
-      "source calendar for --keyword: personal or work; once per command",
+      "--from <calendar>",
+      "calendar whose events --keyword holds back (as `calendar list` shows it); once per command",
       collectOption,
       [],
     )
@@ -360,8 +629,8 @@ Examples:
     .description("Stop excluding source event keys or title keywords")
     .argument("[keys...]", "opaque occurrence or series keys previously added")
     .option(
-      "--from <role>",
-      "source calendar for --keyword: personal or work; once per command",
+      "--from <calendar>",
+      "calendar whose events --keyword holds back (as `calendar list` shows it); once per command",
       collectOption,
       [],
     )
@@ -503,17 +772,35 @@ function addWebCommands(program: Command): void {
         scanGate: new ScanGate(new StateDatabase(databasePath), loadScanGateLimits()),
         runtimeFor: (tenantId) => {
           const runtime = createAuthRuntime(tenantId);
+          const { auth, state } = runtime;
           return {
-            getStatus: (role, calendarId) => runtime.auth.getStatus(role, calendarId),
+            getStatus: (role, calendarId) => auth.getStatus(role, calendarId),
             startConnect: (role, calendarId) =>
-              runtime.auth.startConnect(role, calendarId, { openBrowser: false }),
-            listAccounts: () => runtime.state.listAccounts(),
+              auth.startConnect(role, calendarId, { openBrowser: false }),
+            listGoogleAccounts: () => state.listGoogleAccounts(),
+            listCalendars: () => state.listCalendars(),
+            checkAccount: (slot) => auth.checkAccount(slot),
+            checkCalendar: (calendar) => auth.checkCalendar(calendar),
+            freeAccountSlot: (reserved) => auth.freeAccountSlot(reserved),
+            hasSignedIn: () => state.hasSignedIn(),
+            startAccountConnect: () => auth.startAccountConnect(),
+            adoptSignIn: (slot) => auth.adoptSignIn(slot),
+            availableCalendars: (slot) => auth.availableCalendars(slot),
+            connectCalendar: (slot, calendarId, roles) =>
+              auth.connectCalendar(slot, calendarId, roles),
+            setCalendarRoles: (key, roles) => {
+              state.setCalendarRoles(key, roles);
+            },
+            removeCalendar: (key, options) => runtime.accounts.removeCalendar(key, options),
+            disconnectAccount: (slot) => auth.disconnectAccount(slot),
             syncSummary: () => readSyncSummary(runtime.state, tenantId),
             // Config is re-read per call so .env exclusions show current, as
             // the MCP tools do.
-            listExclusions: () => snapshotExclusions(loadConfig(), runtime.state),
+            listExclusions: () => snapshotExclusions(storedConfig(state), state),
             changeExclusions: (action, input) =>
-              changeExclusions(action, runtime.state, input, { allowMix: true }),
+              changeExclusions(action, state, input, exclusionSources(storedConfig(state)), {
+                allowMix: true,
+              }),
             previewSync: async ({ lockTimeoutMs }) => {
               const sources: ReconcileSourceDetail[] = [];
               const result = await runtime.sync.once({
@@ -617,36 +904,65 @@ function collectOption(value: string, previous: string[]): string[] {
   return [...previous, value];
 }
 
+/**
+ * Applies an exclusion change against the tenant's source calendars — the
+ * two roles until any calendar is connected. `--from` takes a calendar the
+ * way `calendar list` shows it, or its key.
+ */
 function applyExclusionChange(
   action: "add" | "remove",
   state: StateDatabase,
   keys: string[] | string | undefined,
   options: { from?: string[] | string; keyword?: string[] | string },
 ): string {
+  const calendars = state.listCalendars();
+  const accounts = state.listGoogleAccounts();
+  const sources =
+    calendars.length === 0
+      ? [...accountRoles]
+      : calendars.filter((calendar) => calendar.source).map((calendar) => calendar.key);
+  const from =
+    options.from === undefined
+      ? undefined
+      : (typeof options.from === "string" ? [options.from] : options.from).map((value) =>
+          sources.includes(value) || calendars.length === 0
+            ? value
+            : resolveCalendarRef(value, calendars, accounts).key,
+        );
+  const name = (key: string): string => calendarLabels(calendars, accounts).get(key) ?? key;
   return formatExclusionChangeReport(
     action,
-    changeExclusions(action, state, {
-      ...(keys === undefined ? {} : { keys: typeof keys === "string" ? [keys] : keys }),
-      ...(options.keyword === undefined
-        ? {}
-        : {
-            keywords:
-              typeof options.keyword === "string" ? [options.keyword] : [options.keyword.join(" ")],
-          }),
-      ...(options.from === undefined ? {} : { from: options.from }),
-    }),
+    name,
+    changeExclusions(
+      action,
+      state,
+      {
+        ...(keys === undefined ? {} : { keys: typeof keys === "string" ? [keys] : keys }),
+        ...(options.keyword === undefined
+          ? {}
+          : {
+              keywords:
+                typeof options.keyword === "string"
+                  ? [options.keyword]
+                  : [options.keyword.join(" ")],
+            }),
+        ...(from === undefined ? {} : { from }),
+      },
+      sources,
+    ),
   );
 }
 
 function formatExclusionChangeReport(
   action: "add" | "remove",
+  name: (key: string) => string,
   result: ExclusionChangeResult,
 ): string {
   const lines: string[] = [];
   const formatItem = (item: ExclusionItem): string =>
     item.kind === "keyword"
-      ? `  keyword "${item.value}" (${formatDirection(item.direction)})`
-      : `  ${formatKeyScope(item.value)} (${formatDirection(item.direction)}): ${item.value}`;
+      ? `  keyword "${item.value}" (${formatSource(name(item.source))})`
+      : `  ${formatKeyScope(item.value)} (${formatSource(name(item.source))}): ${item.value}`;
   const pushSection = (title: string, items: ExclusionItem[]) => {
     if (items.length === 0) {
       return;
@@ -677,40 +993,22 @@ function formatExclusionChangeReport(
 const EXCLUSION_APPLY_HINT =
   "The next sync pass applies this. Preview with `calsync sync --once --dry-run`, or wait for the background service.";
 
-export function formatExclusionList(config: AppConfig, state: StateDatabase): string {
-  const storedKeys = new Map(
-    state.listExclusionKeys().map((row) => [`${row.direction}\0${row.value}`, row] as const),
-  );
-  const storedKeywords = new Map(
-    state.listExclusionKeywords().map((row) => [`${row.direction}\0${row.keyword}`, row] as const),
-  );
+export function formatExclusionList(configured: AppConfig, state: StateDatabase): string {
+  const calendars = state.listCalendars();
+  const accounts = state.listGoogleAccounts();
+  const config = withStoredCalendars(configured, calendars, state.hasSignedIn());
+  const labels = calendarLabels(calendars, accounts);
+  const snapshot = snapshotExclusions(config, state);
+  const origin = (entry: ExclusionListEntry): string => (entry.origin === "cli" ? "cli" : ".env");
   const lines: string[] = [];
-  for (const direction of ["personalToWork", "workToPersonal"] as const) {
-    lines.push(`${formatDirection(direction)}:`);
-    const envKeywords =
-      direction === "personalToWork"
-        ? config.exclusions.personalToWorkKeywords
-        : config.exclusions.workToPersonalKeywords;
-    const envKeys =
-      direction === "personalToWork"
-        ? config.exclusions.personalToWork
-        : config.exclusions.workToPersonal;
-    const keywordLines = [
-      ...[...storedKeywords.values()]
-        .filter((row) => row.direction === direction)
-        .map((row) => `    ${row.keyword}  (cli)`),
-      ...envKeywords
-        .filter((keyword) => !storedKeywords.has(`${direction}\0${keyword}`))
-        .map((keyword) => `    ${keyword}  (.env)`),
-    ];
-    const keyLines = [
-      ...[...storedKeys.values()]
-        .filter((row) => row.direction === direction)
-        .map((row) => `    ${row.value}  (cli)`),
-      ...envKeys
-        .filter((value) => !storedKeys.has(`${direction}\0${value}`))
-        .map((value) => `    ${value}  (.env)`),
-    ];
+  for (const source of exclusionSources(config)) {
+    lines.push(`${formatSource(labels.get(source) ?? source)}:`);
+    const keywordLines = snapshot.keywords
+      .filter((entry) => entry.source === source)
+      .map((entry) => `    ${entry.value}  (${origin(entry)})`);
+    const keyLines = snapshot.keys
+      .filter((entry) => entry.source === source)
+      .map((entry) => `    ${entry.value}  (${origin(entry)})`);
     lines.push("  keywords:");
     lines.push(...(keywordLines.length === 0 ? ["    (none)"] : keywordLines));
     lines.push("  keys:");
@@ -724,8 +1022,9 @@ export function formatExclusionList(config: AppConfig, state: StateDatabase): st
   return `${lines.join("\n")}\n`;
 }
 
-function formatDirection(direction: ExclusionDirection): string {
-  return direction === "personalToWork" ? "personal → work" : "work → personal";
+/** An exclusion holds a source's events back from every other calendar. */
+function formatSource(source: string): string {
+  return `from ${source}`;
 }
 
 function formatKeyScope(value: string): string {
@@ -815,12 +1114,17 @@ function printResult(result: ReconcileResult): void {
 
 function printDedupeResult(result: DedupeResult, dryRun: boolean): void {
   const count = (n: number, word: string): string => `${String(n)} ${n === 1 ? word : `${word}s`}`;
-  const checked = result.inspected.personal + result.inspected.work;
-  const duplicates = result.duplicates.personal + result.duplicates.work;
-  const phantoms = result.phantoms.personal + result.phantoms.work;
-  const onCalendars =
-    `${String(result.duplicates.personal + result.phantoms.personal)} on personal, ` +
-    `${String(result.duplicates.work + result.phantoms.work)} on work`;
+  const sum = (counts: Record<string, number>): number =>
+    Object.values(counts).reduce((total, value) => total + value, 0);
+  const checked = sum(result.inspected);
+  const duplicates = sum(result.duplicates);
+  const phantoms = sum(result.phantoms);
+  const onCalendars = Object.keys(result.inspected)
+    .map(
+      (calendar) =>
+        `${String((result.duplicates[calendar] ?? 0) + (result.phantoms[calendar] ?? 0))} on ${calendar}`,
+    )
+    .join(", ");
   process.stdout.write(
     `Stray-block cleanup ${dryRun ? "preview" : "complete"}: ${dryRun ? "would remove" : "removed"} ` +
       `${count(result.deleted, "busy block")} ` +
@@ -829,21 +1133,24 @@ function printDedupeResult(result: DedupeResult, dryRun: boolean): void {
   );
 }
 
-function printSyncResult(result: SyncReconcileResult): void {
+function printSyncResult(
+  result: SyncReconcileResult,
+  name: (key: string) => string = (key) => key,
+): void {
   const status = result.converged ? "complete" : "incomplete";
   process.stdout.write(
     `Reconciliation ${status}: ${String(result.created)} created, ${String(result.updated)} updated, ${String(result.deleted)} deleted, ${String(result.repaired)} repaired${result.failed === 0 ? "" : `, ${String(result.failed)} failed`}\n`,
   );
   process.stdout.write(
-    `${formatMirrorTotals(result, result.converged ? "Active mirrors" : "Active mirrors after partial run")}\n`,
+    `${formatMirrorTotals(result, result.converged ? "Busy blocks" : "Busy blocks after partial run", name)}\n`,
   );
   if (!result.converged) {
     process.stdout.write(
-      "Desired state did not fully converge; totals include only desired mirrors active after successful operations.\n",
+      "Desired state did not fully converge; totals include only busy blocks in place after successful operations.\n",
     );
   }
   process.stdout.write(
-    "Excluded and duplicate-suppressed source events are not included in active totals.\n",
+    "Excluded and duplicate-suppressed source events are not included in busy-block totals.\n",
   );
 }
 
@@ -852,26 +1159,19 @@ export function formatDryRunReport(
   result: SyncReconcileResult,
   showDetails = false,
   sources: readonly ReconcileSourceDetail[] = [],
+  name: (key: string) => string = (key) => key,
 ): string {
   const total = result.created + result.updated + result.deleted + result.repaired;
   const lines =
     total === 0
       ? ["Dry run: no changes planned."]
       : [`Dry run: ${String(total)} ${total === 1 ? "operation" : "operations"} planned.`];
-  const directions = [
-    ["personal", "work"],
-    ["work", "personal"],
-  ] as const;
-  for (const [sourceRole, destinationRole] of directions) {
-    const directional = operations.filter(
-      (entry) => entry.sourceRole === sourceRole && entry.destinationRole === destinationRole,
-    );
-    if (directional.length === 0) {
-      continue;
-    }
-    lines.push(`${sourceRole} → ${destinationRole}:`);
+  const destinations = [...new Set(operations.map((entry) => entry.destinationKey))];
+  for (const destination of destinations) {
+    const onDestination = operations.filter((entry) => entry.destinationKey === destination);
+    lines.push(`busy blocks on ${name(destination)}:`);
     const counts = new Map<string, number>();
-    for (const entry of directional) {
+    for (const entry of onDestination) {
       const key = `${entry.operation}\0${entry.reason}`;
       counts.set(key, (counts.get(key) ?? 0) + 1);
     }
@@ -901,7 +1201,7 @@ export function formatDryRunReport(
             ? `${entry.timeRange.start} → ${entry.timeRange.end} (all-day; end exclusive)`
             : `${entry.timeRange.start} → ${entry.timeRange.end}`;
       lines.push(
-        `  ${entry.sourceRole} → ${entry.destinationRole} | ${entry.operation} | ${range} | ${formatReason(entry.reason)} | ${title}`,
+        `  ${formatFlow(entry, name)} | ${entry.operation} | ${range} | ${formatReason(entry.reason)} | ${title}`,
       );
     }
   }
@@ -922,7 +1222,7 @@ export function formatDryRunReport(
               ? "excluded_by_legacy_raw_key"
               : `excluded_by_${source.exclusionReason}_key`;
       lines.push(
-        `  ${source.sourceRole} → ${source.destinationRole} | ${recurrence} | ${formatTimeRange(source.timeRange)} | ${title} | ${exclusion}`,
+        `  ${name(source.sourceKey)} | ${recurrence} | ${formatTimeRange(source.timeRange)} | ${title} | ${exclusion}`,
         `    occurrence only: ${source.exclusionKeys.occurrence}`,
         `    whole series:    ${source.exclusionKeys.series}`,
       );
@@ -930,16 +1230,45 @@ export function formatDryRunReport(
   }
   lines.push(
     ...(showDetails && (operations.length > 0 || sources.length > 0) ? [""] : []),
-    formatMirrorTotals(result, "Projected active mirrors"),
-    "Excluded and duplicate-suppressed source events are not included in active totals.",
+    formatMirrorTotals(result, "Projected busy blocks", name),
+    "Excluded and duplicate-suppressed source events are not included in busy-block totals.",
   );
   return `${lines.join("\n")}\n`;
 }
 
-function formatMirrorTotals(result: SyncReconcileResult, label: string): string {
-  const personal = result.mirrors.personalToWork;
-  const work = result.mirrors.workToPersonal;
-  return `${label}: personal → work ${String(personal.active)} (${String(personal.excluded)} excluded, ${String(personal.duplicateSuppressed)} duplicate-suppressed); work → personal ${String(work.active)} (${String(work.excluded)} excluded, ${String(work.duplicateSuppressed)} duplicate-suppressed)`;
+function formatMirrorTotals(
+  result: SyncReconcileResult,
+  label: string,
+  name: (key: string) => string,
+): string {
+  const blocks = Object.entries(result.destinations)
+    .map(
+      ([calendar, totals]) =>
+        `${name(calendar)} ${String(totals.active)} (${String(totals.duplicateSuppressed)} duplicate-suppressed)`,
+    )
+    .join("; ");
+  const excluded = Object.entries(result.sources)
+    .map(([calendar, totals]) => `${name(calendar)} ${String(totals.excluded)}`)
+    .join(", ");
+  return `${label}: ${blocks}. Excluded events: ${excluded}`;
+}
+
+/** "personal, family → work": the calendars behind a block, and where it sits. */
+function formatFlow(entry: ReconcileLog, name: (key: string) => string): string {
+  const sources = (entry.sourceKeys ?? []).map(name);
+  return sources.length === 0
+    ? `→ ${name(entry.destinationKey)}`
+    : `${sources.join(", ")} → ${name(entry.destinationKey)}`;
+}
+
+/** How output names a calendar key: its account and name once known, else the key. */
+function labelsFor(runtime: AppRuntime): (key: string) => string {
+  const state = runtime.accounts?.state;
+  if (state === undefined) {
+    return (key) => key;
+  }
+  const labels = calendarLabels(state.listCalendars(), state.listGoogleAccounts());
+  return (key) => labels.get(key) ?? key;
 }
 
 function formatTimeRange(range: ReconcileSourceDetail["timeRange"]): string {
@@ -977,7 +1306,9 @@ function printSyncStatus(status: SyncStatus): void {
     return;
   }
   if (status.event === "invalid_sync_token") {
-    process.stdout.write(`${status.role}: invalid sync token; rebuilding incremental state.\n`);
+    process.stdout.write(
+      `${status.calendarKey}: invalid sync token; rebuilding incremental state.\n`,
+    );
     return;
   }
   process.stdout.write(
@@ -1019,4 +1350,9 @@ if (entrypoint !== undefined) {
   if (import.meta.url === pathToFileURL(resolvedEntrypoint).href) {
     await main();
   }
+}
+
+/** The environment config with the tenant's stored calendars: what its exclusions apply to. */
+function storedConfig(state: Pick<StateDatabase, "listCalendars" | "hasSignedIn">): AppConfig {
+  return withStoredCalendars(loadConfig(), state.listCalendars(), state.hasSignedIn());
 }

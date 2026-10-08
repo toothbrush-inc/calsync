@@ -13,18 +13,13 @@ import {
 
 const config: SyncConfig = {
   tenantId: "default",
-  accounts: {
-    personal: { tenantId: "default", role: "personal", calendarId: "personal-calendar" },
-    work: { tenantId: "default", role: "work", calendarId: "work-calendar" },
-  },
+  calendars: [
+    { key: "personal", calendarId: "personal-calendar", source: true, destination: true },
+    { key: "work", calendarId: "work-calendar", source: true, destination: true },
+  ],
   window: { pastDays: 30, futureDays: 365 },
   timezone: "UTC",
-  exclusions: {
-    personalToWork: [],
-    workToPersonal: [],
-    personalToWorkKeywords: [],
-    workToPersonalKeywords: [],
-  },
+  exclusions: { keys: {}, keywords: {} },
 };
 
 describe("pure engine ports", () => {
@@ -51,11 +46,11 @@ describe("pure engine ports", () => {
       created: 1,
       failed: 0,
       converged: true,
-      mirrors: { personalToWork: { active: 1 } },
+      destinations: { work: { active: 1 } },
     });
     expect(work.events).toHaveLength(1);
     expect(work.events[0]).toMatchObject({ summary: "Busy", visibility: "private" });
-    expect(mappings.listMappings("personal")).toHaveLength(1);
+    expect(mappings.listMappings("work")).toHaveLength(1);
     expect(syncState.getState("incremental:configuration-fingerprint")).toBeNull();
   });
 });
@@ -70,10 +65,8 @@ describe("readSyncSummary", () => {
       repaired: 0,
       failed: 0,
       converged: true,
-      mirrors: {
-        personalToWork: { active: 3, excluded: 0, duplicateSuppressed: 0 },
-        workToPersonal: { active: 1, excluded: 0, duplicateSuppressed: 0 },
-      },
+      destinations: { work: { active: 3, duplicateSuppressed: 0 } },
+      sources: { personal: { excluded: 0 } },
     });
     state.setState("incremental:last-full-sync", "2026-08-28T09:00:00.000Z");
     state.setState("incremental:last-result", result);
@@ -81,7 +74,7 @@ describe("readSyncSummary", () => {
 
     expect(readSyncSummary(state)).toMatchObject({
       lastFullSyncAt: "2026-08-28T09:00:00.000Z",
-      lastResult: { converged: true, mirrors: { personalToWork: { active: 3 } } },
+      lastResult: { converged: true, destinations: { work: { active: 3 } } },
     });
     expect(readSyncSummary(state, "default").lastFullSyncAt).toBe("2026-08-28T09:00:00.000Z");
     expect(readSyncSummary(state, "acme")).toEqual({
@@ -91,5 +84,32 @@ describe("readSyncSummary", () => {
 
     state.setState("incremental:last-result", "{corrupt");
     expect(readSyncSummary(state).lastResult).toBeNull();
+  });
+
+  it("converts a result saved before calendars were keyed", () => {
+    const state = new MemorySyncStateStore();
+    state.setState(
+      "incremental:last-result",
+      JSON.stringify({
+        created: 0,
+        updated: 0,
+        deleted: 0,
+        repaired: 0,
+        failed: 0,
+        converged: true,
+        mirrors: {
+          personalToWork: { active: 3, excluded: 2, duplicateSuppressed: 1 },
+          workToPersonal: { active: 4, excluded: 0, duplicateSuppressed: 5 },
+        },
+      }),
+    );
+
+    expect(readSyncSummary(state).lastResult).toMatchObject({
+      destinations: {
+        work: { active: 3, duplicateSuppressed: 1 },
+        personal: { active: 4, duplicateSuppressed: 5 },
+      },
+      sources: { personal: { excluded: 2 }, work: { excluded: 0 } },
+    });
   });
 });

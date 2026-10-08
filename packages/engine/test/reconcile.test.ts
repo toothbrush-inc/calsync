@@ -14,18 +14,13 @@ import {
 
 const config: SyncConfig = {
   tenantId: "default",
-  accounts: {
-    personal: { tenantId: "default", role: "personal", calendarId: "personal-calendar" },
-    work: { tenantId: "default", role: "work", calendarId: "work-calendar" },
-  },
+  calendars: [
+    { key: "personal", calendarId: "personal-calendar", source: true, destination: true },
+    { key: "work", calendarId: "work-calendar", source: true, destination: true },
+  ],
   window: { pastDays: 30, futureDays: 365 },
   timezone: "UTC",
-  exclusions: {
-    personalToWork: [],
-    workToPersonal: [],
-    personalToWorkKeywords: [],
-    workToPersonalKeywords: [],
-  },
+  exclusions: { keys: {}, keywords: {} },
 };
 
 function source(id: string, overrides: GoogleCalendarEvent = {}): GoogleCalendarEvent {
@@ -75,10 +70,7 @@ describe("Reconciler", () => {
 
     await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
       created: 1,
-      mirrors: {
-        personalToWork: { active: 1 },
-        workToPersonal: { active: 0 },
-      },
+      destinations: { work: { active: 1 }, personal: { active: 0 } },
     });
     expect(runtime.work.events).toHaveLength(1);
     expect(first(runtime.state.listMappings()).destinationEtag).toMatch(/^"inserted-/u);
@@ -116,7 +108,7 @@ describe("Reconciler", () => {
     runtime.personal.events.splice(0);
     await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
       deleted: 1,
-      mirrors: { personalToWork: { active: 0 } },
+      destinations: { work: { active: 0 } },
     });
     expect(runtime.work.events).toHaveLength(0);
     expect(runtime.state.listMappings()).toHaveLength(0);
@@ -256,7 +248,7 @@ describe("Reconciler", () => {
     runtime.work.events.splice(0);
     await expect(runtime.reconciler.reconcile({ dryRun: true })).resolves.toMatchObject({
       created: 1,
-      mirrors: { personalToWork: { active: 1 } },
+      destinations: { work: { active: 1 } },
     });
     expect(runtime.work.events).toHaveLength(0);
     expect(runtime.state.listMappings()).toHaveLength(0);
@@ -324,9 +316,9 @@ describe("Reconciler", () => {
     if (!normalized.included) {
       throw new Error("expected normalized source");
     }
-    runtime.config.exclusions.personalToWork = [
-      sourceExclusionKeys("personal", normalized.event).occurrence,
-    ];
+    runtime.config.exclusions.keys = {
+      personal: [sourceExclusionKeys("personal", normalized.event).occurrence],
+    };
     const sourceDetails: { exclusionReason?: string }[] = [];
 
     await expect(
@@ -335,7 +327,8 @@ describe("Reconciler", () => {
       }),
     ).resolves.toMatchObject({
       deleted: 1,
-      mirrors: { personalToWork: { active: 0, excluded: 1 } },
+      destinations: { work: { active: 0 } },
+      sources: { personal: { excluded: 1 } },
     });
     expect(runtime.work.events).toHaveLength(0);
     expect(runtime.state.listMappings()).toHaveLength(0);
@@ -360,9 +353,9 @@ describe("Reconciler", () => {
     if (!normalized.included) {
       throw new Error("expected normalized source");
     }
-    runtime.config.exclusions.personalToWork = [
-      sourceExclusionKeys("personal", normalized.event).series,
-    ];
+    runtime.config.exclusions.keys = {
+      personal: [sourceExclusionKeys("personal", normalized.event).series],
+    };
 
     await expect(runtime.reconciler.reconcile()).resolves.toEqual({
       created: 0,
@@ -385,7 +378,7 @@ describe("Reconciler", () => {
         }),
       ],
     );
-    runtime.config.exclusions.personalToWorkKeywords = ["focus"];
+    runtime.config.exclusions.keywords = { personal: ["focus"] };
 
     await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({ created: 1 });
     expect(runtime.work.events).toHaveLength(1);
@@ -400,7 +393,7 @@ describe("Reconciler", () => {
     await runtime.reconciler.reconcile();
     expect(runtime.work.events).toHaveLength(1);
 
-    runtime.config.exclusions.personalToWorkKeywords = ["focus"];
+    runtime.config.exclusions.keywords = { personal: ["focus"] };
     const sourceDetails: { exclusionReason?: string }[] = [];
     await expect(
       runtime.reconciler.reconcile({
@@ -415,7 +408,7 @@ describe("Reconciler", () => {
 
   it("does not keyword-exclude a source event whose title is missing", async () => {
     const runtime = setup([source("untitled", { summary: null })]);
-    runtime.config.exclusions.personalToWorkKeywords = ["meeting"];
+    runtime.config.exclusions.keywords = { personal: ["meeting"] };
 
     await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({ created: 1 });
     expect(runtime.work.events).toHaveLength(1);
@@ -436,7 +429,7 @@ describe("Reconciler", () => {
         end: { dateTime: "2026-08-11T11:00:00Z" },
       }),
     ]);
-    runtime.config.exclusions.personalToWorkKeywords = ["STAND"];
+    runtime.config.exclusions.keywords = { personal: ["STAND"] };
 
     await expect(runtime.reconciler.reconcile()).resolves.toEqual({
       created: 0,
@@ -504,10 +497,8 @@ describe("Reconciler", () => {
     const runtime = setup([]);
     runtime.state.putMapping({
       mappingKey: "aged-mapping",
-      sourceRole: "personal",
-      sourceEventId: "aged-source",
+      destinationKey: "work",
       destinationEventId: "aged-destination",
-      sourceEtag: null,
       destinationEtag: null,
       updatedAt: "2026-01-01T00:00:00.000Z",
     });
@@ -522,10 +513,8 @@ describe("Reconciler", () => {
     const runtime = setup([]);
     runtime.state.putMapping({
       mappingKey: "aged-mapping",
-      sourceRole: "personal",
-      sourceEventId: "aged-source",
+      destinationKey: "work",
       destinationEventId: "aged-destination",
-      sourceEtag: null,
       destinationEtag: null,
       updatedAt: "2026-01-01T00:00:00.000Z",
     });
@@ -545,10 +534,8 @@ describe("Reconciler", () => {
     const runtime = setup([current]);
     runtime.state.putMapping({
       mappingKey: "aged-occurrence-mapping",
-      sourceRole: "personal",
-      sourceEventId: "aged-instance",
+      destinationKey: "work",
       destinationEventId: "aged-instance-destination",
-      sourceEtag: null,
       destinationEtag: null,
       updatedAt: "2026-01-01T00:00:00.000Z",
     });
@@ -556,11 +543,11 @@ describe("Reconciler", () => {
     await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
       created: 1,
       deleted: 1,
-      mirrors: { personalToWork: { active: 1 } },
+      destinations: { work: { active: 1 } },
     });
 
     expect(runtime.work.deletedIds).toContain("aged-instance-destination");
-    expect(runtime.state.listMappings("personal")).toHaveLength(1);
+    expect(runtime.state.listMappings("work")).toHaveLength(1);
   });
 
   describe("dedupe", () => {
@@ -619,8 +606,7 @@ describe("Reconciler", () => {
       ]);
       expect(operations[0]).toMatchObject({
         operation: "delete",
-        sourceRole: "personal",
-        destinationRole: "work",
+        destinationKey: "work",
         dryRun: false,
       });
       expect(operations.every((entry) => entry.sourceTitles === undefined)).toBe(true);
@@ -962,7 +948,7 @@ describe("Reconciler", () => {
 
       await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
         created: 2,
-        mirrors: { personalToWork: { active: 2 } },
+        destinations: { work: { active: 2 } },
       });
       expect(slots(runtime.work.events)).toEqual([
         "2026-08-10T09:00:00Z/2026-08-10T11:00:00Z",
@@ -1115,10 +1101,8 @@ describe("Reconciler", () => {
         });
         runtime.state.putMapping({
           mappingKey: legacyKey,
-          sourceRole: "personal",
-          sourceEventId: id,
+          destinationKey: "work",
           destinationEventId: `legacy-block-${id}`,
-          sourceEtag: null,
           destinationEtag: null,
           updatedAt: "2026-01-01T00:00:00.000Z",
         });
@@ -1129,8 +1113,8 @@ describe("Reconciler", () => {
         deleted: 2,
       });
       expect(slots(runtime.work.events)).toEqual(["2026-08-10T09:00:00Z/2026-08-10T10:30:00Z"]);
-      expect(runtime.state.listMappings().map((mapping) => mapping.sourceEventId)).not.toContain(
-        "a",
+      expect(runtime.state.listMappings().map((mapping) => mapping.mappingKey)).not.toContain(
+        "legacy-a",
       );
     });
   });
@@ -1157,10 +1141,7 @@ describe("Reconciler", () => {
       repaired: 0,
       failed: 1,
       converged: false,
-      mirrors: {
-        personalToWork: { active: 1 },
-        workToPersonal: { active: 0 },
-      },
+      destinations: { work: { active: 1 }, personal: { active: 0 } },
     });
     expect(progress.at(-1)).toMatchObject({ phase: "finalizing", failed: 1 });
     expect(runtime.work.events).toHaveLength(2);
@@ -1171,10 +1152,7 @@ describe("Reconciler", () => {
       created: 1,
       failed: 0,
       converged: true,
-      mirrors: {
-        personalToWork: { active: 1 },
-        workToPersonal: { active: 1 },
-      },
+      destinations: { work: { active: 1 }, personal: { active: 1 } },
     });
     expect(runtime.personal.events).toHaveLength(2);
     expect(runtime.work.events).toHaveLength(2);
@@ -1189,6 +1167,7 @@ describe("Reconciler", () => {
   });
 });
 
+/** Totals for a two-calendar pass, named by the source of each direction. */
 function syncSummary(
   personalActive: number,
   workActive: number,
@@ -1202,17 +1181,13 @@ function syncSummary(
   return {
     failed: 0,
     converged: true,
-    mirrors: {
-      personalToWork: {
-        active: personalActive,
-        excluded: options.personalExcluded ?? 0,
-        duplicateSuppressed: options.personalDuplicates ?? 0,
-      },
-      workToPersonal: {
-        active: workActive,
-        excluded: options.workExcluded ?? 0,
-        duplicateSuppressed: options.workDuplicates ?? 0,
-      },
+    destinations: {
+      work: { active: personalActive, duplicateSuppressed: options.personalDuplicates ?? 0 },
+      personal: { active: workActive, duplicateSuppressed: options.workDuplicates ?? 0 },
+    },
+    sources: {
+      personal: { excluded: options.personalExcluded ?? 0 },
+      work: { excluded: options.workExcluded ?? 0 },
     },
   };
 }
@@ -1240,3 +1215,167 @@ function canonicalizeManagedEvents(events: GoogleCalendarEvent[]): void {
     }
   }
 }
+
+describe("Reconciler with more than two calendars", () => {
+  type Key = "personal" | "work" | "family";
+
+  function threeCalendars(
+    events: Partial<Record<Key, GoogleCalendarEvent[]>>,
+    roles: Partial<Record<Key, { source?: boolean; destination?: boolean }>> = {},
+  ) {
+    const calendars = {
+      personal: new MemoryCalendar(events.personal ?? []),
+      work: new MemoryCalendar(events.work ?? []),
+      family: new MemoryCalendar(events.family ?? []),
+    };
+    const runtimeConfig: SyncConfig = {
+      ...structuredClone(config),
+      calendars: (["personal", "work", "family"] as const).map((key) => ({
+        key,
+        calendarId: `${key}-calendar`,
+        source: roles[key]?.source ?? true,
+        destination: roles[key]?.destination ?? true,
+      })),
+    };
+    const state = new MemoryMappingStore();
+    return {
+      ...calendars,
+      state,
+      config: runtimeConfig,
+      reconciler: new Reconciler(runtimeConfig, state, calendars),
+    };
+  }
+
+  function busy(calendar: MemoryCalendar): string[] {
+    return calendar.events
+      .filter((event) => event.summary === "Busy" && event.status !== "cancelled")
+      .map((event) => `${event.start?.dateTime ?? ""}/${event.end?.dateTime ?? ""}`)
+      .sort();
+  }
+
+  function at(id: string, start: string, end: string, overrides: GoogleCalendarEvent = {}) {
+    return source(id, {
+      start: { dateTime: `2026-08-10T${start}:00Z` },
+      end: { dateTime: `2026-08-10T${end}:00Z` },
+      ...overrides,
+    });
+  }
+
+  it("mirrors each calendar's busy time to every other calendar, one block per slot", async () => {
+    const runtime = threeCalendars({
+      personal: [at("dentist", "09:00", "10:00")],
+      family: [at("school-run", "09:30", "10:30")],
+    });
+
+    await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
+      destinations: {
+        personal: { active: 1 },
+        work: { active: 1 },
+        family: { active: 1 },
+      },
+    });
+    // Work sees both, merged; each of the others sees only the other one.
+    expect(busy(runtime.work)).toEqual(["2026-08-10T09:00:00Z/2026-08-10T10:30:00Z"]);
+    expect(busy(runtime.personal)).toEqual(["2026-08-10T09:30:00Z/2026-08-10T10:30:00Z"]);
+    expect(busy(runtime.family)).toEqual(["2026-08-10T09:00:00Z/2026-08-10T10:00:00Z"]);
+    await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
+      created: 0,
+      updated: 0,
+      deleted: 0,
+    });
+  });
+
+  it("names every source calendar and title behind a merged block", async () => {
+    const runtime = threeCalendars({
+      personal: [at("dentist", "09:00", "10:00", { summary: "Dentist" })],
+      family: [at("school-run", "09:30", "10:30", { summary: "School run" })],
+    });
+    const operations: ReconcileLog[] = [];
+
+    await runtime.reconciler.reconcile({ dryRun: true, log: (entry) => operations.push(entry) });
+    expect(operations.find((entry) => entry.destinationKey === "work")).toMatchObject({
+      operation: "create",
+      sourceKeys: ["personal", "family"],
+      sourceTitles: ["Dentist", "School run"],
+    });
+  });
+
+  it("writes nothing to a source-only calendar and reads nothing from a destination-only one", async () => {
+    const runtime = threeCalendars(
+      {
+        personal: [at("dentist", "09:00", "10:00")],
+        family: [at("school-run", "13:00", "14:00")],
+        work: [at("standup", "11:00", "11:30")],
+      },
+      { family: { destination: false }, work: { source: false } },
+    );
+
+    const result = await runtime.reconciler.reconcile();
+    expect(Object.keys(result.destinations).sort()).toEqual(["personal", "work"]);
+    expect(Object.keys(result.sources).sort()).toEqual(["family", "personal"]);
+    expect(busy(runtime.family)).toEqual([]);
+    expect(busy(runtime.work)).toEqual([
+      "2026-08-10T09:00:00Z/2026-08-10T10:00:00Z",
+      "2026-08-10T13:00:00Z/2026-08-10T14:00:00Z",
+    ]);
+    // The standup stays on work: work feeds no one.
+    expect(busy(runtime.personal)).toEqual(["2026-08-10T13:00:00Z/2026-08-10T14:00:00Z"]);
+  });
+
+  it("leaves a shared meeting off the calendars that already have it, once on the rest", async () => {
+    const shared = { iCalUID: "offsite@example.test" };
+    const runtime = threeCalendars({
+      personal: [at("offsite-p", "15:00", "16:00", shared)],
+      family: [at("offsite-f", "15:00", "16:00", shared)],
+    });
+
+    await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
+      destinations: {
+        personal: { active: 0, duplicateSuppressed: 1 },
+        family: { active: 0, duplicateSuppressed: 1 },
+        work: { active: 1, duplicateSuppressed: 0 },
+      },
+    });
+    expect(busy(runtime.work)).toEqual(["2026-08-10T15:00:00Z/2026-08-10T16:00:00Z"]);
+  });
+
+  it("holds an excluded event back from every destination", async () => {
+    const runtime = threeCalendars({
+      family: [
+        at("therapy", "09:00", "10:00", { summary: "Therapy" }),
+        at("soccer", "17:00", "18:00"),
+      ],
+    });
+    runtime.config.exclusions.keywords = { family: ["therapy"] };
+
+    await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
+      sources: { family: { excluded: 1 } },
+    });
+    expect(busy(runtime.personal)).toEqual(["2026-08-10T17:00:00Z/2026-08-10T18:00:00Z"]);
+    expect(busy(runtime.work)).toEqual(["2026-08-10T17:00:00Z/2026-08-10T18:00:00Z"]);
+  });
+
+  it("clears every block from a calendar that stops receiving them", async () => {
+    const runtime = threeCalendars({ personal: [at("dentist", "09:00", "10:00")] });
+    await runtime.reconciler.reconcile();
+    expect(busy(runtime.family)).toHaveLength(1);
+
+    const family = runtime.config.calendars.find((calendar) => calendar.key === "family");
+    const reconfigured = new Reconciler(
+      {
+        ...runtime.config,
+        calendars: runtime.config.calendars.map((calendar) =>
+          calendar === family ? { ...calendar, destination: false } : calendar,
+        ),
+      },
+      runtime.state,
+      { personal: runtime.personal, work: runtime.work, family: runtime.family },
+    );
+    const result = await reconfigured.reconcile();
+    expect(result).toMatchObject({ deleted: 1 });
+    expect(result.destinations).not.toHaveProperty("family");
+    expect(busy(runtime.family)).toEqual([]);
+    expect(busy(runtime.work)).toHaveLength(1);
+    expect(runtime.state.listMappings("family")).toEqual([]);
+  });
+});

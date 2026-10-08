@@ -1,26 +1,30 @@
 import { randomBytes, randomUUID } from "node:crypto";
 
-import { accountRoles, systemClock, type AccountRole, type Clock } from "@calsync/engine";
+import { systemClock, type Clock } from "@calsync/engine";
+
+import type { CalendarKey } from "@calsync/engine";
 
 import type { ChannelAPI } from "../google/channels.js";
 import type { WatchChannelRecord } from "../storage/index.js";
 import { channelTokenHash } from "./webhook.js";
 
 export interface WatchChannelStore {
-  getWatchChannel(role: AccountRole, tenantId?: string): WatchChannelRecord | null;
+  getWatchChannel(calendarKey: CalendarKey, tenantId?: string): WatchChannelRecord | null;
   listWatchChannels(tenantId?: string): WatchChannelRecord[];
   upsertWatchChannel(channel: WatchChannelRecord, tenantId: string): void;
-  deleteWatchChannel(role: AccountRole, tenantId?: string): void;
+  deleteWatchChannel(calendarKey: CalendarKey, tenantId?: string): void;
 }
 
 export interface ChannelManagerOptions {
   /** Public HTTPS address Google posts notifications to. */
   address: string;
-  calendarIds: Record<AccountRole, string>;
+  /** One channel per calendar. */
+  calendars: readonly { key: CalendarKey; calendarId: string }[];
   ttlSeconds: number;
   /** Re-arm once a channel is within this long of expiring. */
   renewBeforeMs: number;
-  createClient: (role: AccountRole) => Promise<ChannelAPI>;
+  /** Channel API client for a calendar, by key. */
+  createClient: (calendarKey: CalendarKey) => Promise<ChannelAPI>;
   store: WatchChannelStore;
   clock?: Clock;
   onLog?: (line: string) => void;
@@ -30,13 +34,13 @@ export interface ChannelManagerOptions {
 }
 
 export interface ChannelFailure {
-  role: AccountRole;
+  calendarKey: CalendarKey;
   error: unknown;
 }
 
 export interface ChannelEnsureResult {
-  armed: AccountRole[];
-  current: AccountRole[];
+  armed: CalendarKey[];
+  current: CalendarKey[];
   failed: ChannelFailure[];
 }
 
@@ -60,27 +64,24 @@ export class ChannelManager {
 
   async ensure(): Promise<ChannelEnsureResult> {
     const result: ChannelEnsureResult = { armed: [], current: [], failed: [] };
-    for (const role of accountRoles) {
-      const existing = this.options.store.getWatchChannel(role, this.options.tenantId);
-      if (existing !== null && this.#isCurrent(existing)) {
-        result.current.push(role);
+    for (const { key, calendarId } of this.options.calendars) {
+      const existing = this.options.store.getWatchChannel(key, this.options.tenantId);
+      if (existing !== null && this.#isCurrent(existing, calendarId)) {
+        result.current.push(key);
         continue;
       }
       try {
-        await this.#arm(role, existing);
-        result.armed.push(role);
+        await this.#arm(key, calendarId, existing);
+        result.armed.push(key);
       } catch (error: unknown) {
-        result.failed.push({ role, error });
+        result.failed.push({ calendarKey: key, error });
       }
     }
     return result;
   }
 
-  #isCurrent(channel: WatchChannelRecord): boolean {
-    if (
-      channel.address !== this.options.address ||
-      channel.calendarId !== this.options.calendarIds[channel.role]
-    ) {
+  #isCurrent(channel: WatchChannelRecord, calendarId: string): boolean {
+    if (channel.address !== this.options.address || channel.calendarId !== calendarId) {
       return false;
     }
     const expiresAt = Date.parse(channel.expiresAt);
@@ -90,9 +91,12 @@ export class ChannelManager {
     return expiresAt - this.#clock.now().getTime() > this.options.renewBeforeMs;
   }
 
-  async #arm(role: AccountRole, existing: WatchChannelRecord | null): Promise<void> {
-    const calendarId = this.options.calendarIds[role];
-    const client = await this.options.createClient(role);
+  async #arm(
+    calendarKey: CalendarKey,
+    calendarId: string,
+    existing: WatchChannelRecord | null,
+  ): Promise<void> {
+    const client = await this.options.createClient(calendarKey);
     const token = this.#newToken();
     const watch = await client.watchEvents({
       calendarId,
@@ -104,7 +108,7 @@ export class ChannelManager {
     this.options.store.upsertWatchChannel(
       {
         tenantId: this.options.tenantId,
-        role,
+        calendarKey,
         calendarId,
         channelId: watch.channelId,
         resourceId: watch.resourceId,
@@ -117,7 +121,7 @@ export class ChannelManager {
     );
     this.#log({
       event: existing === null ? "webhook_channel_armed" : "webhook_channel_renewed",
-      role,
+      calendar: calendarKey,
       expiresAt: watch.expiresAt,
     });
     if (existing !== null) {
@@ -126,7 +130,7 @@ export class ChannelManager {
       try {
         await client.stopChannel(existing.channelId, existing.resourceId);
       } catch {
-        this.#log({ event: "webhook_channel_stop_failed", role });
+        this.#log({ event: "webhook_channel_stop_failed", calendar: calendarKey });
       }
     }
   }
@@ -145,19 +149,26 @@ export class ChannelManager {
  */
 export async function stopWatchChannels(options: {
   store: WatchChannelStore;
-  createClient: (role: AccountRole) => Promise<ChannelAPI>;
+  createClient: (calendarKey: CalendarKey) => Promise<ChannelAPI>;
   onLog?: (line: string) => void;
   tenantId?: string;
+  /** Only this calendar's channel; every channel when absent. */
+  calendarKey?: CalendarKey;
 }): Promise<ChannelFailure[]> {
   const failures: ChannelFailure[] = [];
   for (const channel of options.store.listWatchChannels(options.tenantId)) {
+    if (options.calendarKey !== undefined && channel.calendarKey !== options.calendarKey) {
+      continue;
+    }
     try {
-      const client = await options.createClient(channel.role);
+      const client = await options.createClient(channel.calendarKey);
       await client.stopChannel(channel.channelId, channel.resourceId);
-      options.store.deleteWatchChannel(channel.role, options.tenantId);
-      options.onLog?.(JSON.stringify({ event: "webhook_channel_stopped", role: channel.role }));
+      options.store.deleteWatchChannel(channel.calendarKey, options.tenantId);
+      options.onLog?.(
+        JSON.stringify({ event: "webhook_channel_stopped", calendar: channel.calendarKey }),
+      );
     } catch (error: unknown) {
-      failures.push({ role: channel.role, error });
+      failures.push({ calendarKey: channel.calendarKey, error });
     }
   }
   return failures;

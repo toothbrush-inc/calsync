@@ -1,20 +1,30 @@
 import type { GoogleCalendarEvent } from "./normalize.js";
 import type { ManagedBusyEvent, ManagedBusyEventInsert } from "./project.js";
 
-export const accountRoles = ["personal", "work"] as const;
-export type AccountRole = (typeof accountRoles)[number];
+/**
+ * Stable internal identity of one connected calendar. People see a calendar
+ * as its Google account and name; the key never changes once assigned, since
+ * block keys, sync state and stored tokens are scoped by it. Installs from the
+ * two-calendar era keep "personal" and "work" as their keys.
+ */
+export type CalendarKey = string;
 
-export interface AccountConfig {
-  tenantId: string;
-  role: AccountRole;
+/** The two calendar keys every two-calendar install started with. */
+export const legacyCalendarKeys = ["personal", "work"] as const;
+
+export interface CalendarConfig {
+  key: CalendarKey;
   calendarId: string;
+  /** Its busy time is mirrored to the other calendars. */
+  source: boolean;
+  /** It receives busy blocks for the other calendars' busy time. */
+  destination: boolean;
 }
 
+/** Exclusions belong to the source calendar whose events they hold back. */
 export interface SyncExclusions {
-  personalToWork: readonly string[];
-  workToPersonal: readonly string[];
-  personalToWorkKeywords: readonly string[];
-  workToPersonalKeywords: readonly string[];
+  keys: Readonly<Record<CalendarKey, readonly string[]>>;
+  keywords: Readonly<Record<CalendarKey, readonly string[]>>;
 }
 
 /**
@@ -23,7 +33,7 @@ export interface SyncExclusions {
  */
 export interface SyncConfig {
   tenantId: string;
-  accounts: Record<AccountRole, AccountConfig>;
+  calendars: readonly CalendarConfig[];
   window: {
     pastDays: number;
     futureDays: number;
@@ -37,12 +47,11 @@ export interface Clock {
   now(): Date;
 }
 
+/** One busy block calsync wrote, by the destination calendar that holds it. */
 export interface EventMapping {
   mappingKey: string;
-  sourceRole: AccountRole;
-  sourceEventId: string;
+  destinationKey: CalendarKey;
   destinationEventId: string;
-  sourceEtag: string | null;
   destinationEtag: string | null;
   updatedAt: string;
 }
@@ -50,7 +59,7 @@ export interface EventMapping {
 export interface MappingStore {
   putMapping(mapping: EventMapping): void;
   getMapping(mappingKey: string): EventMapping | null;
-  listMappings(sourceRole?: AccountRole, tenantId?: string): EventMapping[];
+  listMappings(destinationKey?: CalendarKey, tenantId?: string): EventMapping[];
   deleteMapping(mappingKey: string, tenantId?: string): void;
 }
 
@@ -61,16 +70,14 @@ export interface SyncStateStore {
   deleteState(key: string): void;
 }
 
-export type ExclusionDirection = "personalToWork" | "workToPersonal";
-
 export interface StoredExclusionKey {
-  direction: ExclusionDirection;
+  sourceKey: CalendarKey;
   value: string;
   createdAt: string;
 }
 
 export interface StoredExclusionKeyword {
-  direction: ExclusionDirection;
+  sourceKey: CalendarKey;
   keyword: string;
   createdAt: string;
 }

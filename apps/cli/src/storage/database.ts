@@ -4,9 +4,8 @@ import { dirname } from "node:path";
 import Database from "better-sqlite3";
 
 import type {
-  AccountRole,
+  CalendarKey,
   EventMapping,
-  ExclusionDirection,
   ExclusionSource,
   MappingStore,
   StoredExclusionKey,
@@ -14,19 +13,87 @@ import type {
   SyncStateStore,
 } from "@calsync/engine";
 
-export type {
-  EventMapping,
-  ExclusionDirection,
-  StoredExclusionKey,
-  StoredExclusionKeyword,
-} from "@calsync/engine";
+import { MAX_CALENDARS, type AccountRole } from "../config.js";
 
+export type { EventMapping, StoredExclusionKey, StoredExclusionKeyword } from "@calsync/engine";
+
+/** A two-calendar-era account: the role's sign-in and its one calendar. */
 export interface AccountRecord {
   tenantId: string;
   role: AccountRole;
   calendarId: string;
   authorizedAt: string;
   verifiedAt: string | null;
+}
+
+/** One Google sign-in. Its refresh token lives in the vault under `slot`. */
+export interface GoogleAccountRecord {
+  tenantId: string;
+  /** Token slot: "personal" or "work" for the original two, else account1..account6. */
+  slot: string;
+  /** The account's address, known once a check has read its primary calendar. */
+  email: string | null;
+  authorizedAt: string;
+  verifiedAt: string | null;
+}
+
+/** One connected Google calendar and what it does in the sync. */
+export interface CalendarRecord {
+  tenantId: string;
+  key: CalendarKey;
+  /** Slot of the sign-in that reads and writes it. */
+  account: string;
+  calendarId: string;
+  /** Google's name for it, for display. */
+  name: string | null;
+  accessRole: string | null;
+  source: boolean;
+  destination: boolean;
+  addedAt: string;
+  verifiedAt: string | null;
+}
+
+export interface CalendarInput {
+  key: CalendarKey;
+  account: string;
+  calendarId: string;
+  name?: string | null;
+  accessRole?: string | null;
+  source?: boolean;
+  destination?: boolean;
+  /** Identifies the calendar across accounts and tenants; see calendarFingerprint. */
+  fingerprint?: string | undefined;
+}
+
+export type CalendarAddResult = { added: true } | CalendarRefusal;
+
+export type CalendarRefusal =
+  /** This tenant already syncs the calendar, under `key`. */
+  | { added: false; reason: "duplicate"; key: CalendarKey }
+  /** The tenant already has MAX_CALENDARS calendars. */
+  | { added: false; reason: "limit" }
+  /** Another tenant on this host already syncs it alongside one of this tenant's calendars. */
+  | { added: false; reason: "conflict"; tenant: string };
+
+interface CalendarRow {
+  tenant_id: string;
+  calendar_key: string;
+  account_slot: string;
+  calendar_id: string;
+  name: string | null;
+  access_role: string | null;
+  source: number;
+  destination: number;
+  added_at: string;
+  verified_at: string | null;
+}
+
+interface GoogleAccountRow {
+  tenant_id: string;
+  slot: string;
+  email: string | null;
+  authorized_at: string;
+  verified_at: string | null;
 }
 
 interface AccountRow {
@@ -39,29 +106,27 @@ interface AccountRow {
 
 interface MappingRow {
   mapping_key: string;
-  source_role: AccountRole;
-  source_event_id: string;
+  destination_key: CalendarKey;
   destination_event_id: string;
-  source_etag: string | null;
   destination_etag: string | null;
   updated_at: string;
 }
 
 interface ExclusionKeyRow {
-  direction: ExclusionDirection;
+  source_key: CalendarKey;
   value: string;
   created_at: string;
 }
 
 interface ExclusionKeywordRow {
-  direction: ExclusionDirection;
+  source_key: CalendarKey;
   keyword: string;
   created_at: string;
 }
 
 export interface WatchChannelRecord {
   tenantId: string;
-  role: AccountRole;
+  calendarKey: CalendarKey;
   calendarId: string;
   channelId: string;
   resourceId: string;
@@ -73,7 +138,7 @@ export interface WatchChannelRecord {
 
 interface WatchChannelRow {
   tenant_id: string;
-  role: AccountRole;
+  calendar_key: CalendarKey;
   calendar_id: string;
   channel_id: string;
   resource_id: string;
@@ -103,28 +168,348 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
     this.db.close();
   }
 
-  upsertAccount(role: AccountRole, calendarId: string, now = new Date(), tenantId?: string): void {
+  /**
+   * Records a sign-in. A slot signed in again keeps its row and calendars;
+   * the email, once known, is never cleared by a later check that lacks it.
+   */
+  upsertGoogleAccount(
+    slot: string,
+    email: string | null,
+    now = new Date(),
+    tenantId?: string,
+  ): void {
     const tid = tenantId ?? this.tenantId;
     this.db
       .prepare(
-        `INSERT INTO accounts (tenant_id, role, calendar_id, authorized_at, verified_at)
+        `INSERT INTO google_accounts (tenant_id, slot, email, authorized_at, verified_at)
          VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(tenant_id, role) DO UPDATE SET
-           calendar_id = excluded.calendar_id,
+         ON CONFLICT(tenant_id, slot) DO UPDATE SET
+           email = COALESCE(excluded.email, google_accounts.email),
            authorized_at = excluded.authorized_at,
            verified_at = excluded.verified_at`,
       )
-      .run(tid, role, calendarId, now.toISOString(), now.toISOString());
+      .run(tid, slot, normalizeEmail(email), now.toISOString(), now.toISOString());
+    this.db
+      .prepare("INSERT OR IGNORE INTO signed_in_tenants (tenant_id, first_at) VALUES (?, ?)")
+      .run(tid, now.toISOString());
   }
 
   /**
-   * Records a validated account together with the fingerprint of the calendar
-   * it resolved to, unless that would complete a calendar pair another tenant
-   * on this host already syncs. Two tenants on one pair mirror every event
-   * twice and see each other's busy blocks as strays, so the second one is
-   * refused here, where it would otherwise become ready and be adopted by the
-   * daemon. Runs as one immediate transaction: two roles validated in
-   * parallel, or two processes at once, still see each other's rows.
+   * Whether this tenant ever had a sign-in. A tenant that removed all of its
+   * own is not new: nothing may sign it back in on its behalf.
+   */
+  hasSignedIn(tenantId?: string): boolean {
+    const tid = tenantId ?? this.tenantId;
+    return (
+      this.db.prepare("SELECT 1 FROM signed_in_tenants WHERE tenant_id = ?").get(tid) !== undefined
+    );
+  }
+
+  /**
+   * Hands every calendar of one sign-in to another and forgets the first:
+   * the same Google account signed in again under a new slot.
+   */
+  moveGoogleAccount(from: string, to: string, tenantId?: string): void {
+    const tid = tenantId ?? this.tenantId;
+    this.db.transaction(() => {
+      this.db
+        .prepare("UPDATE calendars SET account_slot = ? WHERE tenant_id = ? AND account_slot = ?")
+        .run(to, tid, from);
+      this.deleteGoogleAccount(from, tid);
+    })();
+  }
+
+  /** Marks a sign-in verified, learning its email when the check found it. */
+  verifyGoogleAccount(
+    slot: string,
+    email: string | null,
+    now = new Date(),
+    tenantId?: string,
+  ): void {
+    const tid = tenantId ?? this.tenantId;
+    this.db
+      .prepare(
+        `UPDATE google_accounts SET verified_at = ?, email = COALESCE(?, email)
+         WHERE tenant_id = ? AND slot = ?`,
+      )
+      .run(now.toISOString(), normalizeEmail(email), tid, slot);
+  }
+
+  getGoogleAccount(slot: string, tenantId?: string): GoogleAccountRecord | null {
+    const tid = tenantId ?? this.tenantId;
+    const row = this.db
+      .prepare(`${GOOGLE_ACCOUNT_COLUMNS} WHERE tenant_id = ? AND slot = ?`)
+      .get(tid, slot) as GoogleAccountRow | undefined;
+    return row === undefined ? null : googleAccountFromRow(row);
+  }
+
+  findGoogleAccountByEmail(email: string, tenantId?: string): GoogleAccountRecord | null {
+    const tid = tenantId ?? this.tenantId;
+    const row = this.db
+      .prepare(`${GOOGLE_ACCOUNT_COLUMNS} WHERE tenant_id = ? AND email = ?`)
+      .get(tid, normalizeEmail(email)) as GoogleAccountRow | undefined;
+    return row === undefined ? null : googleAccountFromRow(row);
+  }
+
+  listGoogleAccounts(tenantId?: string): GoogleAccountRecord[] {
+    const tid = tenantId ?? this.tenantId;
+    const rows = this.db
+      .prepare(`${GOOGLE_ACCOUNT_COLUMNS} WHERE tenant_id = ? ORDER BY ${SLOT_ORDER}`)
+      .all(tid) as GoogleAccountRow[];
+    return rows.map(googleAccountFromRow);
+  }
+
+  deleteGoogleAccount(slot: string, tenantId?: string): void {
+    const tid = tenantId ?? this.tenantId;
+    this.db.prepare("DELETE FROM google_accounts WHERE tenant_id = ? AND slot = ?").run(tid, slot);
+  }
+
+  /**
+   * Adds or replaces one calendar, refusing what would sync a calendar twice:
+   * the same calendar already in this tenant (under another key), more than
+   * MAX_CALENDARS, or a calendar another tenant already syncs together with
+   * one of this tenant's (both tenants would mirror the same events into each
+   * other's blocks). Replacing a key in place is not a new calendar, so the
+   * cap does not apply to it. One immediate transaction, so two adds at once
+   * still see each other's rows.
+   */
+  addCalendar(input: CalendarInput, now = new Date(), tenantId?: string): CalendarAddResult {
+    const tid = tenantId ?? this.tenantId;
+    return this.db
+      .transaction((): CalendarAddResult => {
+        const fingerprint = input.fingerprint;
+        const refusal = this.calendarRefusal(input.key, fingerprint, tid);
+        if (refusal !== undefined) {
+          return refusal;
+        }
+        this.db
+          .prepare(
+            `INSERT INTO calendars (
+               tenant_id, calendar_key, account_slot, calendar_id, name, access_role,
+               source, destination, calendar_fingerprint, added_at, verified_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(tenant_id, calendar_key) DO UPDATE SET
+               account_slot = excluded.account_slot,
+               calendar_id = excluded.calendar_id,
+               name = COALESCE(excluded.name, calendars.name),
+               access_role = COALESCE(excluded.access_role, calendars.access_role),
+               source = excluded.source,
+               destination = excluded.destination,
+               calendar_fingerprint = COALESCE(excluded.calendar_fingerprint,
+                                               calendars.calendar_fingerprint),
+               verified_at = excluded.verified_at`,
+          )
+          .run(
+            tid,
+            input.key,
+            input.account,
+            input.calendarId,
+            input.name ?? null,
+            input.accessRole ?? null,
+            input.source === false ? 0 : 1,
+            input.destination === false ? 0 : 1,
+            fingerprint ?? null,
+            now.toISOString(),
+            now.toISOString(),
+          );
+        return { added: true };
+      })
+      .immediate();
+  }
+
+  /**
+   * Why addCalendar would refuse this calendar, without adding it: for a
+   * caller that must decide before it touches anything else (a token).
+   */
+  calendarRefusal(
+    key: CalendarKey,
+    fingerprint: string | undefined,
+    tenantId?: string,
+  ): CalendarRefusal | undefined {
+    const tid = tenantId ?? this.tenantId;
+    if (fingerprint !== undefined) {
+      const duplicate = this.db
+        .prepare(
+          `SELECT calendar_key FROM calendars
+           WHERE tenant_id = ? AND calendar_fingerprint = ? AND calendar_key != ?`,
+        )
+        .get(tid, fingerprint, key) as { calendar_key: string } | undefined;
+      if (duplicate !== undefined) {
+        return { added: false, reason: "duplicate", key: duplicate.calendar_key };
+      }
+      const tenant = this.calendarConflict(fingerprint, key, tid);
+      if (tenant !== undefined) {
+        return { added: false, reason: "conflict", tenant };
+      }
+    }
+    const existing = this.db
+      .prepare("SELECT 1 FROM calendars WHERE tenant_id = ? AND calendar_key = ?")
+      .get(tid, key);
+    const count = (
+      this.db.prepare("SELECT COUNT(*) AS n FROM calendars WHERE tenant_id = ?").get(tid) as {
+        n: number;
+      }
+    ).n;
+    return existing === undefined && count >= MAX_CALENDARS
+      ? { added: false, reason: "limit" }
+      : undefined;
+  }
+
+  /**
+   * The other tenant, if any, that already syncs the calendar `fingerprint`
+   * names together with another of this tenant's calendars (other than
+   * `replacing`, the key being re-added). One shared calendar alone is not a
+   * conflict (two people can mirror different work calendars into a family
+   * one); two shared calendars are, since both tenants would mirror the same
+   * events between them.
+   */
+  calendarConflict(
+    fingerprint: string,
+    replacing: CalendarKey,
+    tenantId?: string,
+  ): string | undefined {
+    const tid = tenantId ?? this.tenantId;
+    const row = this.db
+      .prepare(
+        `SELECT theirs.tenant_id FROM calendars theirs
+         WHERE theirs.calendar_fingerprint = ? AND theirs.tenant_id != ?
+           AND EXISTS (
+             SELECT 1 FROM calendars mine
+             JOIN calendars shared
+               ON shared.calendar_fingerprint = mine.calendar_fingerprint
+              AND shared.tenant_id = theirs.tenant_id
+             WHERE mine.tenant_id = ? AND mine.calendar_key != ?
+               AND mine.calendar_fingerprint IS NOT NULL
+               AND mine.calendar_fingerprint != ?
+           )
+         ORDER BY theirs.tenant_id LIMIT 1`,
+      )
+      .get(fingerprint, tid, tid, replacing, fingerprint) as { tenant_id: string } | undefined;
+    return row?.tenant_id;
+  }
+
+  /** Marks a calendar verified and fills in what the check learned about it. */
+  verifyCalendar(
+    key: CalendarKey,
+    details: { fingerprint?: string | undefined; name?: string | null; accessRole?: string | null },
+    now = new Date(),
+    tenantId?: string,
+  ): void {
+    const tid = tenantId ?? this.tenantId;
+    this.db
+      .prepare(
+        // A fingerprint another of this tenant's calendars already has is not
+        // taken: that is a duplicate the status surfaces report, not a crash.
+        `UPDATE calendars SET verified_at = ?,
+           calendar_fingerprint = CASE
+             WHEN EXISTS (
+               SELECT 1 FROM calendars other
+               WHERE other.tenant_id = calendars.tenant_id
+                 AND other.calendar_key != calendars.calendar_key
+                 AND other.calendar_fingerprint = ?
+             ) THEN calendar_fingerprint
+             ELSE COALESCE(?, calendar_fingerprint)
+           END,
+           name = COALESCE(?, name),
+           access_role = COALESCE(?, access_role)
+         WHERE tenant_id = ? AND calendar_key = ?`,
+      )
+      .run(
+        now.toISOString(),
+        details.fingerprint ?? null,
+        details.fingerprint ?? null,
+        details.name ?? null,
+        details.accessRole ?? null,
+        tid,
+        key,
+      );
+  }
+
+  getCalendar(key: CalendarKey, tenantId?: string): CalendarRecord | null {
+    const tid = tenantId ?? this.tenantId;
+    const row = this.db
+      .prepare(`${CALENDAR_COLUMNS} WHERE tenant_id = ? AND calendar_key = ?`)
+      .get(tid, key) as CalendarRow | undefined;
+    return row === undefined ? null : calendarFromRow(row);
+  }
+
+  listCalendars(tenantId?: string): CalendarRecord[] {
+    const tid = tenantId ?? this.tenantId;
+    const rows = this.db
+      .prepare(`${CALENDAR_COLUMNS} WHERE tenant_id = ? ORDER BY ${CALENDAR_ORDER}`)
+      .all(tid) as CalendarRow[];
+    return rows.map(calendarFromRow);
+  }
+
+  setCalendarRoles(
+    key: CalendarKey,
+    roles: { source: boolean; destination: boolean },
+    tenantId?: string,
+  ): void {
+    const tid = tenantId ?? this.tenantId;
+    this.db
+      .prepare(
+        "UPDATE calendars SET source = ?, destination = ? WHERE tenant_id = ? AND calendar_key = ?",
+      )
+      .run(roles.source ? 1 : 0, roles.destination ? 1 : 0, tid, key);
+  }
+
+  /**
+   * Forgets a calendar and everything calsync kept for it: its block
+   * mappings, the exclusions that held its events back, its watch channel
+   * row and its incremental sync state. The caller removes its busy blocks
+   * from Google first; `stateKeys` are its sync_state keys, which the engine
+   * names.
+   */
+  removeCalendar(key: CalendarKey, stateKeys: readonly string[], tenantId?: string): void {
+    const tid = tenantId ?? this.tenantId;
+    this.db.transaction(() => {
+      this.db
+        .prepare("DELETE FROM event_mappings WHERE tenant_id = ? AND destination_key = ?")
+        .run(tid, key);
+      for (const table of ["exclusion_keys", "exclusion_keywords"]) {
+        this.db
+          .prepare(`DELETE FROM ${table} WHERE tenant_id = ? AND source_key = ?`)
+          .run(tid, key);
+      }
+      this.db
+        .prepare("DELETE FROM watch_channels WHERE tenant_id = ? AND calendar_key = ?")
+        .run(tid, key);
+      for (const stateKey of stateKeys) {
+        this.db.prepare("DELETE FROM sync_state WHERE key = ?").run(stateKey);
+      }
+      this.db
+        .prepare("DELETE FROM calendars WHERE tenant_id = ? AND calendar_key = ?")
+        .run(tid, key);
+    })();
+  }
+
+  // ---- The two-calendar API: a role names both its sign-in slot and its
+  // calendar key. Kept so role-based surfaces work unchanged.
+
+  upsertAccount(role: AccountRole, calendarId: string, now = new Date(), tenantId?: string): void {
+    const tid = tenantId ?? this.tenantId;
+    this.db.transaction(() => {
+      this.upsertGoogleAccount(role, null, now, tid);
+      this.db
+        .prepare(
+          `INSERT INTO calendars (
+             tenant_id, calendar_key, account_slot, calendar_id, source, destination,
+             added_at, verified_at
+           ) VALUES (?, ?, ?, ?, 1, 1, ?, ?)
+           ON CONFLICT(tenant_id, calendar_key) DO UPDATE SET
+             account_slot = excluded.account_slot,
+             calendar_id = excluded.calendar_id,
+             verified_at = excluded.verified_at`,
+        )
+        .run(tid, role, role, calendarId, now.toISOString(), now.toISOString());
+    })();
+  }
+
+  /**
+   * Records a validated role account and its calendar, unless that would
+   * sync a calendar twice (see addCalendar). The first passing check is what
+   * makes the daemon adopt a tenant, so refusing here keeps it out.
    */
   adoptAccount(
     role: AccountRole,
@@ -132,73 +517,34 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
     fingerprint: string | undefined,
     now = new Date(),
     tenantId?: string,
-  ): { adopted: true } | { adopted: false; conflictsWith: string } {
+  ): { adopted: true } | { adopted: false; refusal: CalendarRefusal } {
     const tid = tenantId ?? this.tenantId;
     return this.db
-      .transaction((): { adopted: true } | { adopted: false; conflictsWith: string } => {
-        const conflictsWith =
-          fingerprint === undefined ? undefined : this.pairConflict(role, fingerprint, tid);
-        if (conflictsWith !== undefined) {
-          return { adopted: false, conflictsWith };
+      .transaction((): { adopted: true } | { adopted: false; refusal: CalendarRefusal } => {
+        const result = this.addCalendar(
+          { key: role, account: role, calendarId, fingerprint },
+          now,
+          tid,
+        );
+        if (!result.added) {
+          return { adopted: false, refusal: result };
         }
-        this.db
-          .prepare(
-            `INSERT INTO accounts (
-               tenant_id, role, calendar_id, authorized_at, verified_at, calendar_fingerprint
-             ) VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(tenant_id, role) DO UPDATE SET
-               calendar_id = excluded.calendar_id,
-               authorized_at = excluded.authorized_at,
-               verified_at = excluded.verified_at,
-               calendar_fingerprint = excluded.calendar_fingerprint`,
-          )
-          .run(tid, role, calendarId, now.toISOString(), now.toISOString(), fingerprint ?? null);
+        this.upsertGoogleAccount(role, null, now, tid);
         return { adopted: true };
       })
       .immediate();
   }
 
-  /**
-   * The other tenant, if any, whose two calendars are the pair this tenant
-   * would have with `fingerprint` in `role`, in either orientation. Undefined
-   * while this tenant's other role is unknown: one shared calendar is not a
-   * conflict (two people can mirror different work calendars into a family
-   * one), only the same pair is.
-   */
+  /** The other tenant already syncing this role's calendar alongside one of ours. */
   pairConflict(role: AccountRole, fingerprint: string, tenantId?: string): string | undefined {
-    const tid = tenantId ?? this.tenantId;
-    const other = this.db
-      .prepare(
-        "SELECT calendar_fingerprint FROM accounts WHERE tenant_id = ? AND role = ? AND calendar_fingerprint IS NOT NULL",
-      )
-      .get(tid, role === "personal" ? "work" : "personal") as
-      { calendar_fingerprint: string } | undefined;
-    if (other === undefined) {
-      return undefined;
-    }
-    const row = this.db
-      .prepare(
-        `SELECT p.tenant_id FROM accounts p
-         JOIN accounts w ON w.tenant_id = p.tenant_id AND w.role = 'work'
-         WHERE p.role = 'personal' AND p.tenant_id != ?
-           AND ((p.calendar_fingerprint = ? AND w.calendar_fingerprint = ?)
-             OR (p.calendar_fingerprint = ? AND w.calendar_fingerprint = ?))
-         ORDER BY p.tenant_id LIMIT 1`,
-      )
-      .get(
-        tid,
-        fingerprint,
-        other.calendar_fingerprint,
-        other.calendar_fingerprint,
-        fingerprint,
-      ) as { tenant_id: string } | undefined;
-    return row?.tenant_id;
+    return this.calendarConflict(fingerprint, role, tenantId);
   }
 
   /**
-   * Marks an established account verified and fills in its fingerprint, which
-   * rows written before the pair guard lack. Returns another tenant already
-   * on the same pair, for a warning: an established tenant is never refused.
+   * Marks an established role account verified and fills in its fingerprint,
+   * which rows written before the guard lack. Returns another tenant already
+   * syncing the same calendars, for a warning: an established tenant is never
+   * refused.
    */
   verifyAccount(
     role: AccountRole,
@@ -209,32 +555,25 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
     const tid = tenantId ?? this.tenantId;
     return this.db
       .transaction((): string | undefined => {
-        this.db
-          .prepare(
-            `UPDATE accounts SET verified_at = ?,
-               calendar_fingerprint = COALESCE(?, calendar_fingerprint)
-             WHERE tenant_id = ? AND role = ?`,
-          )
-          .run(now.toISOString(), fingerprint ?? null, tid, role);
-        return fingerprint === undefined ? undefined : this.pairConflict(role, fingerprint, tid);
+        this.verifyGoogleAccount(role, null, now, tid);
+        this.verifyCalendar(role, { fingerprint }, now, tid);
+        return fingerprint === undefined
+          ? undefined
+          : this.calendarConflict(fingerprint, role, tid);
       })
       .immediate();
   }
 
   markAccountVerified(role: AccountRole, now = new Date(), tenantId?: string): void {
     const tid = tenantId ?? this.tenantId;
-    this.db
-      .prepare("UPDATE accounts SET verified_at = ? WHERE tenant_id = ? AND role = ?")
-      .run(now.toISOString(), tid, role);
+    this.verifyGoogleAccount(role, null, now, tid);
+    this.verifyCalendar(role, {}, now, tid);
   }
 
   getAccount(role: AccountRole, tenantId?: string): AccountRecord | null {
     const tid = tenantId ?? this.tenantId;
-    const row = this.db
-      .prepare(
-        "SELECT tenant_id, role, calendar_id, authorized_at, verified_at FROM accounts WHERE tenant_id = ? AND role = ?",
-      )
-      .get(tid, role) as AccountRow | undefined;
+    const row = this.db.prepare(`${ROLE_ACCOUNT_COLUMNS} AND c.calendar_key = ?`).get(tid, role) as
+      AccountRow | undefined;
     return row === undefined ? null : accountFromRow(row);
   }
 
@@ -242,10 +581,8 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
     const tid = tenantId ?? this.tenantId;
     const rows = this.db
       .prepare(
-        `SELECT tenant_id, role, calendar_id, authorized_at, verified_at
-         FROM accounts
-         WHERE tenant_id = ?
-         ORDER BY CASE role WHEN 'personal' THEN 0 ELSE 1 END`,
+        `${ROLE_ACCOUNT_COLUMNS} AND c.calendar_key IN ('personal', 'work')
+         ORDER BY CASE c.calendar_key WHEN 'personal' THEN 0 ELSE 1 END`,
       )
       .all(tid) as AccountRow[];
     return rows.map(accountFromRow);
@@ -253,15 +590,25 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
 
   deleteAccount(role: AccountRole, tenantId?: string): void {
     const tid = tenantId ?? this.tenantId;
-    this.db.prepare("DELETE FROM accounts WHERE tenant_id = ? AND role = ?").run(tid, role);
+    this.db.transaction(() => {
+      this.db
+        .prepare("DELETE FROM calendars WHERE tenant_id = ? AND calendar_key = ?")
+        .run(tid, role);
+      const used = this.db
+        .prepare("SELECT 1 FROM calendars WHERE tenant_id = ? AND account_slot = ?")
+        .get(tid, role);
+      if (used === undefined) {
+        this.deleteGoogleAccount(role, tid);
+      }
+    })();
   }
 
-  /** Tenants with both accounts authorized — the set one daemon serves. */
+  /** Tenants with at least two calendars — the set one daemon serves. */
   listReadyTenants(): string[] {
     const rows = this.db
       .prepare(
-        `SELECT tenant_id FROM accounts
-         GROUP BY tenant_id HAVING COUNT(DISTINCT role) = 2
+        `SELECT tenant_id FROM calendars
+         GROUP BY tenant_id HAVING COUNT(*) >= 2
          ORDER BY tenant_id`,
       )
       .all() as { tenant_id: string }[];
@@ -273,25 +620,21 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
     this.db
       .prepare(
         `INSERT INTO event_mappings (
-           mapping_key, tenant_id, source_role, source_event_id, destination_event_id,
-           source_etag, destination_etag, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           mapping_key, tenant_id, destination_key, destination_event_id, destination_etag,
+           updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(mapping_key) DO UPDATE SET
            tenant_id = excluded.tenant_id,
-           source_role = excluded.source_role,
-           source_event_id = excluded.source_event_id,
+           destination_key = excluded.destination_key,
            destination_event_id = excluded.destination_event_id,
-           source_etag = excluded.source_etag,
            destination_etag = excluded.destination_etag,
            updated_at = excluded.updated_at`,
       )
       .run(
         mapping.mappingKey,
         tid,
-        mapping.sourceRole,
-        mapping.sourceEventId,
+        mapping.destinationKey,
         mapping.destinationEventId,
-        mapping.sourceEtag,
         mapping.destinationEtag,
         mapping.updatedAt,
       );
@@ -300,33 +643,23 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
   getMapping(mappingKey: string, tenantId?: string): EventMapping | null {
     const tid = tenantId ?? this.tenantId;
     const row = this.db
-      .prepare(
-        `SELECT mapping_key, tenant_id, source_role, source_event_id, destination_event_id,
-                source_etag, destination_etag, updated_at
-         FROM event_mappings WHERE mapping_key = ? AND tenant_id = ?`,
-      )
+      .prepare(`${MAPPING_COLUMNS} WHERE mapping_key = ? AND tenant_id = ?`)
       .get(mappingKey, tid) as MappingRow | undefined;
     return row === undefined ? null : mappingFromRow(row);
   }
 
-  listMappings(sourceRole?: AccountRole, tenantId?: string): EventMapping[] {
+  listMappings(destinationKey?: CalendarKey, tenantId?: string): EventMapping[] {
     const tid = tenantId ?? this.tenantId;
     const rows =
-      sourceRole === undefined
+      destinationKey === undefined
         ? (this.db
-            .prepare(
-              `SELECT mapping_key, tenant_id, source_role, source_event_id, destination_event_id,
-                      source_etag, destination_etag, updated_at
-               FROM event_mappings WHERE tenant_id = ? ORDER BY mapping_key`,
-            )
+            .prepare(`${MAPPING_COLUMNS} WHERE tenant_id = ? ORDER BY mapping_key`)
             .all(tid) as MappingRow[])
         : (this.db
             .prepare(
-              `SELECT mapping_key, tenant_id, source_role, source_event_id, destination_event_id,
-                      source_etag, destination_etag, updated_at
-               FROM event_mappings WHERE tenant_id = ? AND source_role = ? ORDER BY mapping_key`,
+              `${MAPPING_COLUMNS} WHERE tenant_id = ? AND destination_key = ? ORDER BY mapping_key`,
             )
-            .all(tid, sourceRole) as MappingRow[]);
+            .all(tid, destinationKey) as MappingRow[]);
     return rows.map(mappingFromRow);
   }
 
@@ -370,27 +703,27 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
     const tid = tenantId ?? this.tenantId;
     const rows = this.db
       .prepare(
-        `SELECT tenant_id, direction, value, created_at
+        `SELECT tenant_id, source_key, value, created_at
          FROM exclusion_keys
          WHERE tenant_id = ?
-         ORDER BY direction, value`,
+         ORDER BY source_key, value`,
       )
       .all(tid) as ExclusionKeyRow[];
     return rows.map((row) => ({
-      direction: row.direction,
+      sourceKey: row.source_key,
       value: row.value,
       createdAt: row.created_at,
     }));
   }
 
-  addExclusionKey(direction: ExclusionDirection, value: string, tenantId?: string): boolean {
+  addExclusionKey(sourceKey: CalendarKey, value: string, tenantId?: string): boolean {
     const tid = tenantId ?? this.tenantId;
     const result = this.db
       .prepare(
-        `INSERT OR IGNORE INTO exclusion_keys (tenant_id, value, direction, created_at)
+        `INSERT OR IGNORE INTO exclusion_keys (tenant_id, value, source_key, created_at)
          VALUES (?, ?, ?, ?)`,
       )
-      .run(tid, value, direction, new Date().toISOString());
+      .run(tid, value, sourceKey, new Date().toISOString());
     return result.changes > 0;
   }
 
@@ -406,41 +739,37 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
     const tid = tenantId ?? this.tenantId;
     const rows = this.db
       .prepare(
-        `SELECT tenant_id, direction, keyword, created_at
+        `SELECT tenant_id, source_key, keyword, created_at
          FROM exclusion_keywords
          WHERE tenant_id = ?
-         ORDER BY direction, keyword`,
+         ORDER BY source_key, keyword`,
       )
       .all(tid) as ExclusionKeywordRow[];
     return rows.map((row) => ({
-      direction: row.direction,
+      sourceKey: row.source_key,
       keyword: row.keyword,
       createdAt: row.created_at,
     }));
   }
 
-  addExclusionKeyword(direction: ExclusionDirection, keyword: string, tenantId?: string): boolean {
+  addExclusionKeyword(sourceKey: CalendarKey, keyword: string, tenantId?: string): boolean {
     const tid = tenantId ?? this.tenantId;
     const result = this.db
       .prepare(
-        `INSERT OR IGNORE INTO exclusion_keywords (tenant_id, direction, keyword, created_at)
+        `INSERT OR IGNORE INTO exclusion_keywords (tenant_id, source_key, keyword, created_at)
          VALUES (?, ?, ?, ?)`,
       )
-      .run(tid, direction, keyword, new Date().toISOString());
+      .run(tid, sourceKey, keyword, new Date().toISOString());
     return result.changes > 0;
   }
 
-  removeExclusionKeyword(
-    direction: ExclusionDirection,
-    keyword: string,
-    tenantId?: string,
-  ): boolean {
+  removeExclusionKeyword(sourceKey: CalendarKey, keyword: string, tenantId?: string): boolean {
     const tid = tenantId ?? this.tenantId;
     const result = this.db
       .prepare(
-        "DELETE FROM exclusion_keywords WHERE tenant_id = ? AND direction = ? AND keyword = ?",
+        "DELETE FROM exclusion_keywords WHERE tenant_id = ? AND source_key = ? AND keyword = ?",
       )
-      .run(tid, direction, keyword);
+      .run(tid, sourceKey, keyword);
     return result.changes > 0;
   }
 
@@ -449,9 +778,10 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
     this.db
       .prepare(
         `INSERT INTO watch_channels
-           (tenant_id, role, calendar_id, channel_id, resource_id, token_hash, address, expires_at, created_at)
+           (tenant_id, calendar_key, calendar_id, channel_id, resource_id, token_hash, address,
+            expires_at, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(tenant_id, role) DO UPDATE SET
+         ON CONFLICT(tenant_id, calendar_key) DO UPDATE SET
            calendar_id = excluded.calendar_id,
            channel_id = excluded.channel_id,
            resource_id = excluded.resource_id,
@@ -462,7 +792,7 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
       )
       .run(
         tid,
-        channel.role,
+        channel.calendarKey,
         channel.calendarId,
         channel.channelId,
         channel.resourceId,
@@ -473,11 +803,11 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
       );
   }
 
-  getWatchChannel(role: AccountRole, tenantId?: string): WatchChannelRecord | null {
+  getWatchChannel(calendarKey: CalendarKey, tenantId?: string): WatchChannelRecord | null {
     const tid = tenantId ?? this.tenantId;
     const row = this.db
-      .prepare(`${WATCH_CHANNEL_COLUMNS} WHERE tenant_id = ? AND role = ?`)
-      .get(tid, role) as WatchChannelRow | undefined;
+      .prepare(`${WATCH_CHANNEL_COLUMNS} WHERE tenant_id = ? AND calendar_key = ?`)
+      .get(tid, calendarKey) as WatchChannelRow | undefined;
     return row === undefined ? null : watchChannelFromRow(row);
   }
 
@@ -492,43 +822,59 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
   listWatchChannels(tenantId?: string): WatchChannelRecord[] {
     const tid = tenantId ?? this.tenantId;
     const rows = this.db
-      .prepare(`${WATCH_CHANNEL_COLUMNS} WHERE tenant_id = ? ORDER BY role`)
+      .prepare(`${WATCH_CHANNEL_COLUMNS} WHERE tenant_id = ? ORDER BY calendar_key`)
       .all(tid) as WatchChannelRow[];
     return rows.map(watchChannelFromRow);
   }
 
-  deleteWatchChannel(role: AccountRole, tenantId?: string): void {
+  deleteWatchChannel(calendarKey: CalendarKey, tenantId?: string): void {
     const tid = tenantId ?? this.tenantId;
-    this.db.prepare("DELETE FROM watch_channels WHERE tenant_id = ? AND role = ?").run(tid, role);
+    this.db
+      .prepare("DELETE FROM watch_channels WHERE tenant_id = ? AND calendar_key = ?")
+      .run(tid, calendarKey);
   }
 
   private migrate(): void {
-    const legacyTables = Object.entries(PRE_TENANT_COLUMNS).filter(([table]) =>
-      this.isPreTenantTable(table),
+    const preTenant = Object.keys(LEGACY_COPIES).filter((table) => this.isPreTenantTable(table));
+    const preKeyed = Object.keys(ROLE_KEYED_COLUMNS).filter(
+      (table) => !preTenant.includes(table) && this.hasColumn(table, ROLE_KEYED_COLUMNS[table]),
     );
     this.db.transaction(() => {
-      // Pre-tenant tables changed primary keys, so they are rebuilt: renamed
-      // aside, recreated with tenant_id, and their rows copied under 'default'.
-      for (const [table] of legacyTables) {
+      // Tables whose primary keys or columns changed are rebuilt: renamed
+      // aside, recreated, and their rows copied over. Pre-tenant rows land
+      // under 'default'; role-keyed rows get the calendar key they meant.
+      for (const table of preTenant) {
         this.db.exec(`ALTER TABLE ${table} RENAME TO ${table}_pre_tenant`);
       }
-      this.createTables();
-      this.addColumnIfMissing("accounts", "calendar_fingerprint", "TEXT");
-      for (const [table, columns] of legacyTables) {
-        this.db.exec(
-          `INSERT INTO ${table} (tenant_id, ${columns})
-           SELECT 'default', ${columns} FROM ${table}_pre_tenant;
-           DROP TABLE ${table}_pre_tenant;`,
-        );
+      for (const table of preKeyed) {
+        this.db.exec(`ALTER TABLE ${table} RENAME TO ${table}_pre_keys`);
       }
+      this.createTables();
+      for (const table of preTenant) {
+        this.copyLegacyRows(table, `${table}_pre_tenant`, "'default'");
+      }
+      for (const table of preKeyed) {
+        this.copyLegacyRows(table, `${table}_pre_keys`, "tenant_id");
+      }
+      this.db.exec(`INSERT OR IGNORE INTO signed_in_tenants (tenant_id, first_at)
+        SELECT tenant_id, MIN(authorized_at) FROM google_accounts GROUP BY tenant_id`);
     })();
   }
 
-  private addColumnIfMissing(table: string, column: string, type: string): void {
-    const columns = this.db.pragma(`table_info(${table})`) as { name: string }[];
-    if (!columns.some((existing) => existing.name === column)) {
-      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  private copyLegacyRows(table: string, from: string, tenant: string): void {
+    const copy = LEGACY_COPIES[table];
+    if (copy === undefined) {
+      throw new Error(`No migration for table ${table}`);
     }
+    const columns = new Set(
+      (this.db.pragma(`table_info(${from})`) as { name: string }[]).map((column) => column.name),
+    );
+    this.db.exec(`${copy(from, tenant, columns)}; DROP TABLE ${from};`);
+  }
+
+  private hasColumn(table: string, column: string | undefined): boolean {
+    const columns = this.db.pragma(`table_info(${table})`) as { name: string }[];
+    return columns.some((existing) => existing.name === column);
   }
 
   private isPreTenantTable(table: string): boolean {
@@ -544,28 +890,57 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
 
   private createTables(): void {
     this.db.exec(`
-      CREATE TABLE IF NOT EXISTS accounts (
+      -- One Google sign-in; its refresh token lives in the vault under slot.
+      CREATE TABLE IF NOT EXISTS google_accounts (
         tenant_id TEXT NOT NULL,
-        role TEXT NOT NULL CHECK (role IN ('personal', 'work')),
-        calendar_id TEXT NOT NULL,
+        slot TEXT NOT NULL,
+        email TEXT,
         authorized_at TEXT NOT NULL,
         verified_at TEXT,
-        -- SHA-256 of the calendar the account resolved to; equality only.
-        calendar_fingerprint TEXT,
-        PRIMARY KEY (tenant_id, role)
+        PRIMARY KEY (tenant_id, slot)
       );
 
+      -- Tenants that ever signed in, which a fresh tenant has not.
+      CREATE TABLE IF NOT EXISTS signed_in_tenants (
+        tenant_id TEXT PRIMARY KEY,
+        first_at TEXT NOT NULL
+      );
+
+      -- One connected calendar, read and written through account_slot's sign-in.
+      CREATE TABLE IF NOT EXISTS calendars (
+        tenant_id TEXT NOT NULL,
+        calendar_key TEXT NOT NULL,
+        account_slot TEXT NOT NULL,
+        calendar_id TEXT NOT NULL,
+        name TEXT,
+        access_role TEXT,
+        source INTEGER NOT NULL DEFAULT 1,
+        destination INTEGER NOT NULL DEFAULT 1,
+        -- SHA-256 of the calendar's resolved id; equality only.
+        calendar_fingerprint TEXT,
+        added_at TEXT NOT NULL,
+        verified_at TEXT,
+        PRIMARY KEY (tenant_id, calendar_key)
+      );
+
+      -- A tenant syncs any one calendar once.
+      CREATE UNIQUE INDEX IF NOT EXISTS calendars_fingerprint
+        ON calendars (tenant_id, calendar_fingerprint)
+        WHERE calendar_fingerprint IS NOT NULL;
+
+      -- One busy block calsync wrote, by the calendar holding it. No source
+      -- event identifiers: a block merges any number of sources.
       CREATE TABLE IF NOT EXISTS event_mappings (
         mapping_key TEXT PRIMARY KEY,
         tenant_id TEXT NOT NULL,
-        source_role TEXT NOT NULL CHECK (source_role IN ('personal', 'work')),
-        source_event_id TEXT NOT NULL,
+        destination_key TEXT NOT NULL,
         destination_event_id TEXT NOT NULL,
-        source_etag TEXT,
         destination_etag TEXT,
-        updated_at TEXT NOT NULL,
-        UNIQUE (tenant_id, source_role, source_event_id)
+        updated_at TEXT NOT NULL
       );
+
+      CREATE INDEX IF NOT EXISTS event_mappings_destination
+        ON event_mappings (tenant_id, destination_key);
 
       CREATE TABLE IF NOT EXISTS sync_state (
         key TEXT PRIMARY KEY,
@@ -573,25 +948,26 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
         updated_at TEXT NOT NULL
       );
 
+      -- Exclusions belong to the source calendar whose events they hold back.
       CREATE TABLE IF NOT EXISTS exclusion_keys (
         tenant_id TEXT NOT NULL,
         value TEXT NOT NULL,
-        direction TEXT NOT NULL CHECK (direction IN ('personalToWork', 'workToPersonal')),
+        source_key TEXT NOT NULL,
         created_at TEXT NOT NULL,
         PRIMARY KEY (tenant_id, value)
       );
 
       CREATE TABLE IF NOT EXISTS exclusion_keywords (
         tenant_id TEXT NOT NULL,
-        direction TEXT NOT NULL CHECK (direction IN ('personalToWork', 'workToPersonal')),
+        source_key TEXT NOT NULL,
         keyword TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        PRIMARY KEY (tenant_id, direction, keyword)
+        PRIMARY KEY (tenant_id, source_key, keyword)
       );
 
       CREATE TABLE IF NOT EXISTS watch_channels (
         tenant_id TEXT NOT NULL,
-        role TEXT NOT NULL CHECK (role IN ('personal', 'work')),
+        calendar_key TEXT NOT NULL,
         calendar_id TEXT NOT NULL,
         channel_id TEXT NOT NULL UNIQUE,
         resource_id TEXT NOT NULL,
@@ -599,31 +975,116 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
         address TEXT NOT NULL,
         expires_at TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        PRIMARY KEY (tenant_id, role)
+        PRIMARY KEY (tenant_id, calendar_key)
       );
     `);
   }
 }
 
-/** Column lists (minus tenant_id) used to copy rows out of pre-tenant tables. */
-const PRE_TENANT_COLUMNS: Record<string, string> = {
-  accounts: "role, calendar_id, authorized_at, verified_at",
-  event_mappings:
-    "mapping_key, source_role, source_event_id, destination_event_id, source_etag, destination_etag, updated_at",
-  exclusion_keys: "value, direction, created_at",
-  exclusion_keywords: "direction, keyword, created_at",
-  watch_channels:
-    "role, calendar_id, channel_id, resource_id, token_hash, address, expires_at, created_at",
+/**
+ * The role-era column that marks a table as needing its rows re-keyed by
+ * calendar. Each direction had one source and one destination, so the
+ * conversion is exact.
+ */
+const ROLE_KEYED_COLUMNS: Record<string, string> = {
+  accounts: "role",
+  watch_channels: "role",
+  event_mappings: "source_role",
+  exclusion_keys: "direction",
+  exclusion_keywords: "direction",
 };
 
-const WATCH_CHANNEL_COLUMNS = `SELECT tenant_id, role, calendar_id, channel_id, resource_id,
+/** A mapping sourced from one role's calendar sits on the other's. */
+const DESTINATION_OF_SOURCE_ROLE =
+  "CASE source_role WHEN 'personal' THEN 'work' ELSE 'personal' END";
+/** "personalToWork" held back personal events: the personal source's exclusion. */
+const SOURCE_OF_DIRECTION = "CASE direction WHEN 'personalToWork' THEN 'personal' ELSE 'work' END";
+
+/**
+ * Copies one legacy table's rows into its current shape. `tenant` is the SQL
+ * for each row's tenant: a literal for pre-tenant tables, the column otherwise.
+ */
+const LEGACY_COPIES: Record<
+  string,
+  (from: string, tenant: string, columns: ReadonlySet<string>) => string
+> = {
+  // A role was one sign-in with one calendar: its slot and its calendar key.
+  // Both roles could point at the same calendar before calendars were
+  // unique per tenant; the later role keeps its row without a fingerprint.
+  accounts: (from, tenant, columns) =>
+    `INSERT OR IGNORE INTO google_accounts (tenant_id, slot, email, authorized_at, verified_at)
+     SELECT ${tenant}, role, NULL, authorized_at, verified_at FROM ${from};
+     INSERT OR IGNORE INTO calendars (
+       tenant_id, calendar_key, account_slot, calendar_id, source, destination,
+       calendar_fingerprint, added_at, verified_at
+     )
+     SELECT ${tenant}, role, role, calendar_id, 1, 1,
+            ${
+              columns.has("calendar_fingerprint") && columns.has("tenant_id")
+                ? `CASE WHEN EXISTS (
+                     SELECT 1 FROM ${from} earlier
+                     WHERE earlier.tenant_id = legacy.tenant_id
+                       AND earlier.calendar_fingerprint = legacy.calendar_fingerprint
+                       AND earlier.role < legacy.role
+                   ) THEN NULL ELSE legacy.calendar_fingerprint END`
+                : "NULL"
+            },
+            authorized_at, verified_at
+     FROM ${from} legacy`,
+  event_mappings: (from, tenant) =>
+    `INSERT OR IGNORE INTO event_mappings (
+       mapping_key, tenant_id, destination_key, destination_event_id, destination_etag, updated_at
+     )
+     SELECT mapping_key, ${tenant}, ${DESTINATION_OF_SOURCE_ROLE}, destination_event_id,
+            destination_etag, updated_at
+     FROM ${from}`,
+  exclusion_keys: (from, tenant) =>
+    `INSERT OR IGNORE INTO exclusion_keys (tenant_id, value, source_key, created_at)
+     SELECT ${tenant}, value, ${SOURCE_OF_DIRECTION}, created_at FROM ${from}`,
+  exclusion_keywords: (from, tenant) =>
+    `INSERT OR IGNORE INTO exclusion_keywords (tenant_id, source_key, keyword, created_at)
+     SELECT ${tenant}, ${SOURCE_OF_DIRECTION}, keyword, created_at FROM ${from}`,
+  watch_channels: (from, tenant) =>
+    `INSERT OR IGNORE INTO watch_channels (
+       tenant_id, calendar_key, calendar_id, channel_id, resource_id, token_hash, address,
+       expires_at, created_at
+     )
+     SELECT ${tenant}, role, calendar_id, channel_id, resource_id, token_hash, address,
+            expires_at, created_at
+     FROM ${from}`,
+};
+
+const MAPPING_COLUMNS = `SELECT mapping_key, tenant_id, destination_key, destination_event_id,
+        destination_etag, updated_at
+ FROM event_mappings`;
+
+const GOOGLE_ACCOUNT_COLUMNS = `SELECT tenant_id, slot, email, authorized_at, verified_at
+ FROM google_accounts`;
+
+const CALENDAR_COLUMNS = `SELECT tenant_id, calendar_key, account_slot, calendar_id, name,
+        access_role, source, destination, added_at, verified_at
+ FROM calendars`;
+
+/** The two original calendars first, in their old order, then the rest as added. */
+const CALENDAR_ORDER = `CASE calendar_key WHEN 'personal' THEN 0 WHEN 'work' THEN 1 ELSE 2 END,
+  added_at, calendar_key`;
+const SLOT_ORDER = `CASE slot WHEN 'personal' THEN 0 WHEN 'work' THEN 1 ELSE 2 END, slot`;
+
+/** A role's account as one row: the calendar keyed by the role and its sign-in. */
+const ROLE_ACCOUNT_COLUMNS = `SELECT c.tenant_id, c.calendar_key AS role, c.calendar_id,
+        a.authorized_at, c.verified_at
+ FROM calendars c
+ JOIN google_accounts a ON a.tenant_id = c.tenant_id AND a.slot = c.account_slot
+ WHERE c.tenant_id = ?`;
+
+const WATCH_CHANNEL_COLUMNS = `SELECT tenant_id, calendar_key, calendar_id, channel_id, resource_id,
         token_hash, address, expires_at, created_at
  FROM watch_channels`;
 
 function watchChannelFromRow(row: WatchChannelRow): WatchChannelRecord {
   return {
     tenantId: row.tenant_id,
-    role: row.role,
+    calendarKey: row.calendar_key,
     calendarId: row.calendar_id,
     channelId: row.channel_id,
     resourceId: row.resource_id,
@@ -632,6 +1093,36 @@ function watchChannelFromRow(row: WatchChannelRow): WatchChannelRecord {
     expiresAt: row.expires_at,
     createdAt: row.created_at,
   };
+}
+
+function googleAccountFromRow(row: GoogleAccountRow): GoogleAccountRecord {
+  return {
+    tenantId: row.tenant_id,
+    slot: row.slot,
+    email: row.email,
+    authorizedAt: row.authorized_at,
+    verifiedAt: row.verified_at,
+  };
+}
+
+function calendarFromRow(row: CalendarRow): CalendarRecord {
+  return {
+    tenantId: row.tenant_id,
+    key: row.calendar_key,
+    account: row.account_slot,
+    calendarId: row.calendar_id,
+    name: row.name,
+    accessRole: row.access_role,
+    source: row.source !== 0,
+    destination: row.destination !== 0,
+    addedAt: row.added_at,
+    verifiedAt: row.verified_at,
+  };
+}
+
+function normalizeEmail(email: string | null): string | null {
+  const trimmed = email?.trim().toLowerCase();
+  return trimmed === undefined || trimmed === "" ? null : trimmed;
 }
 
 function accountFromRow(row: AccountRow): AccountRecord {
@@ -647,10 +1138,8 @@ function accountFromRow(row: AccountRow): AccountRecord {
 function mappingFromRow(row: MappingRow): EventMapping {
   return {
     mappingKey: row.mapping_key,
-    sourceRole: row.source_role,
-    sourceEventId: row.source_event_id,
+    destinationKey: row.destination_key,
     destinationEventId: row.destination_event_id,
-    sourceEtag: row.source_etag,
     destinationEtag: row.destination_etag,
     updatedAt: row.updated_at,
   };

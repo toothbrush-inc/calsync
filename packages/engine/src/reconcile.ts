@@ -3,15 +3,15 @@ import { createHash } from "node:crypto";
 import { systemClock } from "./clock.js";
 import { googleApiErrorInfo, isRetryableGoogleError } from "./errors.js";
 import type {
-  AccountRole,
   CalendarAPI,
+  CalendarConfig,
+  CalendarKey,
   CalendarWindow,
   Clock,
   EventMapping,
   MappingStore,
   SyncConfig,
 } from "./types.js";
-import { accountRoles } from "./types.js";
 import {
   isTitleExcludedByKeyword,
   matchingSourceExclusion,
@@ -54,8 +54,10 @@ export type ReconcileTimeRange =
 
 export interface ReconcileLog {
   operation: ReconcileOperation;
-  sourceRole: AccountRole;
-  destinationRole: AccountRole;
+  /** Calendar holding the block. */
+  destinationKey: CalendarKey;
+  /** Calendars whose events merged into the block, when they are still known. */
+  sourceKeys?: CalendarKey[];
   reason: ReconcileReason;
   timeRange?: ReconcileTimeRange;
   /** Titles of every source merged into the block, in start order; untitled sources are left out. */
@@ -64,8 +66,7 @@ export interface ReconcileLog {
 }
 
 export interface ReconcileSourceDetail {
-  sourceRole: AccountRole;
-  destinationRole: AccountRole;
+  sourceKey: CalendarKey;
   sourceTitle?: string;
   timeRange: ReconcileTimeRange;
   exclusionKeys: SourceExclusionKeys;
@@ -80,19 +81,25 @@ export interface ReconcileResult {
   repaired: number;
 }
 
-export interface MirrorDirectionSummary {
+/** What one destination holds after a pass. */
+export interface DestinationSummary {
+  /** Busy blocks on the calendar. */
   active: number;
-  excluded: number;
+  /** Source events left out because the same meeting is already on this calendar. */
   duplicateSuppressed: number;
+}
+
+/** What one source calendar contributed. */
+export interface SourceSummary {
+  /** Events an exclusion holds back from every destination. */
+  excluded: number;
 }
 
 export interface SyncReconcileResult extends ReconcileResult {
   failed: number;
   converged: boolean;
-  mirrors: {
-    personalToWork: MirrorDirectionSummary;
-    workToPersonal: MirrorDirectionSummary;
-  };
+  destinations: Record<CalendarKey, DestinationSummary>;
+  sources: Record<CalendarKey, SourceSummary>;
 }
 
 /**
@@ -103,10 +110,10 @@ export interface SyncReconcileResult extends ReconcileResult {
  */
 export interface DedupeResult extends ReconcileResult {
   /** Active managed busy blocks inspected on each calendar. */
-  inspected: Record<AccountRole, number>;
+  inspected: Record<CalendarKey, number>;
   /** Removed from each calendar — or, in a dry run, that would be. */
-  duplicates: Record<AccountRole, number>;
-  phantoms: Record<AccountRole, number>;
+  duplicates: Record<CalendarKey, number>;
+  phantoms: Record<CalendarKey, number>;
   failed: number;
 }
 
@@ -130,7 +137,7 @@ export interface ReconcileOptions {
    * as a cancelled change; the caller remembers these to tell its own
    * deletions from someone else's.
    */
-  onDestinationDeleted?: (destinationRole: AccountRole, eventId: string) => void;
+  onDestinationDeleted?: (destinationKey: CalendarKey, eventId: string) => void;
 }
 
 export interface ReconcileProgress {
@@ -142,10 +149,15 @@ export interface ReconcileProgress {
   failed: number;
 }
 
-type Clients = Record<AccountRole, CalendarAPI>;
-type EventSets = Record<AccountRole, GoogleCalendarEvent[]>;
-type SourceSets = Record<AccountRole, NormalizedSourceEvent[]>;
+type Clients = Readonly<Record<CalendarKey, CalendarAPI>>;
+type EventSets = Map<CalendarKey, GoogleCalendarEvent[]>;
 type ManagedBlock = GoogleCalendarEvent & { id: string };
+
+/** A source event and the calendar it came from. */
+interface Sourced {
+  calendarKey: CalendarKey;
+  event: NormalizedSourceEvent;
+}
 
 /**
  * One merged busy interval for a destination calendar: the union of every
@@ -155,12 +167,25 @@ type ManagedBlock = GoogleCalendarEvent & { id: string };
  */
 interface BusyBlock {
   time: NormalizedEventTime;
-  sources: NormalizedSourceEvent[];
+  sources: Sourced[];
 }
 
 interface EvaluatedSource {
   source: NormalizedSourceEvent;
   exclusionReason: SourceExclusionScope | "keyword" | undefined;
+}
+
+/** Every calendar read once: raw events, and each calendar's own (native) events. */
+interface Discovery {
+  events: EventSets;
+  natives: Map<CalendarKey, NormalizedSourceEvent[]>;
+  /** Per source calendar, its events with exclusions applied. */
+  evaluated: Map<CalendarKey, EvaluatedSource[]>;
+}
+
+interface DestinationPlan {
+  blocks: Map<string, BusyBlock>;
+  duplicateSuppressed: number;
 }
 
 const EMPTY_RESULT: ReconcileResult = { created: 0, updated: 0, deleted: 0, repaired: 0 };
@@ -243,11 +268,17 @@ export class Reconciler {
     private readonly mappings: MappingStore,
     private readonly clients: Clients,
     private readonly clock: Clock = systemClock,
-  ) {}
+  ) {
+    for (const calendar of config.calendars) {
+      if (clients[calendar.key] === undefined) {
+        throw new Error(`No calendar client for "${calendar.key}"`);
+      }
+    }
+  }
 
   async reconcile(options: ReconcileOptions = {}): Promise<SyncReconcileResult> {
     const now = options.now ?? this.clock.now();
-    const { events, normalized, duplicateKeys } = await this.discover(
+    const discovery = await this.discover(
       calendarWindow(this.config, now),
       options,
       "Planning reconciliation",
@@ -256,33 +287,47 @@ export class Reconciler {
       ...EMPTY_RESULT,
       failed: 0,
       converged: true,
-      mirrors: {
-        personalToWork: emptyMirrorSummary(),
-        workToPersonal: emptyMirrorSummary(),
-      },
+      destinations: {},
+      sources: {},
     };
     const failures: unknown[] = [];
 
-    result.mirrors.personalToWork = await this.reconcileDirection(
-      "personal",
-      events.work,
-      normalized.personal,
-      duplicateKeys,
-      result,
-      options,
-      now,
-      failures,
-    );
-    result.mirrors.workToPersonal = await this.reconcileDirection(
-      "work",
-      events.personal,
-      normalized.work,
-      duplicateKeys,
-      result,
-      options,
-      now,
-      failures,
-    );
+    for (const [sourceKey, evaluated] of discovery.evaluated) {
+      for (const { source, exclusionReason } of evaluated) {
+        options.onSourceEvent?.({
+          sourceKey,
+          ...(source.sourceTitle === undefined ? {} : { sourceTitle: source.sourceTitle }),
+          timeRange: normalizedTimeRange(source),
+          exclusionKeys: sourceExclusionKeys(sourceKey, source),
+          ...(exclusionReason === undefined ? {} : { exclusionReason }),
+          isRecurring: source.isRecurring,
+        });
+      }
+      result.sources[sourceKey] = {
+        excluded: evaluated.filter(({ exclusionReason }) => exclusionReason !== undefined).length,
+      };
+    }
+    for (const calendar of this.config.calendars) {
+      // A calendar that stopped receiving blocks is reconciled against an
+      // empty plan until the blocks it still holds are gone.
+      if (
+        !calendar.destination &&
+        this.mappings.listMappings(calendar.key, this.config.tenantId).length === 0
+      ) {
+        continue;
+      }
+      const summary = await this.reconcileDestination(
+        calendar,
+        discovery,
+        result,
+        options,
+        now,
+        failures,
+      );
+      if (calendar.destination) {
+        result.destinations[calendar.key] = summary;
+      }
+    }
     result.converged = result.failed === 0;
     reportProgress(options, {
       phase: "finalizing",
@@ -300,7 +345,7 @@ export class Reconciler {
 
   async rebuild(options: ReconcileOptions = {}): Promise<ReconcileResult> {
     const now = options.now ?? this.clock.now();
-    const { events, normalized, duplicateKeys } = await this.discover(
+    const discovery = await this.discover(
       calendarWindow(this.config, now),
       options,
       "Planning mapping rebuild",
@@ -312,122 +357,63 @@ export class Reconciler {
         this.mappings.deleteMapping(mapping.mappingKey, this.config.tenantId);
       }
     }
-    for (const destinationRole of roles()) {
-      const sourceRole = opposite(destinationRole);
-      const blocks = this.planDirection(sourceRole, normalized[sourceRole], duplicateKeys).blocks;
-      for (const destination of activeManagedEvents(events[destinationRole])) {
-        const key = managedMappingKey(destination);
+    for (const destination of this.destinations()) {
+      const { blocks } = this.planDestination(destination.key, discovery);
+      for (const event of activeManagedEvents(discovery.events.get(destination.key) ?? [])) {
+        const key = managedMappingKey(event);
         const block = key === undefined ? undefined : blocks.get(key);
-        if (key === undefined || block === undefined || destination.id == null) {
+        if (key === undefined || block === undefined || event.id == null) {
           continue;
         }
         if (!options.dryRun) {
-          this.mappings.putMapping(toMapping(key, sourceRole, destination, now));
+          this.mappings.putMapping(toMapping(key, destination.key, event, now));
         }
-        record(
-          result,
-          "repair",
-          sourceRole,
-          "rebuild-mapping",
-          options,
-          blockTimeRange(block),
-          blockTitles(block),
-        );
+        record(result, "repair", destination.key, "rebuild-mapping", options, {
+          timeRange: blockTimeRange(block),
+          block,
+        });
       }
     }
     return result;
   }
 
   async cleanup(options: ReconcileOptions = {}): Promise<ReconcileResult> {
-    const fetched = { personal: 0, work: 0 };
-    const onListProgress = (role: AccountRole, count: number): void => {
-      fetched[role] = count;
-      reportProgress(options, {
-        phase: "discovering",
-        label: "Finding managed mirrors",
-        completed: fetched.personal + fetched.work,
-        succeeded: 0,
-        failed: 0,
-      });
-    };
-    reportProgress(options, {
-      phase: "discovering",
-      label: "Finding managed mirrors",
-      completed: 0,
-      succeeded: 0,
-      failed: 0,
-    });
-    const [personal, work] = await Promise.all([
-      this.clients.personal.listManagedEvents(
-        this.config.accounts.personal.calendarId,
-        (progress) => {
-          onListProgress("personal", progress.fetched);
-        },
-      ),
-      this.clients.work.listManagedEvents(this.config.accounts.work.calendarId, (progress) => {
-        onListProgress("work", progress.fetched);
-      }),
-    ]);
-    const events = { personal, work };
+    const events = await this.listManaged(options);
     const result = { ...EMPTY_RESULT };
-    const managed = {
-      personal: activeManagedEvents(events.personal).filter((event) => event.id != null),
-      work: activeManagedEvents(events.work).filter((event) => event.id != null),
-    };
-    const total = managed.personal.length + managed.work.length;
+    const managed = [...events].map(
+      ([key, calendarEvents]) => [key, activeManagedEvents(calendarEvents).filter(hasId)] as const,
+    );
+    const total = managed.reduce((sum, [, blocks]) => sum + blocks.length, 0);
     let completed = 0;
     let failed = 0;
-    reportProgress(options, {
-      phase: "applying",
-      label: "Deleting managed mirrors",
-      completed,
-      total,
-      succeeded: result.deleted,
-      failed,
-    });
-    for (const destinationRole of roles()) {
-      for (const event of managed[destinationRole]) {
-        const eventId = event.id;
-        if (eventId == null) {
-          throw new Error("Managed event ID disappeared during cleanup");
-        }
+    const progress = (): void => {
+      reportProgress(options, {
+        phase: "applying",
+        label: "Deleting managed mirrors",
+        completed,
+        total,
+        succeeded: result.deleted,
+        failed,
+      });
+    };
+    progress();
+    for (const [calendarKey, blocks] of managed) {
+      for (const event of blocks) {
         try {
           if (!options.dryRun) {
-            await this.clients[destinationRole].deleteEvent(
-              this.config.accounts[destinationRole].calendarId,
-              eventId,
-            );
+            await this.clients[calendarKey]?.deleteEvent(this.calendarId(calendarKey), event.id);
           }
-          record(
-            result,
-            "delete",
-            opposite(destinationRole),
-            "cleanup-managed-event",
-            options,
-            eventTimeRange(event),
-          );
+          record(result, "delete", calendarKey, "cleanup-managed-event", options, {
+            timeRange: eventTimeRange(event),
+          });
         } catch (error) {
           failed += 1;
           completed += 1;
-          reportProgress(options, {
-            phase: "applying",
-            label: "Deleting managed mirrors",
-            completed,
-            total,
-            succeeded: result.deleted,
-            failed,
-          });
+          progress();
           throw new CleanupPassError(result, failed, error);
         }
         completed += 1;
-        reportProgress(options, {
-          phase: "applying",
-          label: "Deleting managed mirrors",
-          completed,
-          total,
-          succeeded: result.deleted,
-          failed,
-        });
+        progress();
       }
     }
     if (!options.dryRun) {
@@ -456,11 +442,12 @@ export class Reconciler {
    * per key; every other managed block goes, including any that sits outside
    * the sync window, which the sync pass would never mirror and already
    * deletes when it can see it. Real events are never candidates, only
-   * calsync's own blocks.
+   * calsync's own blocks. A calendar that no longer receives blocks keeps
+   * none: every managed block on it is a phantom.
    */
   async dedupe(options: ReconcileOptions = {}): Promise<DedupeResult> {
     const now = options.now ?? this.clock.now();
-    const { events, normalized, duplicateKeys } = await this.discover(
+    const discovery = await this.discover(
       calendarWindow(this.config, now),
       options,
       "Planning stray-block cleanup",
@@ -468,37 +455,36 @@ export class Reconciler {
     const managed = await this.listManaged(options);
     const result: DedupeResult = {
       ...EMPTY_RESULT,
-      inspected: { personal: 0, work: 0 },
-      duplicates: { personal: 0, work: 0 },
-      phantoms: { personal: 0, work: 0 },
+      inspected: {},
+      duplicates: {},
+      phantoms: {},
       failed: 0,
     };
     const removals: {
-      destinationRole: AccountRole;
+      calendarKey: CalendarKey;
       block: ManagedBlock;
       kind: StrayBlockKind;
       mappingKey?: string;
     }[] = [];
-    for (const destinationRole of roles()) {
-      const sourceRole = opposite(destinationRole);
-      const { blocks: desired } = this.planDirection(
-        sourceRole,
-        normalized[sourceRole],
-        duplicateKeys,
-      );
+    for (const calendar of this.config.calendars) {
+      const desired = calendar.destination
+        ? this.planDestination(calendar.key, discovery).blocks
+        : new Map<string, BusyBlock>();
       const mappedIds = new Map(
         this.mappings
-          .listMappings(sourceRole, this.config.tenantId)
+          .listMappings(calendar.key, this.config.tenantId)
           .map((mapping) => [mapping.destinationEventId, mapping.mappingKey]),
       );
-      const blocks = activeManagedEvents(events[destinationRole]).filter(hasId);
+      const blocks = activeManagedEvents(discovery.events.get(calendar.key) ?? []).filter(hasId);
       const inWindow = new Set(blocks.map((block) => block.id));
       // Managed blocks the window read did not return lie outside it: nothing
       // there can be desired, so every one of them is a phantom.
-      const outside = activeManagedEvents(managed[destinationRole])
+      const outside = activeManagedEvents(managed.get(calendar.key) ?? [])
         .filter(hasId)
         .filter((block) => !inWindow.has(block.id));
-      result.inspected[destinationRole] = blocks.length + outside.length;
+      result.inspected[calendar.key] = blocks.length + outside.length;
+      result.duplicates[calendar.key] = 0;
+      result.phantoms[calendar.key] = 0;
       const strays = [
         ...[...groupByTimeRange(blocks).values()].flatMap((group) =>
           strayBlocks(group, desired, mappedIds),
@@ -508,7 +494,7 @@ export class Reconciler {
       for (const { block, kind } of strays) {
         const mappingKey = mappedIds.get(block.id);
         removals.push({
-          destinationRole,
+          calendarKey: calendar.key,
           block,
           kind,
           ...(mappingKey === undefined ? {} : { mappingKey }),
@@ -544,23 +530,24 @@ export class Reconciler {
       },
     );
     await forEachConcurrently(removals, DELETE_CONCURRENCY, async (removal) => {
-      const { destinationRole, block, kind, mappingKey } = removal;
+      const { calendarKey, block, kind, mappingKey } = removal;
       // A dry run deletes nothing, so it has nothing to pace.
       const deleted =
         options.dryRun === true ||
-        (await this.deleteWithBackoff(destinationRole, block.id, pacer, result, failures));
+        (await this.deleteWithBackoff(calendarKey, block.id, pacer, result, failures));
       if (deleted) {
         if (options.dryRun !== true && mappingKey !== undefined) {
           this.mappings.deleteMapping(mappingKey, this.config.tenantId);
         }
-        result[kind === "duplicate" ? "duplicates" : "phantoms"][destinationRole] += 1;
+        const counts = kind === "duplicate" ? result.duplicates : result.phantoms;
+        counts[calendarKey] = (counts[calendarKey] ?? 0) + 1;
         record(
           result,
           "delete",
-          opposite(destinationRole),
+          calendarKey,
           kind === "duplicate" ? "duplicate-busy-block" : "phantom-busy-block",
           options,
-          eventTimeRange(block),
+          { timeRange: eventTimeRange(block) },
         );
       }
       completed += 1;
@@ -586,7 +573,7 @@ export class Reconciler {
    * running out of tries, counts as a failure the caller reports at the end.
    */
   private async deleteWithBackoff(
-    role: AccountRole,
+    calendarKey: CalendarKey,
     eventId: string,
     pacer: DeletePacer,
     result: { failed: number },
@@ -595,7 +582,7 @@ export class Reconciler {
     for (let attempt = 1; ; attempt += 1) {
       const startedAt = await pacer.turn();
       try {
-        await this.clients[role].deleteEvent(this.config.accounts[role].calendarId, eventId);
+        await this.client(calendarKey).deleteEvent(this.calendarId(calendarKey), eventId);
         return true;
       } catch (error) {
         if (attempt >= MAX_DELETE_ATTEMPTS || !isRetryableGoogleError(error)) {
@@ -608,40 +595,46 @@ export class Reconciler {
     }
   }
 
-  /** Every managed block on both calendars, whatever its date. */
-  private async listManaged(options: ReconcileOptions): Promise<EventSets> {
-    const fetched = { personal: 0, work: 0 };
-    const update = (role: AccountRole, count: number): void => {
-      fetched[role] = count;
-      reportProgress(options, {
-        phase: "discovering",
-        label: "Finding managed mirrors",
-        completed: fetched.personal + fetched.work,
-        succeeded: 0,
-        failed: 0,
-      });
-    };
-    const [personal, work] = await Promise.all(
-      roles().map((role) =>
-        this.clients[role].listManagedEvents(this.config.accounts[role].calendarId, (progress) => {
-          update(role, progress.fetched);
-        }),
-      ),
-    );
-    if (personal === undefined || work === undefined) {
-      throw new Error("Managed event listing returned no result");
-    }
-    return { personal, work };
+  private destinations(): CalendarConfig[] {
+    return this.config.calendars.filter((calendar) => calendar.destination);
   }
 
-  /** Reads both calendars and separates source events from our own mirrors. */
+  private client(key: CalendarKey): CalendarAPI {
+    const client = this.clients[key];
+    if (client === undefined) {
+      throw new Error(`No calendar client for "${key}"`);
+    }
+    return client;
+  }
+
+  private calendarId(key: CalendarKey): string {
+    const calendar = this.config.calendars.find((candidate) => candidate.key === key);
+    if (calendar === undefined) {
+      throw new Error(`Unknown calendar "${key}"`);
+    }
+    return calendar.calendarId;
+  }
+
+  /** Every managed block on every calendar, whatever its date. */
+  private async listManaged(options: ReconcileOptions): Promise<EventSets> {
+    return this.readAll(options, "Finding managed mirrors", (calendar, onProgress) =>
+      this.client(calendar.key).listManagedEvents(calendar.calendarId, onProgress),
+    );
+  }
+
+  /**
+   * Reads every calendar once and separates each one's own events from the
+   * blocks calsync wrote to it, then applies each source's exclusions.
+   */
   private async discover(
     window: CalendarWindow,
     options: ReconcileOptions,
     label: string,
-  ): Promise<{ events: EventSets; normalized: SourceSets; duplicateKeys: Set<string> }> {
-    const events = await this.listBoth(window, options);
-    const discovered = events.personal.length + events.work.length;
+  ): Promise<Discovery> {
+    const events = await this.readAll(options, "Reading calendar events", (calendar, onProgress) =>
+      this.client(calendar.key).listEvents(calendar.calendarId, window, onProgress),
+    );
+    const discovered = [...events.values()].reduce((sum, list) => sum + list.length, 0);
     reportProgress(options, {
       phase: "planning",
       label,
@@ -650,45 +643,36 @@ export class Reconciler {
       succeeded: 0,
       failed: 0,
     });
-    const knownDestinationIds = {
-      personal: new Set(
-        this.mappings.listMappings("work").map((mapping) => mapping.destinationEventId),
-      ),
-      work: new Set(
-        this.mappings.listMappings("personal").map((mapping) => mapping.destinationEventId),
-      ),
-    };
-    const normalized: SourceSets = {
-      personal: normalizeSourceEvents(
-        events.personal.filter(
-          (event) => event.id == null || !knownDestinationIds.personal.has(event.id),
+    const natives = new Map<CalendarKey, NormalizedSourceEvent[]>();
+    const evaluated = new Map<CalendarKey, EvaluatedSource[]>();
+    for (const calendar of this.config.calendars) {
+      const knownBlockIds = new Set(
+        this.mappings
+          .listMappings(calendar.key, this.config.tenantId)
+          .map((mapping) => mapping.destinationEventId),
+      );
+      const own = normalizeSourceEvents(
+        (events.get(calendar.key) ?? []).filter(
+          (event) => event.id == null || !knownBlockIds.has(event.id),
         ),
-      ),
-      work: normalizeSourceEvents(
-        events.work.filter((event) => event.id == null || !knownDestinationIds.work.has(event.id)),
-      ),
-    };
-    return {
-      events,
-      normalized,
-      duplicateKeys: intersectDuplicateKeys(normalized.personal, normalized.work),
-    };
+      );
+      natives.set(calendar.key, own);
+      if (calendar.source) {
+        evaluated.set(calendar.key, this.evaluateSource(calendar.key, own));
+      }
+    }
+    return { events, natives, evaluated };
   }
 
-  /** Applies exclusions and duplicate suppression: which sources want a mirror. */
-  private evaluateDirection(
-    sourceRole: AccountRole,
+  /** Applies one source calendar's exclusions to its events. */
+  private evaluateSource(
+    sourceKey: CalendarKey,
     sourceEvents: readonly NormalizedSourceEvent[],
-    duplicateKeys: ReadonlySet<string>,
-  ): { evaluatedSources: EvaluatedSource[]; desired: NormalizedSourceEvent[] } {
-    const exclusions = this.config.exclusions;
-    const keys = sourceRole === "personal" ? exclusions.personalToWork : exclusions.workToPersonal;
-    const keywords =
-      sourceRole === "personal"
-        ? exclusions.personalToWorkKeywords
-        : exclusions.workToPersonalKeywords;
-    const evaluatedSources = sourceEvents.map((source): EvaluatedSource => {
-      const keyExclusion = matchingSourceExclusion(keys, sourceRole, source);
+  ): EvaluatedSource[] {
+    const keys = this.config.exclusions.keys[sourceKey] ?? [];
+    const keywords = this.config.exclusions.keywords[sourceKey] ?? [];
+    return sourceEvents.map((source): EvaluatedSource => {
+      const keyExclusion = matchingSourceExclusion(keys, sourceKey, source);
       return {
         source,
         exclusionReason:
@@ -698,131 +682,112 @@ export class Reconciler {
             : undefined),
       };
     });
-    const desired = evaluatedSources
-      .filter(
-        ({ source, exclusionReason }) =>
-          exclusionReason === undefined &&
-          (source.duplicateMatchKey === undefined || !duplicateKeys.has(source.duplicateMatchKey)),
-      )
-      .map(({ source }) => source);
-    return { evaluatedSources, desired };
   }
 
   /**
-   * The busy blocks one destination should hold: desired sources merged into
-   * disjoint intervals. The destination's own events never suppress a block,
-   * even one they cover in full: the block says another calendar is busy too.
+   * The busy blocks one destination should hold: every other source
+   * calendar's desired events, merged into disjoint intervals. An event whose
+   * meeting is already on the destination is left out: that is one
+   * commitment, not two. The destination's other events never suppress a
+   * block, even one they cover in full: the block says another calendar is
+   * busy too.
    */
-  private planDirection(
-    sourceRole: AccountRole,
-    sourceEvents: readonly NormalizedSourceEvent[],
-    duplicateKeys: ReadonlySet<string>,
-  ): { evaluatedSources: EvaluatedSource[]; blocks: Map<string, BusyBlock> } {
-    const { evaluatedSources, desired } = this.evaluateDirection(
-      sourceRole,
-      sourceEvents,
-      duplicateKeys,
+  private planDestination(destinationKey: CalendarKey, discovery: Discovery): DestinationPlan {
+    const nativeMeetings = new Set(
+      (discovery.natives.get(destinationKey) ?? []).flatMap(
+        (event) => event.duplicateMatchKey ?? [],
+      ),
     );
-    const destinationRole = opposite(sourceRole);
+    const desired: Sourced[] = [];
+    let duplicateSuppressed = 0;
+    for (const [sourceKey, evaluated] of discovery.evaluated) {
+      if (sourceKey === destinationKey) {
+        continue;
+      }
+      for (const { source, exclusionReason } of evaluated) {
+        if (exclusionReason !== undefined) {
+          continue;
+        }
+        if (
+          source.duplicateMatchKey !== undefined &&
+          nativeMeetings.has(source.duplicateMatchKey)
+        ) {
+          duplicateSuppressed += 1;
+          continue;
+        }
+        desired.push({ calendarKey: sourceKey, event: source });
+      }
+    }
     const blocks = new Map(
       mergeBusyBlocks(desired).map((block) => [
-        busyBlockKey(destinationRole, block.time, this.config.tenantId),
+        busyBlockKey(destinationKey, block.time, this.config.tenantId),
         block,
       ]),
     );
-    return { evaluatedSources, blocks };
+    return { blocks, duplicateSuppressed };
   }
 
-  private async listBoth(window: CalendarWindow, options: ReconcileOptions): Promise<EventSets> {
-    const fetched = { personal: 0, work: 0 };
-    const update = (role: AccountRole, count: number): void => {
-      fetched[role] = count;
+  /** Runs one read per calendar concurrently, reporting the running total. */
+  private async readAll(
+    options: ReconcileOptions,
+    label: string,
+    read: (
+      calendar: CalendarConfig,
+      onProgress: (progress: { fetched: number }) => void,
+    ) => Promise<GoogleCalendarEvent[]>,
+  ): Promise<EventSets> {
+    const fetched = new Map<CalendarKey, number>();
+    const report = (total?: number): void => {
       reportProgress(options, {
         phase: "discovering",
-        label: "Reading calendar events",
-        completed: fetched.personal + fetched.work,
+        label,
+        completed: [...fetched.values()].reduce((sum, count) => sum + count, 0),
+        ...(total === undefined ? {} : { total }),
         succeeded: 0,
         failed: 0,
       });
     };
-    reportProgress(options, {
-      phase: "discovering",
-      label: "Reading calendar events",
-      completed: 0,
-      succeeded: 0,
-      failed: 0,
-    });
-    const personal = this.clients.personal.listEvents(
-      this.config.accounts.personal.calendarId,
-      window,
-      (progress) => {
-        update("personal", progress.fetched);
-      },
+    report();
+    const lists = await Promise.all(
+      this.config.calendars.map(async (calendar) => {
+        const events = await read(calendar, (progress) => {
+          fetched.set(calendar.key, progress.fetched);
+          report();
+        });
+        return [calendar.key, events] as const;
+      }),
     );
-    const work = this.clients.work.listEvents(
-      this.config.accounts.work.calendarId,
-      window,
-      (progress) => {
-        update("work", progress.fetched);
-      },
-    );
-    await Promise.all([personal, work]);
-    const events = { personal: await personal, work: await work };
-    const total = events.personal.length + events.work.length;
-    reportProgress(options, {
-      phase: "discovering",
-      label: "Reading calendar events",
-      completed: total,
-      total,
-      succeeded: 0,
-      failed: 0,
-    });
+    const events: EventSets = new Map(lists);
+    for (const [key, list] of events) {
+      fetched.set(key, list.length);
+    }
+    report([...fetched.values()].reduce((sum, count) => sum + count, 0));
     return events;
   }
 
-  private async reconcileDirection(
-    sourceRole: AccountRole,
-    destinationEvents: readonly GoogleCalendarEvent[],
-    sourceEvents: readonly NormalizedSourceEvent[],
-    duplicateKeys: ReadonlySet<string>,
+  private async reconcileDestination(
+    destinationCalendar: CalendarConfig,
+    discovery: Discovery,
     result: SyncReconcileResult,
     options: ReconcileOptions,
     now: Date,
     failures: unknown[],
-  ): Promise<MirrorDirectionSummary> {
-    const destinationRole = opposite(sourceRole);
-    const destinationCalendarId = this.config.accounts[destinationRole].calendarId;
-    const { evaluatedSources, blocks } = this.planDirection(
-      sourceRole,
-      sourceEvents,
-      duplicateKeys,
-    );
-    for (const { source, exclusionReason } of evaluatedSources) {
-      options.onSourceEvent?.({
-        sourceRole,
-        destinationRole,
-        ...(source.sourceTitle === undefined ? {} : { sourceTitle: source.sourceTitle }),
-        timeRange: normalizedTimeRange(source),
-        exclusionKeys: sourceExclusionKeys(sourceRole, source),
-        ...(exclusionReason === undefined ? {} : { exclusionReason }),
-        isRecurring: source.isRecurring,
-      });
-    }
-    const summary: MirrorDirectionSummary = {
+  ): Promise<DestinationSummary> {
+    const destinationKey = destinationCalendar.key;
+    const destinationCalendarId = destinationCalendar.calendarId;
+    const client = this.client(destinationKey);
+    const destinationEvents = discovery.events.get(destinationKey) ?? [];
+    const { blocks, duplicateSuppressed } = destinationCalendar.destination
+      ? this.planDestination(destinationKey, discovery)
+      : { blocks: new Map<string, BusyBlock>(), duplicateSuppressed: 0 };
+    const summary: DestinationSummary = {
       active: options.dryRun === true ? blocks.size : 0,
-      excluded: evaluatedSources.filter(({ exclusionReason }) => exclusionReason !== undefined)
-        .length,
-      duplicateSuppressed: evaluatedSources.filter(
-        ({ source, exclusionReason }) =>
-          exclusionReason === undefined &&
-          source.duplicateMatchKey !== undefined &&
-          duplicateKeys.has(source.duplicateMatchKey),
-      ).length,
+      duplicateSuppressed,
     };
     const managedByKey = indexManagedEvents(destinationEvents);
     const mappings = new Map(
       this.mappings
-        .listMappings(sourceRole, this.config.tenantId)
+        .listMappings(destinationKey, this.config.tenantId)
         .map((mapping) => [mapping.mappingKey, mapping]),
     );
     const total = blocks.size + [...mappings.keys()].filter((key) => !blocks.has(key)).length;
@@ -832,7 +797,7 @@ export class Reconciler {
     const progress = (): void => {
       reportProgress(options, {
         phase: "applying",
-        label: `Applying ${sourceRole} → ${destinationRole}`,
+        label: `Applying busy blocks to ${destinationKey}`,
         completed,
         total,
         succeeded,
@@ -862,11 +827,7 @@ export class Reconciler {
       if (
         options.dryRun !== true &&
         !(await attemptOperation(
-          () =>
-            this.clients[destinationRole].deleteEvent(
-              destinationCalendarId,
-              mapping.destinationEventId,
-            ),
+          () => client.deleteEvent(destinationCalendarId, mapping.destinationEventId),
           result,
           failures,
         ))
@@ -875,16 +836,11 @@ export class Reconciler {
         continue;
       }
       if (options.dryRun !== true) {
-        options.onDestinationDeleted?.(destinationRole, mapping.destinationEventId);
+        options.onDestinationDeleted?.(destinationKey, mapping.destinationEventId);
       }
-      record(
-        result,
-        "delete",
-        sourceRole,
-        "source-no-longer-desired",
-        options,
-        destination === undefined ? undefined : eventTimeRange(destination),
-      );
+      record(result, "delete", destinationKey, "source-no-longer-desired", options, {
+        timeRange: destination === undefined ? undefined : eventTimeRange(destination),
+      });
       if (options.dryRun !== true) {
         this.mappings.deleteMapping(mapping.mappingKey, this.config.tenantId);
       }
@@ -924,7 +880,7 @@ export class Reconciler {
         if (
           options.dryRun !== true &&
           !(await attemptOperation(
-            () => this.clients[destinationRole].deleteEvent(destinationCalendarId, extraId),
+            () => client.deleteEvent(destinationCalendarId, extraId),
             result,
             failures,
           ))
@@ -933,17 +889,12 @@ export class Reconciler {
           continue;
         }
         if (options.dryRun !== true) {
-          options.onDestinationDeleted?.(destinationRole, extraId);
+          options.onDestinationDeleted?.(destinationKey, extraId);
         }
-        record(
-          result,
-          "delete",
-          sourceRole,
-          "duplicate-destination",
-          options,
-          eventTimeRange(extra),
-          blockTitles(block),
-        );
+        record(result, "delete", destinationKey, "duplicate-destination", options, {
+          timeRange: eventTimeRange(extra),
+          block,
+        });
       }
 
       if (
@@ -963,7 +914,6 @@ export class Reconciler {
           options.dryRun !== true &&
           !(await attemptOperation(
             async () => {
-              const client = this.clients[destinationRole];
               inserted = await client.insertEvent(destinationCalendarId, insert);
               // A slot that comes back reuses its interval key, and the ID it
               // derives may belong to a block deleted earlier. Google keeps
@@ -993,15 +943,10 @@ export class Reconciler {
         if (options.dryRun !== true) {
           summary.active += 1;
         }
-        record(
-          result,
-          "create",
-          sourceRole,
-          reason,
-          options,
-          blockTimeRange(block),
-          blockTitles(block),
-        );
+        record(result, "create", destinationKey, reason, options, {
+          timeRange: blockTimeRange(block),
+          block,
+        });
       } else if (!matchesManagedProjection(destination, projectBusyEvent(block, key))) {
         const destinationId = destination.id;
         const destinationEtag = destination.etag;
@@ -1010,7 +955,7 @@ export class Reconciler {
           options.dryRun !== true &&
           !(await attemptOperation(
             async () => {
-              patched = await this.clients[destinationRole].patchEvent(
+              patched = await client.patchEvent(
                 destinationCalendarId,
                 destinationId,
                 projectBusyEvent(block, key),
@@ -1024,47 +969,25 @@ export class Reconciler {
           continue;
         }
         destination = { ...destination, ...(patched ?? {}) };
-        record(
-          result,
-          "update",
-          sourceRole,
-          "destination-drifted",
-          options,
-          blockTimeRange(block),
-          blockTitles(block),
-        );
+        record(result, "update", destinationKey, "destination-drifted", options, {
+          timeRange: blockTimeRange(block),
+          block,
+        });
       }
 
       if (options.dryRun !== true) {
-        this.mappings.putMapping(toMapping(key, sourceRole, destination, now));
+        this.mappings.putMapping(toMapping(key, destinationKey, destination, now));
       }
       if (adoptedExisting) {
-        record(
-          result,
-          "repair",
-          sourceRole,
-          "mapping-missing",
-          options,
-          blockTimeRange(block),
-          blockTitles(block),
-        );
+        record(result, "repair", destinationKey, "mapping-missing", options, {
+          timeRange: blockTimeRange(block),
+          block,
+        });
       }
       finishItem(failuresBefore, operationsBefore);
     }
     return summary;
   }
-}
-
-export function mappingKey(
-  role: AccountRole,
-  source: NormalizedSourceEvent,
-  tenantId?: string,
-): string {
-  // Keys are embedded in managed Google event ids and extended properties, so
-  // the default tenant must keep the pre-tenant format: changing it would
-  // orphan every mirrored event on an existing deployment.
-  const scope = tenantId === undefined || tenantId === "default" ? "" : `${tenantId}\0`;
-  return createHash("sha256").update(`${scope}${role}\0${source.occurrenceKey}`).digest("hex");
 }
 
 /**
@@ -1073,15 +996,13 @@ export function mappingKey(
  * the slot is the identity, and source event IDs never reach the destination.
  */
 export function busyBlockKey(
-  destinationRole: AccountRole,
+  destinationKey: CalendarKey,
   time: NormalizedEventTime,
   tenantId?: string,
 ): string {
   const { start, end } = timeBounds(time);
   return createHash("sha256")
-    .update(
-      `block:v2\0${tenantId ?? "default"}\0${destinationRole}\0${time.kind}\0${start}\0${end}`,
-    )
+    .update(`block:v2\0${tenantId ?? "default"}\0${destinationKey}\0${time.kind}\0${start}\0${end}`)
     .digest("hex");
 }
 
@@ -1091,18 +1012,6 @@ export function calendarWindow(config: SyncConfig, now: Date): CalendarWindow {
     timeMax: new Date(now.getTime() + config.window.futureDays * 86_400_000).toISOString(),
     timeZone: config.timezone,
   };
-}
-
-function roles(): readonly AccountRole[] {
-  return accountRoles;
-}
-
-function opposite(role: AccountRole): AccountRole {
-  return role === "personal" ? "work" : "personal";
-}
-
-function emptyMirrorSummary(): MirrorDirectionSummary {
-  return { active: 0, excluded: 0, duplicateSuppressed: 0 };
 }
 
 async function attemptOperation(
@@ -1257,7 +1166,7 @@ function groupByTimeRange(blocks: readonly ManagedBlock[]): Map<string, ManagedB
  */
 function strayBlocks(
   group: readonly ManagedBlock[],
-  desired: ReadonlyMap<string, unknown>,
+  desired: ReadonlyMap<string, BusyBlock>,
   mappedIds: ReadonlyMap<string, string>,
 ): { block: ManagedBlock; kind: StrayBlockKind }[] {
   const ranked = [...group].sort(
@@ -1285,27 +1194,27 @@ function strayBlocks(
  * against. A timed value without an offset cannot be placed on the timeline,
  * so it stays a block of its own.
  */
-function mergeBusyBlocks(sources: readonly NormalizedSourceEvent[]): BusyBlock[] {
+function mergeBusyBlocks(sources: readonly Sourced[]): BusyBlock[] {
   const intervals: {
     kind: NormalizedEventTime["kind"];
     start: number;
     end: number;
-    source: NormalizedSourceEvent;
+    source: Sourced;
   }[] = [];
   const unplaced: BusyBlock[] = [];
   for (const source of sources) {
-    const bounds = instantBounds(source.time);
+    const bounds = instantBounds(source.event.time);
     if (bounds === undefined) {
-      unplaced.push({ time: source.time, sources: [source] });
+      unplaced.push({ time: source.event.time, sources: [source] });
     } else {
-      intervals.push({ kind: source.time.kind, ...bounds, source });
+      intervals.push({ kind: source.event.time.kind, ...bounds, source });
     }
   }
   intervals.sort((left, right) => left.start - right.start || left.end - right.end);
 
   const merged: BusyBlock[] = [];
   for (const kind of ["timed", "all-day"] as const) {
-    let current: { start: number; end: number; sources: NormalizedSourceEvent[] } | undefined;
+    let current: { start: number; end: number; sources: Sourced[] } | undefined;
     for (const interval of intervals.filter((candidate) => candidate.kind === kind)) {
       if (current !== undefined && interval.start <= current.end) {
         current.end = Math.max(current.end, interval.end);
@@ -1326,7 +1235,7 @@ function mergeBusyBlocks(sources: readonly NormalizedSourceEvent[]): BusyBlock[]
 
 function blockFromInstants(
   kind: NormalizedEventTime["kind"],
-  interval: { start: number; end: number; sources: NormalizedSourceEvent[] },
+  interval: { start: number; end: number; sources: Sourced[] },
 ): BusyBlock {
   const time: NormalizedEventTime =
     kind === "all-day"
@@ -1375,39 +1284,27 @@ function blockTimeRange(block: BusyBlock): ReconcileTimeRange {
 
 /** Every titled source merged into the block, for private dry-run detail. */
 function blockTitles(block: BusyBlock): string[] {
-  return block.sources.flatMap((source) =>
-    source.sourceTitle === undefined ? [] : [source.sourceTitle],
+  return block.sources.flatMap(({ event }) =>
+    event.sourceTitle === undefined ? [] : [event.sourceTitle],
   );
 }
 
-function intersectDuplicateKeys(
-  personal: readonly NormalizedSourceEvent[],
-  work: readonly NormalizedSourceEvent[],
-): Set<string> {
-  const personalKeys = new Set(personal.flatMap((event) => event.duplicateMatchKey ?? []));
-  return new Set(
-    work
-      .map((event) => event.duplicateMatchKey)
-      .filter((key): key is string => key !== undefined && personalKeys.has(key)),
-  );
+/** The calendars whose events merged into the block, each once, in order of first appearance. */
+function blockSourceKeys(block: BusyBlock): CalendarKey[] {
+  return [...new Set(block.sources.map(({ calendarKey }) => calendarKey))];
 }
 
-/**
- * A block has no single source, so the mapping's source columns carry the
- * opaque block key: the store keeps no source event identifiers at all.
- */
+/** A block has no single source, so the store keeps no source event identifiers at all. */
 function toMapping(
   key: string,
-  sourceRole: AccountRole,
+  destinationKey: CalendarKey,
   destination: GoogleCalendarEvent,
   now: Date,
 ): EventMapping {
   return {
     mappingKey: key,
-    sourceRole,
-    sourceEventId: key,
+    destinationKey,
     destinationEventId: destination.id ?? managedGoogleEventId(key),
-    sourceEtag: null,
     destinationEtag: destination.etag ?? null,
     updatedAt: now.toISOString(),
   };
@@ -1416,22 +1313,22 @@ function toMapping(
 function record(
   result: ReconcileResult,
   operation: ReconcileOperation,
-  sourceRole: AccountRole,
+  destinationKey: CalendarKey,
   reason: ReconcileReason,
   options: ReconcileOptions,
-  timeRange?: ReconcileTimeRange,
-  sourceTitles: readonly string[] = [],
+  detail: { timeRange?: ReconcileTimeRange | undefined; block?: BusyBlock } = {},
 ): void {
   const field = `${operation}${operation === "repair" ? "ed" : "d"}` as
     "created" | "updated" | "deleted" | "repaired";
   result[field] += 1;
+  const titles = detail.block === undefined ? [] : blockTitles(detail.block);
   options.log?.({
     operation,
-    sourceRole,
-    destinationRole: opposite(sourceRole),
+    destinationKey,
+    ...(detail.block === undefined ? {} : { sourceKeys: blockSourceKeys(detail.block) }),
     reason,
-    ...(timeRange === undefined ? {} : { timeRange }),
-    ...(sourceTitles.length === 0 ? {} : { sourceTitles: [...sourceTitles] }),
+    ...(detail.timeRange === undefined ? {} : { timeRange: detail.timeRange }),
+    ...(titles.length === 0 ? {} : { sourceTitles: titles }),
     dryRun: options.dryRun ?? false,
   });
 }

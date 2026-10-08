@@ -15,8 +15,8 @@ import {
 import { systemClock } from "./clock.js";
 import { isInvalidSyncTokenError } from "./errors.js";
 import type {
-  AccountRole,
   CalendarAPI,
+  CalendarKey,
   CalendarChangeSet,
   Clock,
   EventMapping,
@@ -26,7 +26,6 @@ import type {
   SyncConfig,
   SyncStateStore,
 } from "./types.js";
-import { accountRoles } from "./types.js";
 
 export interface SyncRunOptions {
   dryRun?: boolean;
@@ -57,7 +56,7 @@ export type SyncStatus =
     }
   | {
       event: "invalid_sync_token";
-      role: AccountRole;
+      calendarKey: CalendarKey;
     };
 
 const CONFIG_FINGERPRINT_KEY = "incremental:configuration-fingerprint";
@@ -73,7 +72,7 @@ export class SyncEngine {
     private readonly mappings: MappingStore,
     private readonly syncState: SyncStateStore,
     private readonly exclusions: ExclusionSource,
-    private readonly clients: Record<AccountRole, CalendarAPI>,
+    private readonly clients: Readonly<Record<CalendarKey, CalendarAPI>>,
     private readonly clock: Clock = systemClock,
   ) {}
 
@@ -91,7 +90,7 @@ export class SyncEngine {
     }
 
     const clients = this.clients;
-    if (!supportsIncremental(clients)) {
+    if (!supportsIncremental(config, clients)) {
       emitStatus(options, {
         event: "full_sync",
         reason: "incremental-unavailable",
@@ -109,24 +108,28 @@ export class SyncEngine {
       reason = "initial";
     } else if (previousFingerprint !== fingerprint) {
       reason = "configuration-changed";
-      clearSyncTokens(this.syncState, this.config.tenantId);
+      clearSyncTokens(this.syncState, config, this.config.tenantId);
     } else if (fullSyncDue(this.syncState, config, now)) {
       reason = "scheduled";
     }
 
-    const pendingTokens: Partial<Record<AccountRole, string>> = {};
-    const ownDeletions = readOwnDeletions(this.syncState, this.config.tenantId);
-    // changesRequireFull matches managed events against mappings sourced from
-    // the opposite calendar, so it needs the tenant's full mapping list.
-    const tenantMappings = this.mappings.listMappings(undefined, this.config.tenantId);
+    const pendingTokens: Record<CalendarKey, string> = {};
+    const ownDeletions = readOwnDeletions(this.syncState, config, this.config.tenantId);
     let relevantChange = false;
-    for (const role of accountRoles) {
-      const poll = await this.pollChanges(role, clients[role], options);
-      pendingTokens[role] = poll.changes.nextSyncToken;
+    for (const calendar of config.calendars) {
+      const client = clients[calendar.key];
+      if (client === undefined) {
+        throw new Error(`No calendar client for "${calendar.key}"`);
+      }
+      const poll = await this.pollChanges(calendar.key, calendar.calendarId, client, options);
+      pendingTokens[calendar.key] = poll.changes.nextSyncToken;
       if (poll.invalidToken) {
         reason = "invalid-token";
       }
-      if (changesRequireFull(role, poll.changes.events, tenantMappings, ownDeletions[role])) {
+      const blocks = this.mappings.listMappings(calendar.key, this.config.tenantId);
+      if (
+        changesRequireFull(poll.changes.events, blocks, ownDeletions.get(calendar.key) ?? new Set())
+      ) {
         relevantChange = true;
       }
     }
@@ -138,18 +141,19 @@ export class SyncEngine {
       // This poll consumed the echoes of the last pass's deletions.
       persistIncrementalState(
         this.syncState,
+        config,
         pendingTokens,
         fingerprint,
         undefined,
         now,
         this.config.tenantId,
-        noDeletions(),
+        {},
       );
       emitStatus(options, {
         event: "incremental_noop",
         nextFullAt: nextFullAt(this.syncState, config, now),
       });
-      return storedSyncResult(this.syncState, this.mappings, this.config.tenantId);
+      return storedSyncResult(this.syncState, this.mappings, config);
     }
 
     emitStatus(options, {
@@ -157,16 +161,17 @@ export class SyncEngine {
       reason,
       nextFullAt: new Date(now.getTime() + fullSyncInterval(config)).toISOString(),
     });
-    const deleted = noDeletions();
+    const deleted: Record<CalendarKey, string[]> = {};
     const result = await reconciler.reconcile({
       ...this.reconcileOptions(options),
       now,
-      onDestinationDeleted: (role, eventId) => {
-        deleted[role].push(eventId);
+      onDestinationDeleted: (calendarKey, eventId) => {
+        (deleted[calendarKey] ??= []).push(eventId);
       },
     });
     persistIncrementalState(
       this.syncState,
+      config,
       pendingTokens,
       fingerprint,
       result,
@@ -194,12 +199,13 @@ export class SyncEngine {
   }
 
   private async pollChanges(
-    role: AccountRole,
+    calendarKey: CalendarKey,
+    calendarId: string,
     client: IncrementalCalendarAPI,
     options: SyncRunOptions,
   ): Promise<{ changes: CalendarChangeSet; invalidToken: boolean }> {
-    const calendarId = this.effectiveConfig().accounts[role].calendarId;
-    const token = this.syncState.getState(syncTokenKey(role, this.config.tenantId)) ?? undefined;
+    const tokenKey = syncTokenKey(calendarKey, this.config.tenantId);
+    const token = this.syncState.getState(tokenKey) ?? undefined;
     try {
       return {
         changes: await client.listChanges(
@@ -212,8 +218,8 @@ export class SyncEngine {
       if (token === undefined || !isInvalidSyncTokenError(error)) {
         throw error;
       }
-      this.syncState.deleteState(syncTokenKey(role, this.config.tenantId));
-      emitStatus(options, { event: "invalid_sync_token", role });
+      this.syncState.deleteState(tokenKey);
+      emitStatus(options, { event: "invalid_sync_token", calendarKey });
       return {
         changes: await client.listChanges(calendarId),
         invalidToken: true,
@@ -247,18 +253,20 @@ export function stateKey(key: string, tenantId?: string): string {
   return tenantId === undefined || tenantId === "default" ? key : `tenant:${tenantId}:${key}`;
 }
 
-function syncTokenKey(role: AccountRole, tenantId: string): string {
-  return stateKey(`incremental:sync-token:${role}`, tenantId);
+/**
+ * Every sync_state key the engine keeps for one calendar, for a caller that
+ * forgets the calendar.
+ */
+export function calendarStateKeys(calendarKey: CalendarKey, tenantId: string): string[] {
+  return [syncTokenKey(calendarKey, tenantId), ownDeletionsKey(calendarKey, tenantId)];
 }
 
-function ownDeletionsKey(role: AccountRole, tenantId: string): string {
-  return stateKey(`incremental:own-deletions:${role}`, tenantId);
+function syncTokenKey(calendarKey: CalendarKey, tenantId: string): string {
+  return stateKey(`incremental:sync-token:${calendarKey}`, tenantId);
 }
 
-type OwnDeletions = Record<AccountRole, string[]>;
-
-function noDeletions(): OwnDeletions {
-  return { personal: [], work: [] };
+function ownDeletionsKey(calendarKey: CalendarKey, tenantId: string): string {
+  return stateKey(`incremental:own-deletions:${calendarKey}`, tenantId);
 }
 
 /**
@@ -269,45 +277,52 @@ function noDeletions(): OwnDeletions {
  */
 function readOwnDeletions(
   state: SyncStateStore,
+  config: SyncConfig,
   tenantId: string,
-): Record<AccountRole, Set<string>> {
-  const read = (role: AccountRole): Set<string> => {
-    const value = state.getState(ownDeletionsKey(role, tenantId));
+): Map<CalendarKey, Set<string>> {
+  const deletions = new Map<CalendarKey, Set<string>>();
+  for (const calendar of config.calendars) {
+    const value = state.getState(ownDeletionsKey(calendar.key, tenantId));
     try {
       const parsed: unknown = value === null ? [] : JSON.parse(value);
-      return new Set(
-        Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string") : [],
+      deletions.set(
+        calendar.key,
+        new Set(
+          Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string") : [],
+        ),
       );
     } catch {
-      return new Set();
+      deletions.set(calendar.key, new Set());
     }
-  };
-  return { personal: read("personal"), work: read("work") };
+  }
+  return deletions;
 }
 
-function clearSyncTokens(state: SyncStateStore, tenantId: string): void {
-  for (const role of accountRoles) {
-    state.deleteState(syncTokenKey(role, tenantId));
+function clearSyncTokens(state: SyncStateStore, config: SyncConfig, tenantId: string): void {
+  for (const calendar of config.calendars) {
+    state.deleteState(syncTokenKey(calendar.key, tenantId));
   }
 }
 
 function supportsIncremental(
-  clients: Record<AccountRole, CalendarAPI>,
-): clients is Record<AccountRole, IncrementalCalendarAPI> {
-  return accountRoles.every((role) => typeof clients[role].listChanges === "function");
+  config: SyncConfig,
+  clients: Readonly<Record<CalendarKey, CalendarAPI>>,
+): clients is Readonly<Record<CalendarKey, IncrementalCalendarAPI>> {
+  return config.calendars.every(
+    (calendar) => typeof clients[calendar.key]?.listChanges === "function",
+  );
 }
 
+/**
+ * Whether one calendar's changes can alter what calsync wants. `blocks` are
+ * the mappings of busy blocks calsync holds on this calendar.
+ */
 function changesRequireFull(
-  calendarRole: AccountRole,
   events: readonly GoogleCalendarEvent[],
-  mappings: readonly EventMapping[],
+  blocks: readonly EventMapping[],
   ownDeletions: ReadonlySet<string>,
 ): boolean {
-  const destinations = new Map(
-    mappings
-      .filter((mapping) => mapping.sourceRole !== calendarRole)
-      .map((mapping) => [mapping.destinationEventId, mapping]),
-  );
+  const destinations = new Map(blocks.map((mapping) => [mapping.destinationEventId, mapping]));
 
   for (const event of events) {
     const id = event.id ?? undefined;
@@ -342,21 +357,29 @@ function changesRequireFull(
 }
 
 function syncFingerprint(config: SyncConfig): string {
+  const sorted = (values: Readonly<Record<string, readonly string[]>>) =>
+    Object.fromEntries(
+      Object.entries(values)
+        .filter(([, list]) => list.length > 0)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, list]) => [key, [...list].sort()]),
+    );
   const fingerprintInput = {
-    // 2: merged busy blocks replaced one mirror per source event. The bump
-    // forces a full pass on upgrade, which swaps the old mirrors for blocks.
-    version: 2,
-    calendars: {
-      personal: config.accounts.personal.calendarId,
-      work: config.accounts.work.calendarId,
-    },
+    // 3: calendars became a keyed list, each a source, a destination, or both.
+    version: 3,
+    calendars: [...config.calendars]
+      .sort((left, right) => left.key.localeCompare(right.key))
+      .map(({ key, calendarId, source, destination }) => ({
+        key,
+        calendarId,
+        source,
+        destination,
+      })),
     window: config.window,
     timezone: config.timezone,
     exclusions: {
-      personalToWork: [...config.exclusions.personalToWork].sort(),
-      workToPersonal: [...config.exclusions.workToPersonal].sort(),
-      personalToWorkKeywords: [...config.exclusions.personalToWorkKeywords].sort(),
-      workToPersonalKeywords: [...config.exclusions.workToPersonalKeywords].sort(),
+      keys: sorted(config.exclusions.keys),
+      keywords: sorted(config.exclusions.keywords),
     },
   };
   return createHash("sha256").update(JSON.stringify(fingerprintInput)).digest("hex");
@@ -385,67 +408,70 @@ function nextFullAt(state: SyncStateStore, config: SyncConfig, now: Date): strin
   ).toISOString();
 }
 
+/**
+ * Advances every calendar's token together, with the deletions the pass
+ * made: a calendar the pass deleted nothing on clears its list, since the
+ * poll that just ran consumed any older echoes.
+ */
 function persistIncrementalState(
   state: SyncStateStore,
-  tokens: Partial<Record<AccountRole, string>>,
+  config: SyncConfig,
+  tokens: Readonly<Record<CalendarKey, string>>,
   fingerprint: string,
   result: SyncReconcileResult | undefined,
   now: Date,
   tenantId: string,
-  ownDeletions: OwnDeletions,
+  ownDeletions: Readonly<Record<CalendarKey, readonly string[]>>,
 ): void {
-  const personal = tokens.personal;
-  const work = tokens.work;
-  if (personal === undefined || work === undefined) {
-    throw new Error("Both calendar sync tokens are required before advancing incremental state");
+  const values: Record<string, string> = {
+    [stateKey(CONFIG_FINGERPRINT_KEY, tenantId)]: fingerprint,
+  };
+  for (const calendar of config.calendars) {
+    const token = tokens[calendar.key];
+    if (token === undefined) {
+      throw new Error("Every calendar's sync token is required before advancing incremental state");
+    }
+    values[syncTokenKey(calendar.key, tenantId)] = token;
+    values[ownDeletionsKey(calendar.key, tenantId)] = JSON.stringify(
+      ownDeletions[calendar.key] ?? [],
+    );
   }
-  state.setStates(
-    {
-      [syncTokenKey("personal", tenantId)]: personal,
-      [syncTokenKey("work", tenantId)]: work,
-      [stateKey(CONFIG_FINGERPRINT_KEY, tenantId)]: fingerprint,
-      [ownDeletionsKey("personal", tenantId)]: JSON.stringify(ownDeletions.personal),
-      [ownDeletionsKey("work", tenantId)]: JSON.stringify(ownDeletions.work),
-      ...(result === undefined
-        ? {}
-        : {
-            [stateKey(LAST_FULL_SYNC_KEY, tenantId)]: now.toISOString(),
-            [stateKey(LAST_RESULT_KEY, tenantId)]: JSON.stringify(result),
-          }),
-    },
-    now,
-  );
+  if (result !== undefined) {
+    values[stateKey(LAST_FULL_SYNC_KEY, tenantId)] = now.toISOString();
+    values[stateKey(LAST_RESULT_KEY, tenantId)] = JSON.stringify(result);
+  }
+  state.setStates(values, now);
 }
 
 function storedSyncResult(
   state: SyncStateStore,
   mappings: MappingStore,
-  tenantId?: string,
+  config: SyncConfig,
 ): SyncReconcileResult {
-  const stored = state.getState(stateKey(LAST_RESULT_KEY, tenantId));
+  const stored = parseStoredResult(state.getState(stateKey(LAST_RESULT_KEY, config.tenantId)));
   if (stored !== null) {
-    try {
-      const parsed = JSON.parse(stored) as SyncReconcileResult;
-      if (
-        typeof parsed.created === "number" &&
-        typeof parsed.updated === "number" &&
-        typeof parsed.deleted === "number" &&
-        typeof parsed.repaired === "number" &&
-        typeof parsed.failed === "number" &&
-        typeof parsed.converged === "boolean"
-      ) {
-        return {
-          ...parsed,
-          created: 0,
-          updated: 0,
-          deleted: 0,
-          repaired: 0,
-          failed: 0,
-          converged: true,
-        };
-      }
-    } catch {
-      // Fall back to privacy-safe mapping counts for migrated or corrupt state.
+    return {
+      ...stored,
+      created: 0,
+      updated: 0,
+      deleted: 0,
+      repaired: 0,
+      failed: 0,
+      converged: true,
+    };
+  }
+  // Fall back to privacy-safe mapping counts for migrated or corrupt state.
+  const destinations: SyncReconcileResult["destinations"] = {};
+  const sources: SyncReconcileResult["sources"] = {};
+  for (const calendar of config.calendars) {
+    if (calendar.destination) {
+      destinations[calendar.key] = {
+        active: mappings.listMappings(calendar.key, config.tenantId).length,
+        duplicateSuppressed: 0,
+      };
+    }
+    if (calendar.source) {
+      sources[calendar.key] = { excluded: 0 };
     }
   }
   return {
@@ -455,19 +481,70 @@ function storedSyncResult(
     repaired: 0,
     failed: 0,
     converged: true,
-    mirrors: {
-      personalToWork: {
-        active: mappings.listMappings("personal", tenantId).length,
-        excluded: 0,
-        duplicateSuppressed: 0,
-      },
-      workToPersonal: {
-        active: mappings.listMappings("work", tenantId).length,
-        excluded: 0,
-        duplicateSuppressed: 0,
-      },
-    },
+    destinations,
+    sources,
   };
+}
+
+/**
+ * A persisted pass result, or null when missing or unreadable. Results saved
+ * before calendars were keyed carry per-direction totals; each direction had
+ * one source and one destination, so they convert exactly.
+ */
+export function parseStoredResult(stored: string | null): SyncReconcileResult | null {
+  if (stored === null) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(stored) as Partial<SyncReconcileResult> & {
+      mirrors?: Record<
+        string,
+        { active?: number; excluded?: number; duplicateSuppressed?: number }
+      >;
+    };
+    if (
+      typeof parsed.created !== "number" ||
+      typeof parsed.updated !== "number" ||
+      typeof parsed.deleted !== "number" ||
+      typeof parsed.repaired !== "number" ||
+      typeof parsed.failed !== "number" ||
+      typeof parsed.converged !== "boolean"
+    ) {
+      return null;
+    }
+    const counts = {
+      created: parsed.created,
+      updated: parsed.updated,
+      deleted: parsed.deleted,
+      repaired: parsed.repaired,
+      failed: parsed.failed,
+      converged: parsed.converged,
+    };
+    if (typeof parsed.destinations === "object" && typeof parsed.sources === "object") {
+      return { ...counts, destinations: parsed.destinations, sources: parsed.sources };
+    }
+    const toWork = parsed.mirrors?.["personalToWork"];
+    const toPersonal = parsed.mirrors?.["workToPersonal"];
+    if (typeof toWork !== "object" || typeof toPersonal !== "object") {
+      return null;
+    }
+    return {
+      ...counts,
+      destinations: {
+        work: { active: toWork.active ?? 0, duplicateSuppressed: toWork.duplicateSuppressed ?? 0 },
+        personal: {
+          active: toPersonal.active ?? 0,
+          duplicateSuppressed: toPersonal.duplicateSuppressed ?? 0,
+        },
+      },
+      sources: {
+        personal: { excluded: toWork.excluded ?? 0 },
+        work: { excluded: toPersonal.excluded ?? 0 },
+      },
+    };
+  } catch {
+    return null;
+  }
 }
 
 function emitStatus(options: SyncRunOptions, status: SyncStatus): void {
@@ -482,27 +559,12 @@ export interface StoredSyncSummary {
 /**
  * Privacy-safe aggregates the daemon persisted for one tenant, for status
  * surfaces (CLI, MCP, web). Counts and timestamps only — never event data.
+ * Corrupt state reads as "no summary yet"; the daemon repairs it on its next
+ * full pass.
  */
 export function readSyncSummary(state: SyncStateStore, tenantId?: string): StoredSyncSummary {
-  const lastFullSyncAt = state.getState(stateKey(LAST_FULL_SYNC_KEY, tenantId));
-  const stored = state.getState(stateKey(LAST_RESULT_KEY, tenantId));
-  let lastResult: SyncReconcileResult | null = null;
-  if (stored !== null) {
-    try {
-      const parsed = JSON.parse(stored) as SyncReconcileResult;
-      if (
-        typeof parsed.created === "number" &&
-        typeof parsed.converged === "boolean" &&
-        typeof parsed.mirrors === "object" &&
-        typeof parsed.mirrors.personalToWork === "object" &&
-        typeof parsed.mirrors.workToPersonal === "object"
-      ) {
-        lastResult = parsed;
-      }
-    } catch {
-      // Corrupt state reads as "no summary yet"; the daemon repairs it on
-      // its next full pass.
-    }
-  }
-  return { lastFullSyncAt, lastResult };
+  return {
+    lastFullSyncAt: state.getState(stateKey(LAST_FULL_SYNC_KEY, tenantId)),
+    lastResult: parseStoredResult(state.getState(stateKey(LAST_RESULT_KEY, tenantId))),
+  };
 }

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import type { AccountRole, ExclusionDirection, ExclusionSource, SyncConfig } from "./types.js";
+import type { CalendarKey, ExclusionSource, SyncConfig } from "./types.js";
 import type { NormalizedSourceEvent } from "./normalize.js";
 
 export type SourceExclusionScope = "occurrence" | "series" | "legacy";
@@ -11,32 +11,38 @@ export interface SourceExclusionKeys {
 }
 
 const KEY_NAMESPACE = "calsync-exclude";
-const KEY_VERSION = "v1";
 const OPAQUE_KEY_PATTERN =
-  /^calsync-exclude:v1:(?<direction>p2w|w2p):(?<scope>occ|series):[A-Za-z0-9_-]+$/u;
+  /^calsync-exclude:(?:v1:(?<direction>p2w|w2p)|v2:(?<tag>[A-Za-z0-9_-]{11})):(?<scope>occ|series):[A-Za-z0-9_-]+$/u;
 
 /**
- * Derives non-reversible, direction-bound keys without storing any additional
- * event data. The visible prefix makes the namespace, version, direction, and
+ * v1 keys predate calendar keys and name a direction; each direction had one
+ * source, so they now name that source. They stay in use for those two keys,
+ * so every stored exclusion keeps matching.
+ */
+const LEGACY_DIRECTIONS: Readonly<Record<string, "p2w" | "w2p">> = { personal: "p2w", work: "w2p" };
+
+/**
+ * Derives non-reversible, source-bound keys without storing any additional
+ * event data. The visible prefix makes the namespace, version, source, and
  * scope explicit; the digest conceals the source identity.
  */
 export function sourceExclusionKeys(
-  sourceRole: AccountRole,
+  sourceKey: CalendarKey,
   source: NormalizedSourceEvent,
 ): SourceExclusionKeys {
   return {
-    occurrence: deriveKey(sourceRole, "occurrence", source.occurrenceKey),
-    series: deriveKey(sourceRole, "series", source.seriesKey),
+    occurrence: deriveKey(sourceKey, "occurrence", source.occurrenceKey),
+    series: deriveKey(sourceKey, "series", source.seriesKey),
   };
 }
 
 export function matchingSourceExclusion(
   exclusions: readonly string[],
-  sourceRole: AccountRole,
+  sourceKey: CalendarKey,
   source: NormalizedSourceEvent,
 ): SourceExclusionScope | undefined {
   const configured = new Set(exclusions);
-  const keys = sourceExclusionKeys(sourceRole, source);
+  const keys = sourceExclusionKeys(sourceKey, source);
   if (configured.has(keys.occurrence)) {
     return "occurrence";
   }
@@ -49,15 +55,27 @@ export function matchingSourceExclusion(
   return undefined;
 }
 
-export function parseOpaqueExclusionKey(value: string): ExclusionDirection {
+/** The connected source calendar an opaque key belongs to. */
+export function parseOpaqueExclusionKey(
+  value: string,
+  calendarKeys: readonly CalendarKey[],
+): CalendarKey {
   const trimmed = value.trim();
-  const match = OPAQUE_KEY_PATTERN.exec(trimmed);
-  if (match?.groups?.["direction"] === undefined) {
+  const groups = OPAQUE_KEY_PATTERN.exec(trimmed)?.groups;
+  if (groups === undefined) {
     throw new Error(
       `Invalid exclusion key "${trimmed}"; copy an opaque occurrence or series key from a detailed dry run`,
     );
   }
-  return match.groups["direction"] === "p2w" ? "personalToWork" : "workToPersonal";
+  const sourceKey = calendarKeys.find((key) =>
+    groups["direction"] === undefined
+      ? calendarTag(key) === groups["tag"]
+      : LEGACY_DIRECTIONS[key] === groups["direction"],
+  );
+  if (sourceKey === undefined) {
+    throw new Error(`Exclusion key "${trimmed}" belongs to a calendar that is not connected`);
+  }
+  return sourceKey;
 }
 
 export function normalizeExclusionKeyword(value: string): string {
@@ -83,26 +101,19 @@ export function parseExclusionKeywords(values: readonly string[]): string[] {
 }
 
 export function applyStoredExclusions<T extends SyncConfig>(config: T, source: ExclusionSource): T {
-  const keys = groupedValues(source.listExclusionKeys());
-  const keywords = groupedValues(
-    source.listExclusionKeywords().map((row) => ({
-      direction: row.direction,
-      value: row.keyword,
-    })),
-  );
   return {
     ...config,
     exclusions: {
-      personalToWork: unique([...config.exclusions.personalToWork, ...keys.personalToWork]),
-      workToPersonal: unique([...config.exclusions.workToPersonal, ...keys.workToPersonal]),
-      personalToWorkKeywords: unique([
-        ...config.exclusions.personalToWorkKeywords,
-        ...keywords.personalToWork,
-      ]),
-      workToPersonalKeywords: unique([
-        ...config.exclusions.workToPersonalKeywords,
-        ...keywords.workToPersonal,
-      ]),
+      keys: mergeBySource(
+        config.exclusions.keys,
+        source.listExclusionKeys().map((row) => ({ sourceKey: row.sourceKey, value: row.value })),
+      ),
+      keywords: mergeBySource(
+        config.exclusions.keywords,
+        source
+          .listExclusionKeywords()
+          .map((row) => ({ sourceKey: row.sourceKey, value: row.keyword })),
+      ),
     },
   };
 }
@@ -122,29 +133,40 @@ export function isTitleExcludedByKeyword(
 }
 
 function deriveKey(
-  sourceRole: AccountRole,
+  sourceKey: CalendarKey,
   scope: Exclude<SourceExclusionScope, "legacy">,
   identity: string,
 ): string {
-  const direction = sourceRole === "personal" ? "p2w" : "w2p";
   const scopeCode = scope === "occurrence" ? "occ" : "series";
+  const direction = LEGACY_DIRECTIONS[sourceKey];
+  const [version, label] =
+    direction === undefined ? ["v2", calendarTag(sourceKey)] : ["v1", direction];
   const digest = createHash("sha256")
-    .update(`${KEY_NAMESPACE}\0${KEY_VERSION}\0${direction}\0${scopeCode}\0${identity}`)
+    .update(`${KEY_NAMESPACE}\0${version}\0${label}\0${scopeCode}\0${identity}`)
     .digest("base64url");
-  return `${KEY_NAMESPACE}:${KEY_VERSION}:${direction}:${scopeCode}:${digest}`;
+  return `${KEY_NAMESPACE}:${version}:${label}:${scopeCode}:${digest}`;
 }
 
-function groupedValues(
-  rows: readonly { direction: ExclusionDirection; value: string }[],
-): Record<ExclusionDirection, string[]> {
-  const grouped: Record<ExclusionDirection, string[]> = {
-    personalToWork: [],
-    workToPersonal: [],
-  };
-  for (const row of rows) {
-    grouped[row.direction].push(row.value);
+/** Short, fixed-width tag naming a source calendar inside a v2 key. */
+function calendarTag(key: CalendarKey): string {
+  return createHash("sha256").update(`calsync-calendar\0${key}`).digest("base64url").slice(0, 11);
+}
+
+function mergeBySource(
+  configured: Readonly<Record<CalendarKey, readonly string[]>>,
+  stored: readonly { sourceKey: CalendarKey; value: string }[],
+): Record<CalendarKey, string[]> {
+  const merged: Record<CalendarKey, string[]> = {};
+  for (const [key, values] of Object.entries(configured)) {
+    merged[key] = [...values];
   }
-  return grouped;
+  for (const row of stored) {
+    (merged[row.sourceKey] ??= []).push(row.value);
+  }
+  for (const [key, values] of Object.entries(merged)) {
+    merged[key] = unique(values);
+  }
+  return merged;
 }
 
 function unique(values: readonly string[]): string[] {

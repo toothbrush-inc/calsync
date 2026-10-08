@@ -1,7 +1,11 @@
 export {
   type AccountRecord,
+  type CalendarAddResult,
+  type CalendarInput,
+  type CalendarRecord,
+  type CalendarRefusal,
+  type GoogleAccountRecord,
   type EventMapping,
-  type ExclusionDirection,
   type StoredExclusionKey,
   type StoredExclusionKeyword,
   type WatchChannelRecord,

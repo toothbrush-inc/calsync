@@ -34,6 +34,43 @@ calsync sync --once --dry-run
 calsync service logs --lines 50
 ```
 
+## More than two calendars
+
+calsync syncs up to six calendars. Each one shares its busy time with all the
+others, receives theirs as merged `Busy` blocks, or both. Sign in each Google
+account once, then pick its calendars:
+
+```sh
+calsync account add                         # sign in; repeat per Google account
+calsync calendar list --available           # every calendar those accounts can use
+calsync calendar add me@work.example        # the account's own calendar
+calsync calendar add me@work.example/Team   # another calendar, by name
+calsync calendar add me@gmail.example/Holidays --source-only
+calsync calendar list
+```
+
+`--source-only` shares a calendar's busy time without writing blocks to it,
+which is what a calendar you can only read needs; `--destination-only` does
+the reverse. A calendar you see only as free/busy cannot be added yet.
+
+The two original sign-ins (`calsync auth personal|work`) keep working and
+count towards the six. A calendar can be synced once, through one account:
+adding it again through another account is refused. `--from` in `calsync
+exclude` takes a calendar the way `calendar list` shows it.
+
+To stop syncing a calendar:
+
+```sh
+calsync calendar remove me@work.example/Team
+```
+
+This runs one pass that deletes the blocks calsync wrote to it and the blocks
+its events put on the others, then forgets its exclusions and sync state. If
+calsync can no longer reach it, add `--keep-blocks` to skip that pass; its own
+blocks stay and the others are cleaned up on the next pass.
+`calsync account remove <email>` then forgets the sign-in locally; remove
+calsync from that Google account's third-party access to revoke it there.
+
 ## After pulling code updates
 
 ```sh

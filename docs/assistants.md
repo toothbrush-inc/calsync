@@ -34,22 +34,32 @@ with `"args": ["mcp"]` works too. Claude Desktop uses the same
 `~/Library/Application Support/Claude/claude_desktop_config.json`. Logs go to
 stderr only; do not point stdout at a log file.
 
-Authorize from chat with `connect_provider` (`provider=google`,
-`slot=personal|work`). It returns a browser URL — never pass a token or API
-key. After consent, `get_status` shows authorized. `calsync auth` is the same
-flow from the terminal.
+Add calendars from chat: `connect_account` returns a browser URL where the
+person signs in to a Google account (never pass a token or API key), then
+`list_calendars` with `available=true` shows what that account can sync and
+`add_calendar` adds one by name — `me@work.example` for the account's own
+calendar, `me@work.example/Team` for another. `get_status` checks every
+sign-in and calendar. `connect_provider` re-authorizes the two original
+sign-ins (`slot=personal|work`), as `calsync auth` does. Under the gateway,
+set `CALSYNC_WEB_CONNECT_URL` in the capability's env (the dashboard's
+template) so `connect_account` hands out the gateway's consent link; the
+sign-in is recorded on the next `get_status`.
 
 ## Tools
 
-| Tool               | What it does                                                              | Reads / writes                            |
-| ------------------ | ------------------------------------------------------------------------- | ----------------------------------------- |
-| `get_status`       | Auth state, calendar writability, and last-sync aggregates                | Reads                                     |
-| `connect_provider` | Starts Google consent for `personal` or `work` and returns a browser URL  | Writes a token to the vault after consent |
-| `preview_sync`     | Dry-runs one reconciliation and returns counts by direction and operation | Reads                                     |
-| `sync_now`         | Runs one live reconciliation pass and returns counts                      | Writes mirrors                            |
-| `list_exclusions`  | Lists keyword and opaque-key exclusions                                   | Reads                                     |
-| `add_exclusion`    | Excludes keywords or opaque keys from mirroring                           | Writes exclusions                         |
-| `remove_exclusion` | Stops excluding keywords or opaque keys                                   | Writes exclusions                         |
+| Tool               | What it does                                                                | Reads / writes                            |
+| ------------------ | --------------------------------------------------------------------------- | ----------------------------------------- |
+| `get_status`       | Checks every sign-in and calendar; last-sync aggregates                     | Reads                                     |
+| `connect_account`  | Starts signing in another Google account and returns a browser URL          | Writes a token to the vault after consent |
+| `list_calendars`   | Synced calendars; with `available=true`, every calendar that could be added | Reads                                     |
+| `add_calendar`     | Syncs one more calendar (up to six), optionally share- or receive-only      | Writes calendar settings                  |
+| `remove_calendar`  | Stops syncing a calendar and deletes the busy blocks written for it         | Writes mirrors                            |
+| `connect_provider` | Re-authorizes the original `personal` or `work` sign-in                     | Writes a token to the vault after consent |
+| `preview_sync`     | Dry-runs one reconciliation and returns counts by calendar and operation    | Reads                                     |
+| `sync_now`         | Runs one live reconciliation pass and returns counts                        | Writes mirrors                            |
+| `list_exclusions`  | Lists keyword and opaque-key exclusions                                     | Reads                                     |
+| `add_exclusion`    | Excludes keywords (from a named calendar) or opaque keys from mirroring     | Writes exclusions                         |
+| `remove_exclusion` | Stops excluding keywords or opaque keys                                     | Writes exclusions                         |
 
 Only `preview_sync` can return titles, and only when `include_source_titles`
 is explicitly true. The gateway config in [hosting.md](hosting.md) denies

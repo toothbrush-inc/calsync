@@ -119,6 +119,25 @@ export function renderDashboardPage(): string {
     padding: 7px 9px; border: 1px solid #cfd6de; border-radius: 6px; color: #384453; background: #f6f7f9;
   }
   .guide { color: #5b6675; font-size: 13px; margin: 6px 0 20px; }
+  h2.heading { font-size: 17px; margin: 28px 0 10px; letter-spacing: -0.01em; }
+  h2.heading:first-child { margin-top: 0; }
+  .card h2.label { text-transform: none; overflow-wrap: anywhere; }
+  .card .roles { color: #384453; font-size: 13px; margin: 0 0 6px; }
+  .card select {
+    font: inherit; font-size: 13px; padding: 6px 8px; border: 1px solid #cfd6de;
+    border-radius: 8px; background: #fff; color: #1c2430;
+  }
+  .confirm { display: inline-flex; gap: 6px; align-items: center; }
+  .confirm .hint { margin: 0; }
+  button.danger { border-color: #e7b3ac; color: #a3372c; }
+  .available { list-style: none; margin: 12px 0 0; padding: 0; }
+  .available li {
+    display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    padding: 8px 0; border-top: 1px solid #eef1f4;
+  }
+  .available li .name { overflow-wrap: anywhere; }
+  .available li .why { color: #9aa5b1; font-size: 12px; white-space: nowrap; }
+  .add-account { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
   .summary { color: #5b6675; font-size: 13px; margin-top: 20px; }
   .summary strong { color: #1c2430; font-weight: 600; }
   .error { color: #a3372c; margin-top: 16px; }
@@ -225,8 +244,18 @@ export function renderDashboardPage(): string {
   <h1>calsync</h1>
   <p class="sub">${storeDescription}</p>
   <div id="banner" class="banner" data-state="loading"><span class="dot"></span><span id="banner-text">Checking sync status…</span></div>
-  <div id="cards"></div>
-  <p class="guide">Each calendar is connected with the Google account that owns it, so you sign in twice: once as your personal account, once as your work account. Google asks which account to use each time. If a calendar's account lives in another browser or profile, use "Copy link" and open it there.</p>
+  <h2 class="heading">Calendars</h2>
+  <div id="calendar-cards"></div>
+  <p id="calendar-hint" class="guide"></p>
+  <h2 class="heading">Google accounts</h2>
+  <div id="account-cards"></div>
+  <div class="add-account" id="add-account-row">
+    <button id="add-account" class="connect" type="button">Connect a Google account</button>
+    <button id="add-account-link" class="link" type="button" title="Get the connect link to open in another browser or profile">Copy link</button>
+  </div>
+  <div class="share" id="add-account-share"></div>
+  <p id="account-note" class="note" hidden></p>
+  <p class="guide">Sign in once per Google account, then pick which of its calendars to sync. Each calendar shares its busy time with the others, receives theirs as private Busy blocks, or both. Google asks which account to use each time; if an account lives in another browser or profile, use "Copy link" and open it there.</p>
   <p id="summary" class="summary"></p>
   <p id="error" class="error" hidden></p>
 
@@ -249,7 +278,7 @@ export function renderDashboardPage(): string {
 
   <section class="section" id="preview">
     <h2>Preview a sync</h2>
-    <p class="lead">A dry run reads both calendars and lists every event in the sync window, so you can see what would be mirrored and pick what to exclude. Nothing is written. Titles appear only here, only when you run it, and never leave this page.</p>
+    <p class="lead">A dry run reads every calendar and lists every event in the sync window, so you can see what would be mirrored and pick what to exclude. Nothing is written. Titles appear only here, only when you run it, and never leave this page.</p>
     <p class="cli">Same as <code>calsync sync --once --dry-run --verbose</code> in the terminal.</p>
     <div class="card">
       <div class="preview-toolbar">
@@ -269,7 +298,7 @@ export function renderDashboardPage(): string {
 
   <section class="section" id="dedupe">
     <h2>Prune duplicates</h2>
-    <p class="lead">A reinstall, a calendar switch, or an event Google re-created under a new identity can leave an old busy block behind: next to its replacement as a duplicate, or on its own as a phantom once the event it mirrored moved or went away. A check reads both calendars and lists every block calsync made that no live event stands behind. Pruning them deletes only those blocks: every mirror of a live event stays, and your real events are never touched.</p>
+    <p class="lead">A reinstall, a calendar switch, or an event Google re-created under a new identity can leave an old busy block behind: next to its replacement as a duplicate, or on its own as a phantom once the event it mirrored moved or went away. A check reads every calendar and lists every block calsync made that no live event stands behind. Pruning them deletes only those blocks: every mirror of a live event stays, and your real events are never touched.</p>
     <p class="cli">Same as <code>calsync dedupe</code> in the terminal.</p>
     <div class="card">
       <div class="preview-toolbar">
@@ -281,7 +310,7 @@ export function renderDashboardPage(): string {
         <div id="dedupe-lists"></div>
         <div id="dedupe-apply" class="preview-toolbar dedupe-apply" hidden>
           <button id="apply-dedupe" class="connect" type="button">Prune stray blocks</button>
-          <p class="hint">Reads both calendars again and deletes the stray blocks it finds, so the list above may shift a little if a sync ran in between. Nothing else changes.</p>
+          <p class="hint">Reads every calendar again and deletes the stray blocks it finds, so the list above may shift a little if a sync ran in between. Nothing else changes.</p>
         </div>
       </div>
     </div>
@@ -293,13 +322,12 @@ export function renderDashboardPage(): string {
 (() => {
   const banner = document.getElementById("banner");
   const bannerText = document.getElementById("banner-text");
-  const cards = document.getElementById("cards");
   const summary = document.getElementById("summary");
   const errorLine = document.getElementById("error");
   const BANNERS = {
     "syncing": "Actively syncing — your calendars are being mirrored.",
     "daemon-offline": "Calendars connected, but the sync service is not running.",
-    "setup": "Connect your calendars below to start syncing.",
+    "setup": "Connect at least two calendars below to start syncing.",
   };
   let fastUntil = 0;
   let timer;
@@ -315,85 +343,273 @@ export function renderDashboardPage(): string {
     return Math.round(hours / 24) + "d ago";
   }
 
-  function card(account) {
-    const div = document.createElement("div");
-    div.className = "card";
-    const title = document.createElement("h2");
-    title.textContent = account.role + " calendar";
-    const status = document.createElement("p");
-    status.className = "status";
-    status.textContent = account.message;
-    const row = document.createElement("div");
-    row.className = "row";
-    const calendar = document.createElement("span");
-    calendar.className = "calendar";
-    calendar.textContent = account.account ?? account.calendarId ?? "not connected";
-    row.append(calendar);
-    const actions = document.createElement("div");
-    actions.className = "actions";
-    row.append(actions);
-    div.append(title, status, row);
-    if (account.valid && account.calendarUrl) {
-      const link = document.createElement("a");
-      link.className = "open";
-      link.href = account.calendarUrl;
+  const calendarCards = document.getElementById("calendar-cards");
+  const calendarHint = document.getElementById("calendar-hint");
+  const accountCards = document.getElementById("account-cards");
+  const accountNote = document.getElementById("account-note");
+  const addAccount = document.getElementById("add-account");
+  const addAccountLink = document.getElementById("add-account-link");
+  const addAccountRow = document.getElementById("add-account-row");
+  const addAccountShare = document.getElementById("add-account-share");
+  // The last status: every calendar, by key, for the sections below.
+  let current = { calendars: [], signIns: [], maxCalendars: 6 };
+  // Account cards whose "Add a calendar" list is open survive a refresh.
+  const openPickers = new Set();
+
+  function labelOf(key) {
+    const calendar = current.calendars.find((entry) => entry.key === key);
+    return calendar ? calendar.label : key;
+  }
+
+  function rolesText(calendar) {
+    if (calendar.shares && calendar.receives) return "Shares its busy time and receives the others'";
+    return calendar.shares ? "Shares its busy time only" : "Receives the others' busy time only";
+  }
+
+  function el(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  async function post(path, body) {
+    const response = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "request failed");
+    return payload;
+  }
+
+  function accountMessage(message, kind) {
+    accountNote.textContent = message;
+    accountNote.dataset.kind = kind || "ok";
+    accountNote.hidden = false;
+  }
+
+  // A two-step button: the first click asks, the second does it.
+  function confirmButton(label, question, onConfirm) {
+    const wrap = el("span", "confirm");
+    const start = el("button", "link danger", label);
+    start.type = "button";
+    start.addEventListener("click", () => {
+      const ask = el("span", "hint", question);
+      const yes = el("button", "link danger", "Yes, " + label.toLowerCase());
+      yes.type = "button";
+      const no = el("button", "link", "Cancel");
+      no.type = "button";
+      no.addEventListener("click", () => wrap.replaceChildren(start));
+      yes.addEventListener("click", async () => {
+        yes.disabled = true;
+        no.disabled = true;
+        await onConfirm(yes);
+      });
+      wrap.replaceChildren(ask, yes, no);
+    });
+    wrap.append(start);
+    return wrap;
+  }
+
+  function calendarCard(calendar) {
+    const div = el("div", "card");
+    div.append(el("h2", "label", calendar.label));
+    div.append(el("p", "roles", rolesText(calendar)));
+    div.append(el("p", "status", calendar.message));
+    const row = el("div", "row");
+    const select = document.createElement("select");
+    select.setAttribute("aria-label", "What " + calendar.label + " does");
+    for (const [value, text, needsWrite] of [
+      ["both", "Share and receive", true],
+      ["shares", "Share only", false],
+      ["receives", "Receive only", true],
+    ]) {
+      const option = el("option", "", text);
+      option.value = value;
+      option.disabled = needsWrite && !calendar.writable;
+      select.append(option);
+    }
+    select.value = calendar.shares && calendar.receives ? "both" : calendar.shares ? "shares" : "receives";
+    select.addEventListener("change", async () => {
+      select.disabled = true;
+      try {
+        await post("/api/calendars", {
+          action: "update",
+          key: calendar.key,
+          shares: select.value !== "receives",
+          receives: select.value !== "shares",
+        });
+        accountMessage("Updated " + calendar.label + ". The next sync pass applies it.");
+      } catch (error) {
+        accountMessage(String(error.message || error), "error");
+      }
+      wantFresh = true;
+      void refresh();
+    });
+    const actions = el("div", "actions");
+    if (calendar.calendarUrl) {
+      const link = el("a", "open", "Open in Google Calendar ↗");
+      link.href = calendar.calendarUrl;
       link.target = "_blank";
       link.rel = "noreferrer";
-      link.textContent = "Open in Google Calendar ↗";
       actions.append(link);
-      if (account.account) {
-        const who = document.createElement("p");
-        who.className = "account";
-        who.append("Connected as ");
-        const strong = document.createElement("strong");
-        strong.textContent = account.account;
-        who.append(strong);
-        div.append(who);
+    }
+    actions.append(confirmButton("Remove", "Deletes the busy blocks calsync wrote for it.", async (button) => {
+      try {
+        const result = await post("/api/calendars", { action: "remove", key: calendar.key });
+        accountMessage("Stopped syncing " + calendar.label +
+          (result.deleted === null ? "." : "; " + result.deleted + " busy blocks deleted."));
+      } catch (error) {
+        button.disabled = false;
+        accountMessage(String(error.message || error), "error");
       }
-      if (account.conflict) {
-        const warn = document.createElement("p");
-        warn.className = "hint";
-        warn.dataset.kind = "error";
-        warn.textContent = "Another calsync sign-in on this host syncs these same two calendars, so every event is mirrored twice. Ask whoever runs this calsync to remove one of them.";
-        div.append(warn);
-      }
-    } else {
-      const button = document.createElement("button");
-      button.className = "connect";
-      button.textContent = account.connected ? "Reconnect" : "Connect";
-      button.addEventListener("click", () => connect(account.role, button));
-      const copy = document.createElement("button");
-      copy.className = "link";
-      copy.textContent = "Copy link";
-      copy.title = "Get the connect link to open in another browser or profile";
-      const share = document.createElement("div");
-      share.className = "share";
-      copy.addEventListener("click", () => shareLink(account.role, copy, share));
-      actions.append(button, copy);
-      const hint = document.createElement("p");
-      hint.className = "hint";
-      hint.textContent = "Sign in with the Google account that owns your " + account.role + " calendar.";
-      div.append(hint, share);
+      wantFresh = true;
+      void refresh();
+      void loadExclusions();
+    }));
+    row.append(select, actions);
+    div.append(row);
+    if (calendar.conflict) {
+      const warn = el("p", "hint", "Another calsync sign-in on this host syncs this calendar together with one of yours, so its events are mirrored twice. Ask whoever runs this calsync to remove one of them.");
+      warn.dataset.kind = "error";
+      div.append(warn);
     }
     return div;
   }
 
-  async function connectUrl(role) {
-    const response = await fetch("/api/connect", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ role }),
-    });
-    const payload = await response.json();
-    if (!response.ok || !payload.url) throw new Error(payload.error || "connect failed");
-    return payload;
+  function availableRow(signIn, option) {
+    const li = document.createElement("li");
+    li.append(el("span", "name", option.primary ? option.name + " (its own calendar)" : option.name));
+    const actions = el("span", "event-actions");
+    const add = (label, receives) => {
+      const button = el("button", receives ? "connect" : "link", label);
+      button.type = "button";
+      button.addEventListener("click", async () => {
+        button.disabled = true;
+        try {
+          await post("/api/calendars", {
+            action: "add",
+            account: signIn.slot,
+            calendarId: option.calendarId,
+            shares: true,
+            receives,
+          });
+          accountMessage("Added " + option.name + ". The next sync pass mirrors it.");
+        } catch (error) {
+          button.disabled = false;
+          accountMessage(String(error.message || error), "error");
+          return;
+        }
+        wantFresh = true;
+        void refresh();
+        void loadExclusions();
+      });
+      return button;
+    };
+    const full = current.calendars.length >= current.maxCalendars;
+    if (option.synced) {
+      actions.append(el("span", "why", "synced"));
+    } else if (!option.readable) {
+      actions.append(el("span", "why", "free/busy only — not supported yet"));
+    } else if (full) {
+      actions.append(el("span", "why", "at the " + current.maxCalendars + "-calendar limit"));
+    } else {
+      if (option.writable) actions.append(add("Add", true));
+      actions.append(add(option.writable ? "Share only" : "Add, share only", false));
+    }
+    li.append(actions);
+    return li;
   }
 
-  async function connect(role, button) {
+  async function togglePicker(signIn, button, holder) {
+    if (openPickers.has(signIn.slot)) {
+      openPickers.delete(signIn.slot);
+      holder.replaceChildren();
+      button.textContent = "Add a calendar";
+      return;
+    }
+    openPickers.add(signIn.slot);
+    await fillPicker(signIn, button, holder);
+  }
+
+  async function fillPicker(signIn, button, holder) {
+    button.textContent = "Hide calendars";
+    holder.replaceChildren(el("p", "hint", "Listing calendars…"));
+    try {
+      const response = await fetch("/api/calendars/available?account=" + encodeURIComponent(signIn.slot));
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "could not list calendars");
+      const list = el("ul", "available");
+      list.append(...payload.calendars.map((option) => availableRow(signIn, option)));
+      holder.replaceChildren(list);
+    } catch (error) {
+      const line = el("p", "hint", String(error.message || error));
+      line.dataset.kind = "error";
+      holder.replaceChildren(line);
+    }
+  }
+
+  function accountCard(signIn) {
+    const div = el("div", "card");
+    div.append(el("h2", "label", signIn.email || "Google account"));
+    div.append(el("p", "status", signIn.message));
+    const row = el("div", "row");
+    row.append(el("span", "account", signIn.calendars + (signIn.calendars === 1 ? " calendar synced" : " calendars synced")));
+    const actions = el("div", "actions");
+    const holder = el("div");
+    if (signIn.valid) {
+      const pick = el("button", "link", "Add a calendar");
+      pick.type = "button";
+      pick.addEventListener("click", () => { void togglePicker(signIn, pick, holder); });
+      actions.append(pick);
+      if (openPickers.has(signIn.slot)) void fillPicker(signIn, pick, holder);
+    } else {
+      const reconnect = el("button", "connect", "Reconnect");
+      reconnect.type = "button";
+      reconnect.addEventListener("click", () => { void connect({ action: "reconnect", slot: signIn.slot }, reconnect); });
+      actions.append(reconnect);
+    }
+    if (signIn.calendars === 0) {
+      actions.append(confirmButton("Remove", "calsync forgets this sign-in.", async (button) => {
+        try {
+          await post("/api/accounts", { action: "remove", slot: signIn.slot });
+        } catch (error) {
+          button.disabled = false;
+          accountMessage(String(error.message || error), "error");
+        }
+        wantFresh = true;
+        void refresh();
+      }));
+    }
+    row.append(actions);
+    div.append(row, holder);
+    return div;
+  }
+
+  function renderSetup(status) {
+    current = status;
+    calendarCards.replaceChildren(...status.calendars.map(calendarCard));
+    calendarHint.textContent = status.calendars.length === 0
+      ? "No calendars yet. Connect a Google account below, then add its calendars."
+      : status.calendars.length === 1
+        ? "Add at least one more calendar to start syncing."
+        : status.calendars.length >= status.maxCalendars
+          ? "That's the most calsync syncs (" + status.maxCalendars + "). Remove one to add another."
+          : "";
+    calendarHint.hidden = calendarHint.textContent === "";
+    accountCards.replaceChildren(...status.signIns.map(accountCard));
+    addAccountRow.hidden = !status.canAddAccount;
+    addAccount.textContent = status.signIns.length === 0 ? "Connect a Google account" : "Connect another Google account";
+  }
+
+  async function connect(body, button) {
+    const label = button.textContent;
     button.disabled = true;
     button.textContent = "Waiting for Google…";
     try {
-      const payload = await connectUrl(role);
+      const payload = await post("/api/accounts", body);
       fastUntil = Date.now() + 3 * 60 * 1000;
       if (payload.external) {
         // The gateway brings the browser back here once consent is done.
@@ -404,23 +620,22 @@ export function renderDashboardPage(): string {
       schedule(5000);
     } catch (error) {
       button.disabled = false;
-      button.textContent = "Connect";
+      button.textContent = label;
       showError(String(error.message || error));
     }
   }
 
-  async function shareLink(role, button, share) {
+  async function shareLink(button, share) {
     button.disabled = true;
     try {
-      const payload = await connectUrl(role);
+      const payload = await post("/api/accounts", { action: "connect" });
       share.replaceChildren();
       const input = document.createElement("input");
       input.readOnly = true;
       input.value = payload.url;
       input.addEventListener("focus", () => input.select());
-      const copy = document.createElement("button");
-      copy.className = "link";
-      copy.textContent = "Copy";
+      const copy = el("button", "link", "Copy");
+      copy.type = "button";
       copy.addEventListener("click", async () => {
         try {
           await navigator.clipboard.writeText(payload.url);
@@ -435,16 +650,17 @@ export function renderDashboardPage(): string {
       share.dataset.open = "1";
       input.focus();
       input.select();
-      if (!payload.external) {
-        fastUntil = Date.now() + 3 * 60 * 1000;
-        schedule(5000);
-      }
+      fastUntil = Date.now() + 3 * 60 * 1000;
+      schedule(5000);
     } catch (error) {
       showError(String(error.message || error));
     } finally {
       button.disabled = false;
     }
   }
+
+  addAccount.addEventListener("click", () => { void connect({ action: "connect" }, addAccount); });
+  addAccountLink.addEventListener("click", () => { void shareLink(addAccountLink, addAccountShare); });
 
   function showError(message) {
     errorLine.textContent = message;
@@ -453,20 +669,19 @@ export function renderDashboardPage(): string {
 
   const exclusionLists = document.getElementById("exclusion-lists");
   const exclusionNote = document.getElementById("exclusion-note");
-  const DIRECTIONS = [
-    { id: "personalToWork", from: "personal", title: "Personal → work",
-      who: "Personal events kept off your work calendar." },
-    { id: "workToPersonal", from: "work", title: "Work → personal",
-      who: "Work events kept off your personal calendar." },
-  ];
+  // Exclusions and the preview are grouped by the calendar whose events they cover.
+  function sourceCalendars() {
+    return current.calendars.filter((calendar) => calendar.shares).map((calendar) => ({
+      id: calendar.key,
+      from: calendar.key,
+      title: calendar.label,
+      who: "Events on this calendar kept off every other calendar.",
+    }));
+  }
   const APPLY_HINT = "The next sync pass applies this.";
 
   function keyScope(value) {
     return value.includes(":series:") ? "whole series" : "one occurrence";
-  }
-
-  function directionFrom(direction) {
-    return direction === "personalToWork" ? "personal" : "work";
   }
 
   function chip(kind, entry) {
@@ -499,7 +714,7 @@ export function renderDashboardPage(): string {
         remove.disabled = true;
         const body = kind === "key"
           ? { action: "remove", keys: [entry.value] }
-          : { action: "remove", keywords: [entry.value], from: directionFrom(entry.direction) };
+          : { action: "remove", keywords: [entry.value], from: entry.source };
         void changeExclusions(body);
       });
       span.append(remove);
@@ -535,7 +750,7 @@ export function renderDashboardPage(): string {
     input.type = "text";
     input.placeholder = "Add keywords: dentist, therapy, school pickup";
     input.autocomplete = "off";
-    input.setAttribute("aria-label", "Keywords to exclude from " + direction.from);
+    input.setAttribute("aria-label", "Keywords to exclude from " + direction.title);
     const button = document.createElement("button");
     button.className = "connect";
     button.type = "submit";
@@ -565,11 +780,11 @@ export function renderDashboardPage(): string {
   }
 
   function renderExclusions(snapshot) {
-    exclusionLists.replaceChildren(...DIRECTIONS.map((direction) => {
+    exclusionLists.replaceChildren(...sourceCalendars().map((direction) => {
       const card = directionCard(direction);
       card.append(
-        group("Keywords", "keyword", snapshot.keywords.filter((entry) => entry.direction === direction.id)),
-        group("Events", "key", snapshot.keys.filter((entry) => entry.direction === direction.id)),
+        group("Keywords", "keyword", snapshot.keywords.filter((entry) => entry.source === direction.id)),
+        group("Events", "key", snapshot.keys.filter((entry) => entry.source === direction.id)),
         keywordForm(direction),
       );
       return card;
@@ -748,18 +963,18 @@ export function renderDashboardPage(): string {
   function renderPreviewLists() {
     const needle = previewFilter.value.trim().toLowerCase();
     const hideExcluded = previewHideExcluded.checked;
-    previewLists.replaceChildren(...DIRECTIONS.map((direction) => {
-      const card = directionCard(direction);
+    previewLists.replaceChildren(...sourceCalendars().map((direction) => {
+      const card = directionCard({ ...direction, who: "Its events in the sync window, and what happens to each." });
       const list = document.createElement("ul");
       list.className = "events";
       const events = previewEvents
-        .filter((event) => event.direction === direction.id)
+        .filter((event) => event.source === direction.id)
         .filter((event) => !needle || (event.title || "").toLowerCase().includes(needle))
         .filter((event) => !hideExcluded || event.status === "mirrored");
       if (events.length === 0) {
         const empty = document.createElement("li");
         empty.className = "empty";
-        empty.textContent = previewEvents.some((event) => event.direction === direction.id)
+        empty.textContent = previewEvents.some((event) => event.source === direction.id)
           ? "No events match the filter."
           : "No events in the sync window.";
         list.append(empty);
@@ -777,7 +992,9 @@ export function renderDashboardPage(): string {
     const parts = [
       planned === 0 ? "No changes planned" : planned + (planned === 1 ? " operation" : " operations") + " planned",
       previewEvents.length + " events in the sync window",
-      view.mirrors.personalToWork.active + " busy blocks would go to work, " + view.mirrors.workToPersonal.active + " to personal",
+      Object.entries(view.destinations)
+        .map(([key, totals]) => totals.active + " busy blocks on " + labelOf(key))
+        .join(", "),
     ];
     previewSummary.textContent = parts.join(" · ") + ".";
     previewResults.hidden = false;
@@ -806,7 +1023,7 @@ export function renderDashboardPage(): string {
   runPreview.addEventListener("click", async () => {
     runPreview.disabled = true;
     delete previewStatus.dataset.kind;
-    previewStatus.textContent = "Reading both calendars… this can take a minute.";
+    previewStatus.textContent = "Reading every calendar… this can take a minute.";
     try {
       const response = await fetch("/api/preview", {
         method: "POST",
@@ -842,10 +1059,10 @@ export function renderDashboardPage(): string {
   const dedupeResults = document.getElementById("dedupe-results");
   const dedupeSummary = document.getElementById("dedupe-summary");
   const dedupeLists = document.getElementById("dedupe-lists");
-  const CALENDARS = [
-    { id: "work", title: "Work calendar", who: "Busy blocks calsync mirrored here from your personal calendar." },
-    { id: "personal", title: "Personal calendar", who: "Busy blocks calsync mirrored here from your work calendar." },
-  ];
+  function dedupeCalendars(view) {
+    const keys = new Set([...current.calendars.map((calendar) => calendar.key), ...Object.keys(view.inspected)]);
+    return [...keys].map((key) => ({ id: key, title: labelOf(key), who: "Busy blocks calsync wrote here." }));
+  }
 
   function plural(n, word) {
     return n + " " + (n === 1 ? word : word + "s");
@@ -872,7 +1089,7 @@ export function renderDashboardPage(): string {
 
   function renderDedupe(view) {
     const found = view.removals.length;
-    const checked = view.inspected.personal + view.inspected.work;
+    const checked = Object.values(view.inspected).reduce((sum, count) => sum + count, 0);
     const duplicates = view.removals.filter((removal) => removal.kind === "duplicate").length;
     const breakdown = found === 0 ? "" :
       " (" + plural(duplicates, "duplicate") + ", " + plural(found - duplicates, "phantom") + ")";
@@ -884,7 +1101,7 @@ export function renderDashboardPage(): string {
       dedupeSummary.textContent = (found === 0 ? "No stray blocks" : plural(found, "stray busy block") + breakdown) +
         " found · " + plural(checked, "busy block") + " checked.";
     }
-    dedupeLists.replaceChildren(...CALENDARS.flatMap((calendar) => {
+    dedupeLists.replaceChildren(...dedupeCalendars(view).flatMap((calendar) => {
       const removals = view.removals
         .filter((removal) => removal.calendar === calendar.id)
         .sort((a, b) => a.when.start.localeCompare(b.when.start));
@@ -913,7 +1130,7 @@ export function renderDashboardPage(): string {
     delete dedupeStatus.dataset.kind;
     dedupeStatus.textContent = apply
       ? "Pruning stray blocks…"
-      : "Reading both calendars… this can take a minute.";
+      : "Reading every calendar… this can take a minute.";
     try {
       const response = await fetch("/api/dedupe", {
         method: "POST",
@@ -965,14 +1182,15 @@ export function renderDashboardPage(): string {
       errorLine.hidden = true;
       banner.dataset.state = status.overall;
       bannerText.textContent = BANNERS[status.overall] || status.overall;
-      cards.replaceChildren(...status.accounts.map(card));
+      const firstLoad = current.calendars.length === 0 && status.calendars.length > 0;
+      renderSetup(status);
+      if (firstLoad) void loadExclusions();
       const parts = [];
       if (status.lastFullSyncAt) parts.push("Last full sync " + relative(status.lastFullSyncAt));
       if (status.lastResult) {
-        parts.push(
-          status.lastResult.personalToWorkActive + " busy blocks mirrored to work, " +
-          status.lastResult.workToPersonalActive + " to personal",
-        );
+        const blocks = Object.entries(status.lastResult.blocks)
+          .map(([key, count]) => count + " busy blocks on " + labelOf(key));
+        if (blocks.length > 0) parts.push(blocks.join(", "));
       }
       summary.textContent = parts.join(" · ");
     } catch (error) {
@@ -991,13 +1209,32 @@ export function renderDashboardPage(): string {
   // couple of minutes, and drop the marker from the address bar. The cards
   // themselves say what happened; no extra banner.
   const landing = new URLSearchParams(window.location.search);
-  if (landing.has("connected") || landing.has("fresh")) {
+  const connected = landing.get("connected");
+  if (connected !== null || landing.has("fresh")) {
     wantFresh = true;
     fastUntil = Date.now() + 2 * 60 * 1000;
     window.history.replaceState(null, "", "/");
   }
-  void refresh();
-  void loadExclusions();
+
+  async function start() {
+    // Back from the gateway's consent: record the sign-in it just stored.
+    if (connected !== null) {
+      try {
+        const adopted = await post("/api/accounts", { action: "adopt", slot: connected });
+        const who = adopted.email || "the account";
+        accountMessage(
+          adopted.status === "replaced" ? "Signed " + who + " in again; its calendars use the new sign-in." :
+          adopted.status === "mismatch" ? who + " is not the account that was being reconnected; nothing changed." :
+          "Signed in " + who + ". Add its calendars below.",
+          adopted.status === "mismatch" ? "error" : "ok");
+      } catch (error) {
+        accountMessage("Could not finish the sign-in: " + String(error.message || error), "error");
+      }
+    }
+    await refresh();
+    void loadExclusions();
+  }
+  void start();
 })();
 </script>
 </body>

@@ -1,7 +1,5 @@
 import { connectionId, grantFromManifest, type Vault } from "@dvd-toy-box/vault";
 
-import type { AccountRole } from "@calsync/engine";
-
 import { CALSYNC_CAPABILITY } from "../capability.js";
 import { tokenSlot, type TokenStore } from "./keychain.js";
 
@@ -13,19 +11,19 @@ export class VaultTokenStore implements TokenStore {
     private readonly tenantId = "default",
   ) {}
 
-  async getRefreshToken(role: AccountRole): Promise<string | null> {
+  async getRefreshToken(slot: string): Promise<string | null> {
     const fromVault = await this.vault.getSecretFor(
       CALSYNC_CAPABILITY.id,
-      connectionId("google", tokenSlot(role, this.tenantId)),
+      connectionId("google", tokenSlot(slot, this.tenantId)),
     );
     if (fromVault !== null) {
       return fromVault;
     }
-    return this.legacy?.getRefreshToken(role) ?? null;
+    return this.legacy?.getRefreshToken(slot) ?? null;
   }
 
-  async setRefreshToken(role: AccountRole, refreshToken: string): Promise<void> {
-    const slot = tokenSlot(role, this.tenantId);
+  async setRefreshToken(account: string, refreshToken: string): Promise<void> {
+    const slot = tokenSlot(account, this.tenantId);
     await this.vault.putSecret({
       provider: "google",
       slot,
@@ -33,19 +31,19 @@ export class VaultTokenStore implements TokenStore {
       secret: refreshToken,
       scopes: this.scopes,
     });
-    // The manifest declares per-role needs and cannot enumerate tenants ahead
-    // of time, so tenant slots inherit the role connection's grant (actions).
+    // The manifest declares each sign-in slot and cannot enumerate tenants
+    // ahead of time, so tenant slots inherit the slot's grant (actions).
     this.vault.putGrant({
-      ...grantFromManifest(CALSYNC_CAPABILITY, "google", role),
+      ...grantFromManifest(CALSYNC_CAPABILITY, "google", account),
       connectionId: connectionId("google", slot),
     });
   }
 
-  async deleteRefreshToken(role: AccountRole): Promise<boolean> {
+  async deleteRefreshToken(slot: string): Promise<boolean> {
     const vaultDeleted = await this.vault.revoke(
-      connectionId("google", tokenSlot(role, this.tenantId)),
+      connectionId("google", tokenSlot(slot, this.tenantId)),
     );
-    const legacyDeleted = (await this.legacy?.deleteRefreshToken(role)) ?? false;
+    const legacyDeleted = (await this.legacy?.deleteRefreshToken(slot)) ?? false;
     return vaultDeleted || legacyDeleted;
   }
 }

@@ -2,8 +2,9 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
 import type {
-  AccountRole,
+  CalendarKey,
   DedupeResult,
+  ReconcileResult,
   ReconcileLog,
   ReconcileSourceDetail,
   ReconcileTimeRange,
@@ -11,18 +12,33 @@ import type {
   StrayBlockKind,
   SyncReconcileResult,
 } from "@calsync/engine";
-import { accountRoles } from "@calsync/engine";
 import { tenantForIdentity } from "@dvd-toy-box/vault";
 
-import { parseTenantId, ConfigError } from "../config.js";
+import { calendarLabel } from "../calendars.js";
+import {
+  accountRoles,
+  accountSlots,
+  MAX_CALENDARS,
+  parseTenantId,
+  ConfigError,
+  type AccountRole,
+} from "../config.js";
 import type { ScanGate, ScanOperation } from "../scanlimit.js";
 import type {
   ExclusionChangeInput,
   ExclusionChangeResult,
   ExclusionSnapshot,
 } from "../exclusions.js";
-import type { AccountStatus, ConnectStartResult } from "../google/auth.js";
-import { tokenSlot, type AccountRecord } from "../storage/index.js";
+import {
+  isWritableAccessRole,
+  type AccountStatus,
+  type AvailableCalendar,
+  type CalendarStatus,
+  type ConnectStartResult,
+  type GoogleAccountStatus,
+  type SignInAdoption,
+} from "../google/auth.js";
+import { tokenSlot, type CalendarRecord, type GoogleAccountRecord } from "../storage/index.js";
 import { LockTimeoutError } from "../sync/service.js";
 import { renderAccessPage, renderDashboardPage } from "./page.js";
 
@@ -57,9 +73,36 @@ export { tenantForIdentity };
  */
 
 export interface WebTenantRuntime {
+  /** Checks a role sign-in; a passing check adopts one the gateway finished
+   * before this tenant had anything stored. */
   getStatus(role: AccountRole, calendarId: string): Promise<AccountStatus>;
+  /** Local mode: re-signs a role in, which also re-adds its one calendar. */
   startConnect(role: AccountRole, calendarId: string): Promise<ConnectStartResult>;
-  listAccounts(): AccountRecord[];
+  listGoogleAccounts(): GoogleAccountRecord[];
+  listCalendars(): CalendarRecord[];
+  checkAccount(slot: string): Promise<GoogleAccountStatus>;
+  checkCalendar(calendar: CalendarRecord): Promise<CalendarStatus>;
+  freeAccountSlot(reserved?: Iterable<string>): string | undefined;
+  /** Local mode: starts signing in another account; recorded when it finishes. */
+  startAccountConnect(): Promise<{ slot: string; url: string; expiresAt: string }>;
+  /** Records a sign-in the gateway finished under `slot`. */
+  adoptSignIn(slot: string): Promise<SignInAdoption>;
+  /** Whether the tenant ever signed in: only one that never did adopts a role on status. */
+  hasSignedIn(): boolean;
+  availableCalendars(slot: string): Promise<AvailableCalendar[]>;
+  connectCalendar(
+    slot: string,
+    calendarId: string,
+    roles: { source: boolean; destination: boolean },
+  ): Promise<CalendarRecord>;
+  setCalendarRoles(key: CalendarKey, roles: { source: boolean; destination: boolean }): void;
+  /** Stops syncing a calendar, as `calsync calendar remove` does. Rejects with
+   * LockTimeoutError once `lockTimeoutMs` passes with a sync holding the lock. */
+  removeCalendar(
+    key: CalendarKey,
+    options: { lockTimeoutMs: number; keepBlocks?: boolean },
+  ): Promise<ReconcileResult | undefined>;
+  disconnectAccount(slot: string): Promise<void>;
   syncSummary(): StoredSyncSummary;
   /** Same view as `calsync exclude list` and the MCP `list_exclusions` tool. */
   listExclusions(): ExclusionSnapshot;
@@ -116,17 +159,31 @@ export interface WebServerOptions {
   onLog?: (line: string) => void;
 }
 
-export interface WebAccountView {
-  role: AccountRole;
-  connected: boolean;
+/** One Google sign-in, as the dashboard shows it. */
+export interface WebSignInView {
+  slot: string;
+  email: string | null;
   valid: boolean;
-  calendarId: string | null;
-  calendarUrl: string | null;
-  /** The Google account (primary calendar id) behind a valid connection. */
-  account: string | null;
   message: string;
-  /** Another tenant on this host syncs the same calendar pair. A flag only:
-   * a tenant id derives from someone else's sign-in and is never sent. */
+  /** Calendars synced through it; it can be removed only at zero. */
+  calendars: number;
+}
+
+/** One synced calendar, as the dashboard shows it. */
+export interface WebCalendarView {
+  key: CalendarKey;
+  /** How a person names it: the account's email, and its name unless it is the account's own. */
+  label: string;
+  account: string | null;
+  calendarUrl: string | null;
+  shares: boolean;
+  receives: boolean;
+  /** Write access, without which it can only share. */
+  writable: boolean;
+  valid: boolean;
+  message: string;
+  /** Another tenant on this host syncs it alongside another of these calendars.
+   * A flag only: a tenant id derives from someone else's sign-in and is never sent. */
   conflict: boolean;
 }
 
@@ -134,14 +191,23 @@ export interface WebStatusView {
   tenant: string;
   overall: "syncing" | "daemon-offline" | "setup";
   daemonRunning: boolean;
-  accounts: WebAccountView[];
+  signIns: WebSignInView[];
+  calendars: WebCalendarView[];
+  maxCalendars: number;
+  /** A free sign-in slot remains for another Google account. */
+  canAddAccount: boolean;
   lastFullSyncAt: string | null;
   lastResult: {
     converged: boolean;
-    personalToWorkActive: number;
-    workToPersonalActive: number;
+    /** Busy blocks on each calendar, by calendar key. */
+    blocks: Record<CalendarKey, number>;
   } | null;
   connectMode: "local" | "external";
+}
+
+/** A calendar a signed-in account can see, for the dashboard's add list. */
+export interface WebAvailableCalendar extends AvailableCalendar {
+  synced: boolean;
 }
 
 export type WebPreviewStatus =
@@ -150,7 +216,8 @@ export type WebPreviewStatus =
 /** One source event as the dry-run preview shows it: the title the person
  * needs to recognise it, when it is, and the keys that would exclude it. */
 export interface WebPreviewEvent {
-  direction: "personalToWork" | "workToPersonal";
+  /** Calendar the event is on. */
+  source: CalendarKey;
   title: string | null;
   when: ReconcileTimeRange;
   recurring: boolean;
@@ -162,7 +229,8 @@ export interface WebPreviewView {
   ranAt: string;
   planned: { created: number; updated: number; deleted: number; repaired: number };
   converged: boolean;
-  mirrors: SyncReconcileResult["mirrors"];
+  destinations: SyncReconcileResult["destinations"];
+  sources: SyncReconcileResult["sources"];
   events: WebPreviewEvent[];
 }
 
@@ -170,7 +238,7 @@ export interface WebPreviewView {
  * doubles another block or stands alone with no event behind it. Managed
  * blocks are all titled "Busy", so there is no title to leak. */
 export interface WebDedupeRemoval {
-  calendar: AccountRole;
+  calendar: CalendarKey;
   when: ReconcileTimeRange;
   kind: StrayBlockKind;
 }
@@ -180,7 +248,7 @@ export interface WebDedupeView {
   /** False for a dry run: `removals` are what a real run would delete. */
   applied: boolean;
   /** Managed busy blocks checked on each calendar. */
-  inspected: Record<AccountRole, number>;
+  inspected: Record<CalendarKey, number>;
   removals: WebDedupeRemoval[];
 }
 
@@ -207,6 +275,8 @@ const STATUS_CACHE_MS = 5_000;
  * it reports progress and has no connection to tie up.
  */
 const LOCK_TIMEOUT_MS = 5_000;
+/** How long a gateway sign-in keeps its slot while the person is at Google. */
+const RESERVED_SLOT_MS = 60 * 60 * 1_000;
 
 export type WebTokenKind = "link" | "session";
 
@@ -218,6 +288,13 @@ export class WebServer {
   readonly #previews = new Map<string, Promise<WebPreviewView>>();
   /** Likewise for stray-block checks and removals, keyed by tenant and mode. */
   readonly #dedupes = new Map<string, Promise<WebDedupeView>>();
+  /**
+   * Slots handed to gateway sign-ins still in progress, by tenant, with when.
+   * Each sign-in gets a fresh one (never the slot of an account it may be
+   * replacing), and status adopts any the person did not come back from —
+   * a link opened in another browser lands without this dashboard's cookie.
+   */
+  readonly #reserved = new Map<string, Map<string, number>>();
 
   constructor(private readonly options: WebServerOptions) {}
 
@@ -340,12 +417,24 @@ export class WebServer {
       respondJson(response, 200, await this.#status(tenant, url.searchParams.has("fresh")));
       return;
     }
-    if (request.method === "POST" && url.pathname === "/api/connect") {
+    if (request.method === "POST" && url.pathname === "/api/accounts") {
       if (!isSameOriginJson(request)) {
         respondJson(response, 403, { error: "cross-site request refused" });
         return;
       }
-      await this.#connect(tenant, request, response);
+      await this.#accounts(tenant, request, response);
+      return;
+    }
+    if (request.method === "GET" && url.pathname === "/api/calendars/available") {
+      await this.#available(tenant, url.searchParams.get("account"), response);
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/api/calendars") {
+      if (!isSameOriginJson(request)) {
+        respondJson(response, 403, { error: "cross-site request refused" });
+        return;
+      }
+      await this.#calendars(tenant, request, response);
       return;
     }
     if (request.method === "GET" && url.pathname === "/api/exclusions") {
@@ -439,92 +528,372 @@ export class WebServer {
 
   async #liveStatus(tenant: string): Promise<WebStatusView> {
     const runtime = this.#runtime(tenant);
-    const stored = new Map(runtime.listAccounts().map((account) => [account.role, account]));
-    const accounts = await Promise.all(
-      accountRoles.map(async (role): Promise<WebAccountView> => {
-        const calendarId = stored.get(role)?.calendarId ?? this.options.defaultCalendarIds[role];
-        let status: AccountStatus;
-        try {
-          // Live validation; in brokered mode a passing check also records
-          // the account row, which is what makes the daemon adopt the tenant.
-          status = await runtime.getStatus(role, calendarId);
-        } catch (error) {
-          status = {
-            role,
-            configured: stored.has(role),
-            valid: false,
-            calendarId,
-            message: errorName(error),
-          };
-        }
-        return {
-          role,
-          connected: status.configured,
-          valid: status.valid,
-          calendarId: status.configured ? status.calendarId : null,
-          calendarUrl: status.configured ? calendarUrl(status.account ?? status.calendarId) : null,
-          account: status.valid ? (status.account ?? null) : null,
-          message: status.message,
-          conflict: status.conflictsWith !== undefined,
-        };
-      }),
+    await this.#adoptReserved(tenant);
+    // A tenant that never signed in may have finished a role connect at the
+    // gateway: a passing check is what records it.
+    if (!runtime.hasSignedIn()) {
+      await Promise.all(
+        accountRoles.map((role) =>
+          runtime.getStatus(role, this.options.defaultCalendarIds[role]).catch(() => undefined),
+        ),
+      );
+    }
+    // A check that throws (Google unreachable) is an invalid entry, not a failed page.
+    const accountChecks = await Promise.all(
+      runtime.listGoogleAccounts().map((account) =>
+        runtime.checkAccount(account.slot).catch((error: unknown): GoogleAccountStatus => ({
+          slot: account.slot,
+          email: account.email,
+          valid: false,
+          message: errorName(error),
+        })),
+      ),
     );
+    const calendarChecks = await Promise.all(
+      runtime.listCalendars().map((calendar) =>
+        runtime.checkCalendar(calendar).catch((error: unknown): CalendarStatus => ({
+          calendar,
+          valid: false,
+          message: errorName(error),
+        })),
+      ),
+    );
+    const accounts = runtime.listGoogleAccounts();
+    const calendars = calendarChecks.map((check): WebCalendarView => {
+      const calendar = check.calendar;
+      const email = accounts.find((account) => account.slot === calendar.account)?.email ?? null;
+      const id = calendar.calendarId === "primary" ? email : calendar.calendarId;
+      return {
+        key: calendar.key,
+        label: calendarLabel(calendar, accounts),
+        account: email,
+        calendarUrl: id === null ? null : calendarUrl(id),
+        shares: calendar.source,
+        receives: calendar.destination,
+        writable: isWritableAccessRole(calendar.accessRole),
+        valid: check.valid,
+        message: check.message,
+        conflict: check.conflictsWith !== undefined,
+      };
+    });
+    const signIns = accountChecks.map((check): WebSignInView => ({
+      slot: check.slot,
+      email: check.email,
+      valid: check.valid,
+      message: check.message,
+      calendars: calendars.filter(
+        (calendar) =>
+          runtime.listCalendars().find((record) => record.key === calendar.key)?.account ===
+          check.slot,
+      ).length,
+    }));
     const daemonRunning = this.options.daemonIsRunning(this.options.daemonLockPath);
-    const allValid = accounts.every((account) => account.valid);
+    // Syncing needs one calendar to share busy time and another to receive
+    // it; a sign-in no calendar uses does not hold that up.
+    const ready =
+      calendars.every((calendar) => calendar.valid) &&
+      calendars.some(
+        (receiver) =>
+          receiver.receives &&
+          calendars.some((sharer) => sharer.shares && sharer.key !== receiver.key),
+      ) &&
+      signIns.every((signIn) => signIn.valid || signIn.calendars === 0);
     const summary = runtime.syncSummary();
     return {
       tenant,
-      overall: !allValid ? "setup" : daemonRunning ? "syncing" : "daemon-offline",
+      overall: !ready ? "setup" : daemonRunning ? "syncing" : "daemon-offline",
       daemonRunning,
-      accounts,
+      signIns,
+      calendars,
+      maxCalendars: MAX_CALENDARS,
+      canAddAccount: runtime.freeAccountSlot() !== undefined,
       lastFullSyncAt: summary.lastFullSyncAt,
       lastResult:
         summary.lastResult === null
           ? null
           : {
               converged: summary.lastResult.converged,
-              personalToWorkActive: summary.lastResult.mirrors.personalToWork.active,
-              workToPersonalActive: summary.lastResult.mirrors.workToPersonal.active,
+              blocks: Object.fromEntries(
+                Object.entries(summary.lastResult.destinations).map(([key, totals]) => [
+                  key,
+                  totals.active,
+                ]),
+              ),
             },
       connectMode: this.options.connectUrl === undefined ? "local" : "external",
     };
   }
 
-  async #connect(
+  /**
+   * `{ action: "connect" }` signs in another Google account; `{ action:
+   * "reconnect", slot }` signs one in again; `{ action: "adopt", slot }`
+   * records one the gateway just finished (the page passes back the slot the
+   * gateway named, tenant prefix and all); `{ action: "remove", slot }`
+   * forgets one no calendar uses.
+   */
+  async #accounts(
     tenant: string,
     request: IncomingMessage,
     response: ServerResponse,
   ): Promise<void> {
     const body = await readJsonBody(request);
-    const role = body === null ? undefined : body["role"];
-    if (role !== "personal" && role !== "work") {
-      respondJson(response, 400, { error: "role must be personal or work" });
-      return;
+    const action = body?.["action"];
+    const runtime = this.#runtime(tenant);
+    const known = (slot: unknown): string | null => {
+      if (typeof slot !== "string") {
+        return null;
+      }
+      const bare = slot.startsWith(`${tenant}_`) ? slot.slice(tenant.length + 1) : slot;
+      return (accountRoles as readonly string[]).includes(bare) ||
+        (accountSlots as readonly string[]).includes(bare)
+        ? bare
+        : null;
+    };
+    try {
+      if (action === "connect" || action === "reconnect") {
+        const existing = action === "reconnect" ? known(body?.["slot"]) : undefined;
+        if (existing === null) {
+          respondJson(response, 400, { error: "unknown account" });
+          return;
+        }
+        this.#statusCache.delete(tenant);
+        respondJson(response, 200, await this.#connectUrl(tenant, existing));
+        return;
+      }
+      if (action === "adopt") {
+        const slot = known(body?.["slot"]);
+        if (slot === null) {
+          respondJson(response, 400, { error: "unknown account" });
+          return;
+        }
+        const adopted = await runtime.adoptSignIn(slot);
+        if (adopted.status !== "missing") {
+          this.#reserved.get(tenant)?.delete(slot);
+        }
+        this.#statusCache.delete(tenant);
+        this.#log({ event: "web_account_adopted", tenant, result: adopted.status });
+        if (adopted.status === "missing") {
+          respondJson(response, 409, { status: adopted.status, error: adopted.message });
+          return;
+        }
+        respondJson(response, 200, {
+          status: adopted.status,
+          email: adopted.status === "mismatch" ? adopted.email : adopted.account.email,
+        });
+        return;
+      }
+      if (action === "remove") {
+        const slot = known(body?.["slot"]);
+        if (slot === null) {
+          respondJson(response, 400, { error: "unknown account" });
+          return;
+        }
+        await runtime.disconnectAccount(slot);
+        this.#statusCache.delete(tenant);
+        respondJson(response, 200, { removed: slot });
+        return;
+      }
+      respondJson(response, 400, { error: "action must be connect, reconnect, adopt or remove" });
+    } catch (error) {
+      respondJson(response, 400, { error: error instanceof Error ? error.message : "failed" });
     }
+  }
+
+  /**
+   * Where to send the person to sign in. Under the gateway: its connect URL
+   * for the tenant's slot, which brings them back with `?connected=<slot>`.
+   * Locally: calsync's own consent, finished in another tab.
+   */
+  async #connectUrl(
+    tenant: string,
+    existing: string | undefined,
+  ): Promise<{ url: string; external: boolean; expiresAt?: string }> {
+    const runtime = this.#runtime(tenant);
     const template = this.options.connectUrl;
     if (template !== undefined) {
-      respondJson(response, 200, {
+      // The gateway stores the token under whatever slot it is given, before
+      // calsync sees whose it is — so never an existing account's slot, even
+      // to reconnect it: a different Google account picked at Google would
+      // take that account's calendars over. Adoption matches by email.
+      const reserved = this.#reservedFor(tenant);
+      const slot = runtime.freeAccountSlot(reserved.keys());
+      if (slot === undefined) {
+        throw new Error(
+          `calsync holds at most ${String(accountSlots.length)} added Google accounts; remove one first`,
+        );
+      }
+      reserved.set(slot, Date.now());
+      return {
         url: template
-          .replaceAll("{slot}", tokenSlot(role, tenant))
+          .replaceAll("{slot}", tokenSlot(slot, tenant))
           .replaceAll("{tenant}", tenant)
-          .replaceAll("{role}", role),
+          .replaceAll("{role}", slot),
         external: true,
-      });
+      };
+    }
+    // The pending OAuth session (and its callback listener) lives on the
+    // cached runtime, so it survives past this request until the person
+    // finishes in the browser.
+    if (existing !== undefined && (accountRoles as readonly string[]).includes(existing)) {
+      const role = existing as AccountRole;
+      const calendarId =
+        runtime.listCalendars().find((calendar) => calendar.key === role)?.calendarId ??
+        this.options.defaultCalendarIds[role];
+      const started = await runtime.startConnect(role, calendarId);
+      return { url: started.url, expiresAt: started.expiresAt, external: false };
+    }
+    // Locally the token is matched by email before it is stored, so an
+    // account signed in again lands on its own slot.
+    const started = await runtime.startAccountConnect();
+    return { url: started.url, expiresAt: started.expiresAt, external: false };
+  }
+
+  /** This tenant's in-progress sign-in slots, dropping any left over an hour. */
+  #reservedFor(tenant: string): Map<string, number> {
+    let reserved = this.#reserved.get(tenant);
+    if (reserved === undefined) {
+      reserved = new Map();
+      this.#reserved.set(tenant, reserved);
+    }
+    const cutoff = Date.now() - RESERVED_SLOT_MS;
+    for (const [slot, at] of reserved) {
+      if (at < cutoff) {
+        reserved.delete(slot);
+      }
+    }
+    return reserved;
+  }
+
+  /** Records gateway sign-ins whose person never came back to say so. */
+  async #adoptReserved(tenant: string): Promise<void> {
+    const runtime = this.#runtime(tenant);
+    for (const slot of [...this.#reservedFor(tenant).keys()]) {
+      if (runtime.listGoogleAccounts().some((account) => account.slot === slot)) {
+        this.#reserved.get(tenant)?.delete(slot);
+        continue;
+      }
+      const adopted = await runtime.adoptSignIn(slot).catch(() => undefined);
+      if (adopted !== undefined && adopted.status !== "missing") {
+        this.#reserved.get(tenant)?.delete(slot);
+        this.#log({ event: "web_account_adopted", tenant, result: adopted.status });
+      }
+    }
+  }
+
+  async #available(tenant: string, slot: string | null, response: ServerResponse): Promise<void> {
+    const runtime = this.#runtime(tenant);
+    if (slot === null || !runtime.listGoogleAccounts().some((account) => account.slot === slot)) {
+      respondJson(response, 400, { error: "unknown account" });
       return;
     }
+    try {
+      const synced = runtime.listCalendars();
+      const calendars = (await runtime.availableCalendars(slot)).map(
+        (option): WebAvailableCalendar => ({
+          ...option,
+          synced: synced.some(
+            (calendar) =>
+              calendar.calendarId.toLowerCase() === option.calendarId.toLowerCase() ||
+              (option.primary && calendar.account === slot && calendar.calendarId === "primary"),
+          ),
+        }),
+      );
+      respondJson(response, 200, { calendars });
+    } catch (error) {
+      respondJson(response, 502, {
+        error: error instanceof Error ? error.message : "could not list calendars",
+      });
+    }
+  }
+
+  /**
+   * `{ action: "add", account, calendarId, shares, receives }`, `{ action:
+   * "update", key, shares, receives }`, or `{ action: "remove", key,
+   * keepBlocks? }` — the `calsync calendar` commands. Removal runs a pass, so
+   * a sync holding the lock is a 409 the page can retry.
+   */
+  async #calendars(
+    tenant: string,
+    request: IncomingMessage,
+    response: ServerResponse,
+  ): Promise<void> {
+    const body = await readJsonBody(request);
+    const action = body?.["action"];
     const runtime = this.#runtime(tenant);
-    const calendarId =
-      runtime.listAccounts().find((account) => account.role === role)?.calendarId ??
-      this.options.defaultCalendarIds[role];
-    // The pending OAuth session (and its callback listener) lives on the
-    // cached runtime, so it survives past this request until the user
-    // finishes in the browser.
-    const started = await runtime.startConnect(role, calendarId);
-    respondJson(response, 200, {
-      url: started.url,
-      expiresAt: started.expiresAt,
-      external: false,
-    });
+    const roles = {
+      source: body?.["shares"] !== false,
+      destination: body?.["receives"] !== false,
+    };
+    const calendar = (): CalendarRecord | undefined =>
+      runtime.listCalendars().find((entry) => entry.key === body?.["key"]);
+    try {
+      if (action === "add") {
+        const account = body?.["account"];
+        const calendarId = body?.["calendarId"];
+        if (typeof account !== "string" || typeof calendarId !== "string") {
+          respondJson(response, 400, { error: "account and calendarId are required" });
+          return;
+        }
+        const added = await runtime.connectCalendar(account, calendarId, roles);
+        this.#statusCache.delete(tenant);
+        this.#log({ event: "web_calendar_added", tenant });
+        respondJson(response, 200, { key: added.key });
+        return;
+      }
+      if (action === "update") {
+        const existing = calendar();
+        if (existing === undefined) {
+          respondJson(response, 404, { error: "unknown calendar" });
+          return;
+        }
+        if (!roles.source && !roles.destination) {
+          respondJson(response, 400, {
+            error: "a calendar must share busy time, receive it, or both",
+          });
+          return;
+        }
+        if (roles.destination && !isWritableAccessRole(existing.accessRole)) {
+          respondJson(response, 400, {
+            error: "calsync cannot write busy blocks to that calendar",
+          });
+          return;
+        }
+        runtime.setCalendarRoles(existing.key, roles);
+        this.#statusCache.delete(tenant);
+        respondJson(response, 200, { key: existing.key });
+        return;
+      }
+      if (action === "remove") {
+        const existing = calendar();
+        if (existing === undefined) {
+          respondJson(response, 404, { error: "unknown calendar" });
+          return;
+        }
+        // A removal runs a full pass and writes, like pruning.
+        if (
+          this.options.scanGate !== undefined &&
+          !this.#admit(tenant, "write", "remove", response)
+        ) {
+          return;
+        }
+        const result = await runtime.removeCalendar(existing.key, {
+          lockTimeoutMs: LOCK_TIMEOUT_MS,
+          ...(body?.["keepBlocks"] === true ? { keepBlocks: true } : {}),
+        });
+        this.options.scanGate?.record(tenant, "write");
+        this.#statusCache.delete(tenant);
+        this.#log({ event: "web_calendar_removed", tenant, deleted: result?.deleted ?? null });
+        respondJson(response, 200, { removed: existing.key, deleted: result?.deleted ?? null });
+        return;
+      }
+      respondJson(response, 400, { error: "action must be add, update or remove" });
+    } catch (error) {
+      if (error instanceof LockTimeoutError) {
+        respondJson(response, 409, { error: "a sync is running right now; try again in a moment" });
+        return;
+      }
+      respondJson(response, 400, { error: error instanceof Error ? error.message : "failed" });
+    }
   }
 
   /**
@@ -637,7 +1006,8 @@ export class WebServer {
         repaired: result.repaired,
       },
       converged: result.converged,
-      mirrors: result.mirrors,
+      destinations: result.destinations,
+      sources: result.sources,
       events: sources.map(previewEvent),
     };
     this.options.scanGate?.remember(tenant, "preview", view);
@@ -704,14 +1074,14 @@ export class WebServer {
     for (const operation of operations) {
       const kind = STRAY_KINDS[operation.reason];
       if (kind !== undefined && operation.timeRange !== undefined) {
-        removals.push({ calendar: operation.destinationRole, when: operation.timeRange, kind });
+        removals.push({ calendar: operation.destinationKey, when: operation.timeRange, kind });
       }
     }
     this.#log({
       event: "web_dedupe",
       tenant,
       applied: apply,
-      inspected: result.inspected.personal + result.inspected.work,
+      inspected: Object.values(result.inspected).reduce((sum, count) => sum + count, 0),
       removed: result.deleted,
     });
     const gate = this.options.scanGate;
@@ -743,7 +1113,7 @@ export class WebServer {
   #admit(
     tenant: string,
     operation: ScanOperation,
-    what: "preview" | "dedupe",
+    what: "preview" | "dedupe" | "remove",
     response: ServerResponse,
   ): boolean {
     const decision = this.options.scanGate?.check(tenant, operation) ?? { allowed: true };
@@ -1004,7 +1374,7 @@ async function readJsonBody(request: IncomingMessage): Promise<Record<string, un
 
 function previewEvent(source: ReconcileSourceDetail): WebPreviewEvent {
   return {
-    direction: source.sourceRole === "personal" ? "personalToWork" : "workToPersonal",
+    source: source.sourceKey,
     title: source.sourceTitle ?? null,
     when: source.timeRange,
     recurring: source.isRecurring,

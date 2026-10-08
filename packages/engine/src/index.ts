@@ -53,11 +53,11 @@ export {
   calendarWindow,
   CleanupPassError,
   DedupePassError,
-  mappingKey,
   ReconcilePassError,
   Reconciler,
   type DedupeResult,
-  type MirrorDirectionSummary,
+  type DestinationSummary,
+  type SourceSummary,
   type StrayBlockKind,
   type ReconcileLog,
   type ReconcileOperation,
@@ -73,6 +73,8 @@ export {
 export {
   LAST_FULL_SYNC_KEY,
   LAST_RESULT_KEY,
+  calendarStateKeys,
+  parseStoredResult,
   readSyncSummary,
   stateKey,
   SyncEngine,
@@ -82,15 +84,14 @@ export {
   type SyncStatus,
 } from "./sync.js";
 export type {
-  AccountConfig,
-  AccountRole,
   CalendarAPI,
   CalendarChangeSet,
+  CalendarConfig,
+  CalendarKey,
   CalendarListProgress,
   CalendarWindow,
   Clock,
   EventMapping,
-  ExclusionDirection,
   ExclusionSource,
   IncrementalCalendarAPI,
   MappingStore,
@@ -100,4 +101,4 @@ export type {
   SyncExclusions,
   SyncStateStore,
 } from "./types.js";
-export { accountRoles } from "./types.js";
+export { legacyCalendarKeys } from "./types.js";

@@ -13,7 +13,11 @@ import type { AppConfig } from "../src/config.js";
 import { createCalsyncMcpServer, runMcpStdioServer } from "../src/mcp/server.js";
 import { previewProgressFromLockWait } from "../src/mcp/progress.js";
 import {
+  handleAddCalendar,
   handleAddExclusion,
+  handleConnectAccount,
+  handleListCalendars,
+  handleRemoveCalendar,
   handleConnectProvider,
   handleGetStatus,
   handleListExclusions,
@@ -60,9 +64,13 @@ describe("MCP tool handlers", () => {
         repaired: 0,
         failed: 0,
         converged: true,
-        mirrors: {
-          personalToWork: { active: 4, excluded: 1, duplicateSuppressed: 0 },
-          workToPersonal: { active: 3, excluded: 0, duplicateSuppressed: 2 },
+        destinations: {
+          work: { active: 4, duplicateSuppressed: 0 },
+          personal: { active: 3, duplicateSuppressed: 2 },
+        },
+        sources: {
+          personal: { excluded: 1 },
+          work: { excluded: 0 },
         },
         access_token: "ya29.secret-token",
         sourceTitle: "Dentist",
@@ -76,29 +84,23 @@ describe("MCP tool handlers", () => {
       return;
     }
     const json = JSON.stringify(toJsonPayload(result.data));
-    expect(result.data.accounts).toEqual([
-      {
-        role: "personal",
-        configured: true,
-        valid: true,
-        writable: true,
-        message: "authorized and writable",
-      },
-      {
-        role: "work",
-        configured: true,
-        valid: true,
-        writable: true,
-        message: "authorized and writable",
-      },
+    // Without account management, the two roles' checks stand in for sign-ins.
+    expect(result.data.signIns).toEqual([
+      { account: "personal", valid: true, message: "authorized and writable", calendars: 0 },
+      { account: "work", valid: true, message: "authorized and writable", calendars: 0 },
     ]);
+    expect(result.data.calendars).toEqual([]);
     expect(result.data.lastSync).toMatchObject({
       created: 2,
       deleted: 1,
       lastFullSyncAt: "2026-08-14T12:00:00.000Z",
-      mirrors: {
-        personalToWork: { active: 4, excluded: 1, duplicateSuppressed: 0 },
-        workToPersonal: { active: 3, excluded: 0, duplicateSuppressed: 2 },
+      destinations: {
+        work: { active: 4, duplicateSuppressed: 0 },
+        personal: { active: 3, duplicateSuppressed: 2 },
+      },
+      sources: {
+        personal: { excluded: 1 },
+        work: { excluded: 0 },
       },
     });
     expect(json).not.toContain("ya29");
@@ -128,7 +130,7 @@ describe("MCP tool handlers", () => {
       return;
     }
     expect(result.data.lastSync?.created).toBe(7);
-    expect(result.data.lastSync?.mirrors.personalToWork.active).toBe(7);
+    expect(result.data.lastSync?.destinations["work"]?.active).toBe(7);
     expect(result.data.lastSync?.lastFullSyncAt).toBe("2026-09-22T00:00:00.000Z");
   });
 
@@ -241,7 +243,7 @@ describe("MCP tool handlers", () => {
     expect(result.error.code).toBe("connect_unavailable");
   });
 
-  it("previews sync as directional counts and omits titles unless the dangerous flag is on", async () => {
+  it("previews sync as per-calendar counts and omits titles unless the dangerous flag is on", async () => {
     const once = vi.fn((options?: Parameters<SyncService["once"]>[0]) => {
       options?.onOperation?.(
         operation("personal", "work", "create", "destination-missing", "Private planning"),
@@ -267,16 +269,16 @@ describe("MCP tool handlers", () => {
     expect(once.mock.calls[0]?.[0]).not.toHaveProperty("lockTimeoutMs");
     expect(preview.data.operations).toEqual([
       {
-        direction: "personalToWork",
-        operation: "create",
-        reason: "destination-missing",
-        count: 2,
-      },
-      {
-        direction: "workToPersonal",
+        destination: "personal",
         operation: "update",
         reason: "destination-drifted",
         count: 1,
+      },
+      {
+        destination: "work",
+        operation: "create",
+        reason: "destination-missing",
+        count: 2,
       },
     ]);
     const defaultJson = JSON.stringify(toJsonPayload(preview.data));
@@ -390,8 +392,8 @@ describe("MCP tool handlers", () => {
     }
     expect(listed.data.keywords).toEqual(
       expect.arrayContaining([
-        { value: "dentist", direction: "personalToWork", origin: "cli" },
-        { value: "focus time", direction: "personalToWork", origin: "env" },
+        { value: "dentist", source: "personal", origin: "cli" },
+        { value: "focus time", source: "personal", origin: "env" },
       ]),
     );
     expect(listed.data.keys.map((entry) => entry.value)).toEqual(
@@ -404,7 +406,7 @@ describe("MCP tool handlers", () => {
       return;
     }
     expect(removed.data.removed).toEqual([
-      { kind: "key", value: PERSONAL_KEY, direction: "personalToWork" },
+      { kind: "key", value: PERSONAL_KEY, source: "personal" },
     ]);
   });
 
@@ -421,7 +423,7 @@ describe("MCP tool handlers", () => {
     expect(result.data).toMatchObject({
       dryRun: false,
       created: 1,
-      mirrors: { personalToWork: { active: 1 } },
+      destinations: { work: { active: 1 } },
     });
     expect(JSON.stringify(toJsonPayload(result.data))).not.toContain("title");
   });
@@ -486,6 +488,10 @@ describe("MCP stdio server", () => {
       expect(listed.tools.map((tool) => tool.name)).toEqual([
         "get_status",
         "connect_provider",
+        "connect_account",
+        "list_calendars",
+        "add_calendar",
+        "remove_calendar",
         "preview_sync",
         "add_exclusion",
         "sync_now",
@@ -498,7 +504,7 @@ describe("MCP stdio server", () => {
       const status = await client.callTool({ name: "get_status", arguments: {} });
       expect("isError" in status && status.isError === true).toBe(false);
       const encoded = JSON.stringify(status);
-      expect(encoded).toContain('"writable":true');
+      expect(encoded).toContain('"valid":true');
       expect(encoded).not.toContain("ya29");
       expect(encoded).not.toContain("personal@example.com");
     } finally {
@@ -599,7 +605,7 @@ describe("MCP stdio server", () => {
       expect("isError" in listed && listed.isError === true).toBe(false);
       const status = await client.callTool({ name: "get_status", arguments: {} });
       expect("isError" in status && status.isError === true).toBe(false);
-      expect(JSON.stringify(status)).toContain('"writable":true');
+      expect(JSON.stringify(status)).toContain('"valid":true');
       expect(JSON.stringify(status)).not.toContain("The database connection is not open");
     } finally {
       await client.close();
@@ -697,9 +703,13 @@ function storedAggregates(created: number): Record<string, unknown> {
     repaired: 0,
     failed: 0,
     converged: true,
-    mirrors: {
-      personalToWork: { active: created, excluded: 0, duplicateSuppressed: 0 },
-      workToPersonal: { active: 0, excluded: 0, duplicateSuppressed: 0 },
+    destinations: {
+      work: { active: created, duplicateSuppressed: 0 },
+      personal: { active: 0, duplicateSuppressed: 0 },
+    },
+    sources: {
+      personal: { excluded: 0 },
+      work: { excluded: 0 },
     },
   };
 }
@@ -707,6 +717,22 @@ function storedAggregates(created: number): Record<string, unknown> {
 function configFixture(tenantId = "default"): AppConfig {
   return {
     tenantId,
+    calendars: [
+      {
+        key: "personal",
+        account: "personal",
+        calendarId: "personal@example.com",
+        source: true,
+        destination: true,
+      },
+      {
+        key: "work",
+        account: "work",
+        calendarId: "work@example.com",
+        source: true,
+        destination: true,
+      },
+    ],
     accounts: {
       personal: { tenantId, role: "personal", calendarId: "personal@example.com" },
       work: { tenantId, role: "work", calendarId: "work@example.com" },
@@ -715,10 +741,8 @@ function configFixture(tenantId = "default"): AppConfig {
     window: { pastDays: 30, futureDays: 365 },
     timezone: "UTC",
     exclusions: {
-      personalToWork: [],
-      workToPersonal: [],
-      personalToWorkKeywords: ["focus time"],
-      workToPersonalKeywords: [],
+      keys: { personal: [], work: [] },
+      keywords: { personal: ["focus time"], work: [] },
     },
   };
 }
@@ -732,8 +756,8 @@ function operation(
 ): ReconcileLog {
   return {
     operation: operationName,
-    sourceRole,
-    destinationRole,
+    destinationKey: destinationRole,
+    sourceKeys: [sourceRole],
     reason,
     sourceTitles: [sourceTitle],
     timeRange: {
@@ -763,17 +787,159 @@ function syncResult(
     repaired: values.repaired ?? 0,
     failed: values.failed ?? 0,
     converged: values.converged ?? true,
-    mirrors: {
-      personalToWork: {
-        active: values.personalActive ?? 0,
-        excluded: 0,
-        duplicateSuppressed: 0,
-      },
-      workToPersonal: {
-        active: values.workActive ?? 0,
-        excluded: 0,
-        duplicateSuppressed: 0,
-      },
+    destinations: {
+      work: { active: values.personalActive ?? 0, duplicateSuppressed: 0 },
+      personal: { active: values.workActive ?? 0, duplicateSuppressed: 0 },
+    },
+    sources: {
+      personal: { excluded: 0 },
+      work: { excluded: 0 },
     },
   };
 }
+
+describe("MCP calendar tools", () => {
+  function accountsRuntime(connectUrl?: string) {
+    const state = new StateDatabase(":memory:");
+    databases.push(state);
+    state.upsertGoogleAccount("account1", "me@work.test");
+    state.addCalendar({
+      key: "cal-mine",
+      account: "account1",
+      calendarId: "me@work.test",
+      name: "me@work.test",
+      fingerprint: "fp-mine",
+    });
+    const removed: string[] = [];
+    const accounts: NonNullable<McpRuntime["accounts"]> = {
+      auth: {
+        connectAccount: vi.fn(),
+        startAccountConnect: () =>
+          Promise.resolve({ slot: "account2", url: "https://consent", expiresAt: "later" }),
+        freeAccountSlot: (reserved: Iterable<string>) =>
+          [...reserved].includes("account2") ? "account3" : "account2",
+        adoptSignIn: (slot: string) => {
+          state.upsertGoogleAccount(slot, "colleague@work.test");
+          const account = state.getGoogleAccount(slot);
+          return account === null
+            ? Promise.resolve({ status: "missing" as const, message: "no token" })
+            : Promise.resolve({ status: "adopted" as const, account });
+        },
+        availableCalendars: () =>
+          Promise.resolve([
+            {
+              calendarId: "me@work.test",
+              name: "me@work.test",
+              accessRole: "owner",
+              primary: true,
+              writable: true,
+              readable: true,
+            },
+            {
+              calendarId: "team@group.test",
+              name: "Team",
+              accessRole: "writer",
+              primary: false,
+              writable: true,
+              readable: true,
+            },
+          ]),
+        connectCalendar: (slot: string, calendarId: string, roles) => {
+          state.addCalendar({
+            key: "cal-team",
+            account: slot,
+            calendarId,
+            name: "Team",
+            source: roles?.source ?? true,
+            destination: roles?.destination ?? true,
+          });
+          const added = state.getCalendar("cal-team");
+          return added === null ? Promise.reject(new Error("not added")) : Promise.resolve(added);
+        },
+        checkAccount: (slot: string) =>
+          Promise.resolve({
+            slot,
+            email: state.getGoogleAccount(slot)?.email ?? null,
+            valid: true,
+            message: "signed in",
+          }),
+        checkCalendar: (calendar) =>
+          Promise.resolve({ calendar, valid: true, message: "readable and writable" }),
+        disconnectAccount: vi.fn(),
+      },
+      state,
+      removeCalendar: (key: string) => {
+        removed.push(key);
+        state.removeCalendar(key, []);
+        return Promise.resolve({ created: 0, updated: 0, deleted: 2, repaired: 0 });
+      },
+    };
+    const runtime: McpRuntime = {
+      ...mockRuntime({ state }),
+      accounts,
+      ...(connectUrl === undefined ? {} : { connectUrl }),
+    };
+    return { runtime, state, removed };
+  }
+
+  it("names sign-ins and calendars by account in get_status", async () => {
+    const { runtime } = accountsRuntime();
+    const result = await handleGetStatus(runtime);
+    expect(result.ok && result.data.signIns).toEqual([
+      { account: "me@work.test", valid: true, message: "signed in", calendars: 1 },
+    ]);
+    expect(result.ok && result.data.calendars).toEqual([
+      {
+        calendar: "me@work.test",
+        shares: true,
+        receives: true,
+        valid: true,
+        message: "readable and writable",
+      },
+    ]);
+  });
+
+  it("links to the gateway for a new sign-in and adopts it on the next status", async () => {
+    const { runtime, state } = accountsRuntime(
+      "https://gw.example.test/auth/google/connect?slot={slot}",
+    );
+    const started = await handleConnectAccount(runtime);
+    expect(started.ok && started.data.url).toBe(
+      "https://gw.example.test/auth/google/connect?slot=account2",
+    );
+    expect(state.getGoogleAccount("account2")).toBeNull();
+    await handleGetStatus(runtime);
+    expect(state.getGoogleAccount("account2")?.email).toBe("colleague@work.test");
+  });
+
+  it("lists what could be added, adds by name, and removes by name", async () => {
+    const { runtime, removed } = accountsRuntime();
+    const listed = await handleListCalendars(runtime, { available: true });
+    expect(listed.ok && listed.data.available).toEqual([
+      { calendar: "me@work.test", synced: true, can_receive: true, can_share: true },
+      { calendar: "me@work.test/Team", synced: false, can_receive: true, can_share: true },
+    ]);
+    const added = await handleAddCalendar(runtime, {
+      calendar: "me@work.test/team",
+      share_only: true,
+    });
+    expect(added.ok && added.data).toEqual({
+      calendar: "me@work.test / Team",
+      shares: true,
+      receives: false,
+    });
+    expect((await handleAddCalendar(runtime, { calendar: "nobody@x.test" })).ok).toBe(false);
+
+    const keyword = handleAddExclusion(runtime, {
+      keywords: ["standup"],
+      from: "me@work.test / Team",
+    });
+    expect(keyword.ok && keyword.data.added).toEqual([
+      { kind: "keyword", value: "standup", source: "cal-team" },
+    ]);
+
+    const result = await handleRemoveCalendar(runtime, { calendar: "me@work.test / Team" });
+    expect(result.ok && result.data).toEqual({ calendar: "me@work.test / Team", deleted: 2 });
+    expect(removed).toEqual(["cal-team"]);
+  });
+});

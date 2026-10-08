@@ -361,6 +361,22 @@ describe("sync process lock", () => {
     const state = new StateDatabase(":memory:");
     const config: AppConfig = {
       tenantId: "default",
+      calendars: [
+        {
+          key: "personal",
+          account: "personal",
+          calendarId: "personal-calendar",
+          source: true,
+          destination: true,
+        },
+        {
+          key: "work",
+          account: "work",
+          calendarId: "work-calendar",
+          source: true,
+          destination: true,
+        },
+      ],
       accounts: {
         personal: { tenantId: "default", role: "personal", calendarId: "personal-calendar" },
         work: { tenantId: "default", role: "work", calendarId: "work-calendar" },
@@ -369,10 +385,8 @@ describe("sync process lock", () => {
       window: { pastDays: 30, futureDays: 365 },
       timezone: "UTC",
       exclusions: {
-        personalToWork: [],
-        workToPersonal: [],
-        personalToWorkKeywords: [],
-        workToPersonalKeywords: [],
+        keys: { personal: [], work: [] },
+        keywords: { personal: [], work: [] },
       },
     };
     const client: CalendarAPI = {
@@ -483,7 +497,7 @@ describe("sync process lock", () => {
   it("applies CLI-stored title keywords on the next sync pass", async () => {
     const directory = mkdtempSync(join(tmpdir(), "calsync-stored-exclude-"));
     const state = new StateDatabase(":memory:");
-    state.addExclusionKeyword("personalToWork", "medical");
+    state.addExclusionKeyword("personal", "medical");
     const personal = new MemoryCalendar([
       {
         id: "private-source-id",
@@ -501,7 +515,8 @@ describe("sync process lock", () => {
 
     const result = await service.once({ dryRun: true });
     expect(result.created).toBe(0);
-    expect(result.mirrors.personalToWork).toMatchObject({ active: 0, excluded: 1 });
+    expect(result.destinations["work"]).toMatchObject({ active: 0 });
+    expect(result.sources["personal"]).toMatchObject({ excluded: 1 });
     expect(work.insertedIds).toEqual([]);
     state.close();
     rmSync(directory, { recursive: true });
@@ -539,10 +554,8 @@ describe("incremental sync orchestration", () => {
 
     runtime.state.putMapping({
       mappingKey: "mapping",
-      sourceRole: "work",
-      sourceEventId: "source",
+      destinationKey: "personal",
       destinationEventId: "managed-destination",
-      sourceEtag: null,
       destinationEtag: '"managed-v1"',
       updatedAt: new Date().toISOString(),
     });
@@ -560,10 +573,8 @@ describe("incremental sync orchestration", () => {
     await runtime.service.once();
     runtime.state.putMapping({
       mappingKey: "mapping",
-      sourceRole: "work",
-      sourceEventId: "source",
+      destinationKey: "personal",
       destinationEventId: "managed-destination",
-      sourceEtag: null,
       destinationEtag: '"managed-v1"',
       updatedAt: new Date().toISOString(),
     });
@@ -1281,6 +1292,13 @@ function tenantConfig(tenantId: string): AppConfig {
   return {
     ...testConfig(),
     tenantId,
+    calendars: (["personal", "work"] as const).map((role) => ({
+      key: role,
+      account: role,
+      calendarId: `${tenantId}-${role}-calendar`,
+      source: true,
+      destination: true,
+    })),
     accounts: {
       personal: { tenantId, role: "personal", calendarId: `${tenantId}-personal-calendar` },
       work: { tenantId, role: "work", calendarId: `${tenantId}-work-calendar` },
@@ -1428,6 +1446,22 @@ function idleCalendar(): CalendarAPI {
 function testConfig(): AppConfig {
   return {
     tenantId: "default",
+    calendars: [
+      {
+        key: "personal",
+        account: "personal",
+        calendarId: "personal-calendar",
+        source: true,
+        destination: true,
+      },
+      {
+        key: "work",
+        account: "work",
+        calendarId: "work-calendar",
+        source: true,
+        destination: true,
+      },
+    ],
     accounts: {
       personal: { tenantId: "default", role: "personal", calendarId: "personal-calendar" },
       work: { tenantId: "default", role: "work", calendarId: "work-calendar" },
@@ -1436,10 +1470,8 @@ function testConfig(): AppConfig {
     window: { pastDays: 30, futureDays: 365 },
     timezone: "UTC",
     exclusions: {
-      personalToWork: [],
-      workToPersonal: [],
-      personalToWorkKeywords: [],
-      workToPersonalKeywords: [],
+      keys: { personal: [], work: [] },
+      keywords: { personal: [], work: [] },
     },
   };
 }
@@ -1473,3 +1505,246 @@ function incrementalRuntime(): {
     },
   };
 }
+
+describe("calendars beyond the two roles", () => {
+  function threeCalendarService() {
+    const directory = mkdtempSync(join(tmpdir(), "calsync-three-"));
+    const state = new StateDatabase(":memory:");
+    const at = (id: string, hour: string) => ({
+      id,
+      start: { dateTime: `2026-08-10T${hour}:00:00Z` },
+      end: { dateTime: `2026-08-10T${hour}:30:00Z` },
+    });
+    const calendars = {
+      personal: new MemoryCalendar([at("dentist", "09")]),
+      work: new MemoryCalendar([at("standup", "10")]),
+      family: new MemoryCalendar([at("school-run", "15")]),
+    };
+    const config: AppConfig = {
+      ...testConfig(),
+      calendars: [
+        ...testConfig().calendars,
+        {
+          key: "cal-family",
+          account: "account1",
+          calendarId: "family-calendar",
+          source: true,
+          destination: true,
+        },
+      ],
+    };
+    for (const calendar of config.calendars) {
+      state.addCalendar({
+        key: calendar.key,
+        account: calendar.account,
+        calendarId: calendar.calendarId,
+      });
+    }
+    const bySlot: Record<string, MemoryCalendar> = {
+      personal: calendars.personal,
+      work: calendars.work,
+      account1: calendars.family,
+    };
+    const service = new DefaultSyncService(
+      config,
+      {
+        createCalendarClient: (slot) => {
+          const client = bySlot[slot];
+          return client === undefined
+            ? Promise.reject(new Error(`no client for ${slot}`))
+            : Promise.resolve(client);
+        },
+      },
+      state,
+      join(directory, "sync.lock"),
+      () => undefined,
+    );
+    return {
+      ...calendars,
+      state,
+      service,
+      close: () => {
+        state.close();
+        rmSync(directory, { recursive: true });
+      },
+    };
+  }
+
+  const busy = (calendar: MemoryCalendar) =>
+    calendar.events.filter((event) => event.summary === "Busy").length;
+
+  it("syncs every calendar through its own sign-in", async () => {
+    const runtime = threeCalendarService();
+    await expect(runtime.service.once()).resolves.toMatchObject({
+      destinations: { personal: { active: 2 }, work: { active: 2 }, "cal-family": { active: 2 } },
+    });
+    expect([busy(runtime.personal), busy(runtime.work), busy(runtime.family)]).toEqual([2, 2, 2]);
+    runtime.close();
+  });
+
+  it("removes a calendar's blocks, the blocks its events made, and what calsync kept for it", async () => {
+    const runtime = threeCalendarService();
+    await runtime.service.once();
+    runtime.state.addExclusionKeyword("cal-family", "soccer");
+
+    const result = await runtime.service.removeCalendar("cal-family");
+
+    // Two blocks on the family calendar, and the school run on each of the others.
+    expect(result).toMatchObject({ deleted: 4 });
+    expect([busy(runtime.personal), busy(runtime.work), busy(runtime.family)]).toEqual([1, 1, 0]);
+    expect(runtime.state.listCalendars().map((calendar) => calendar.key)).toEqual([
+      "personal",
+      "work",
+    ]);
+    expect(runtime.state.listMappings("cal-family")).toEqual([]);
+    expect(runtime.state.listExclusionKeywords()).toEqual([]);
+    expect(runtime.state.getState("incremental:sync-token:cal-family")).toBeNull();
+    runtime.close();
+  });
+
+  it("refuses a pass planned before the calendars changed", async () => {
+    const runtime = threeCalendarService();
+    await runtime.service.once();
+    // Another process removed a calendar while this service waited.
+    runtime.state.removeCalendar("cal-family", []);
+    await expect(runtime.service.once()).rejects.toThrow(/calendars changed/u);
+    expect(busy(runtime.family)).toBe(2);
+    runtime.close();
+  });
+
+  it("leaves blocks behind when told the calendar is unreachable", async () => {
+    const runtime = threeCalendarService();
+    await runtime.service.once();
+    await expect(
+      runtime.service.removeCalendar("cal-family", { keepBlocks: true }),
+    ).resolves.toBeUndefined();
+    expect(busy(runtime.family)).toBe(2);
+    expect(runtime.state.getCalendar("cal-family")).toBeNull();
+    runtime.close();
+  });
+
+  it("refuses to sync fewer than two calendars, saying how to add one", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "calsync-one-"));
+    const state = new StateDatabase(":memory:");
+    const config: AppConfig = { ...testConfig(), calendars: testConfig().calendars.slice(0, 1) };
+    const service = new DefaultSyncService(
+      config,
+      { createCalendarClient: () => Promise.resolve(new MemoryCalendar()) },
+      state,
+      join(directory, "sync.lock"),
+      () => undefined,
+    );
+    await expect(service.once()).rejects.toThrow(/connect at least two/u);
+    state.close();
+    rmSync(directory, { recursive: true });
+  });
+});
+
+describe("daemon with calendars that change while it runs", () => {
+  it("arms a calendar added mid-run and never uses a rebuilt tenant's closed store", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "calsync-rebuild-"));
+    const path = join(directory, "state.sqlite3");
+    const firstState = new StateDatabase(path);
+    const watched: string[] = [];
+    const channelApi = {
+      watchEvents: (request: { calendarId: string; channelId: string }) => {
+        watched.push(request.calendarId);
+        return Promise.resolve({
+          channelId: request.channelId,
+          resourceId: `resource-${request.calendarId}`,
+          expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1_000).toISOString(),
+        });
+      },
+      stopChannel: (): Promise<void> => Promise.resolve(),
+    };
+    const auth = {
+      createCalendarClient: () => Promise.resolve(idleCalendar()),
+      createChannelClient: () => Promise.resolve(channelApi),
+    };
+    const lines: string[] = [];
+    let resolveFirstPass!: () => void;
+    const firstPass = new Promise<void>((resolve) => {
+      resolveFirstPass = resolve;
+    });
+    const writeLog = (line: string): void => {
+      lines.push(line);
+      if (line.includes('"reconcile_complete"')) {
+        resolveFirstPass();
+      }
+    };
+    const webhook = {
+      address: "https://calsync.example.test/gcal/webhook",
+      host: "127.0.0.1",
+      port: 0,
+      path: "/gcal/webhook",
+      debounceMs: 0,
+      channelTtlSeconds: 604_800,
+      renewBeforeMs: 60 * 60 * 1_000,
+      pollIntervalMs: 20,
+    };
+    const config: AppConfig = { ...testConfig(), webhook };
+    let tenant = new DefaultSyncService(
+      config,
+      auth,
+      firstState,
+      join(directory, "default.lock"),
+      writeLog,
+    ).daemonTenant();
+    const daemon = new SyncDaemon(
+      config,
+      () => [tenant],
+      (channelId) => firstState.getWatchChannelByChannelId(channelId),
+      join(directory, "daemon.lock"),
+      writeLog,
+    );
+
+    const stop = new AbortController();
+    const running = daemon.start({ signal: stop.signal });
+    let secondState: StateDatabase | undefined;
+    try {
+      await firstPass;
+      expect([...watched].sort()).toEqual(["personal-calendar", "work-calendar"]);
+
+      // A calendar is added: the runtime rebuilds the tenant on a fresh
+      // connection and closes the old one.
+      secondState = new StateDatabase(path);
+      for (const calendar of [
+        ...config.calendars,
+        { key: "cal-family", account: "account1", calendarId: "family-calendar" },
+      ]) {
+        secondState.addCalendar({ ...calendar });
+      }
+      tenant = new DefaultSyncService(
+        {
+          ...config,
+          calendars: [
+            ...config.calendars,
+            {
+              key: "cal-family",
+              account: "account1",
+              calendarId: "family-calendar",
+              source: true,
+              destination: true,
+            },
+          ],
+        },
+        auth,
+        secondState,
+        join(directory, "default.lock"),
+        writeLog,
+      ).daemonTenant();
+      firstState.close();
+
+      for (let tries = 0; tries < 200 && !watched.includes("family-calendar"); tries += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(watched).toContain("family-calendar");
+    } finally {
+      stop.abort();
+      await running;
+      secondState?.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
+    expect(lines.some((line) => line.includes("not open"))).toBe(false);
+  });
+});
