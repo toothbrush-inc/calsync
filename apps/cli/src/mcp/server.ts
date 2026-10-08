@@ -102,14 +102,9 @@ export function createCalsyncMcpServer(runtime: McpRuntime): McpServer {
     "add_calendar",
     {
       description:
-        "Sync one more calendar (up to six). calendar is '<email>' for that account's own calendar or '<email>/<calendar name>'. By default it shares its busy time and receives the others'; share_only for a calendar that can't be written, receive_only to keep its own events private.",
+        "Sync one more calendar (up to six). calendar is '<email>' for that account's own calendar or '<email>/<calendar name>'. It shares its busy time and receives the others'; one calsync cannot write to only shares.",
       inputSchema: z.object({
         calendar: z.string().describe("'<email>' or '<email>/<calendar name>'"),
-        share_only: z.boolean().optional().describe("Share its busy time; write no blocks to it"),
-        receive_only: z
-          .boolean()
-          .optional()
-          .describe("Receive busy blocks; share none of its own busy time"),
       }),
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
     },

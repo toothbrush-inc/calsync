@@ -30,7 +30,6 @@ import type {
   ExclusionSnapshot,
 } from "../exclusions.js";
 import {
-  isWritableAccessRole,
   type AccountStatus,
   type AvailableCalendar,
   type CalendarStatus,
@@ -94,12 +93,7 @@ export interface WebTenantRuntime {
   /** Whether the tenant ever signed in: only one that never did adopts a role on status. */
   hasSignedIn(): boolean;
   availableCalendars(slot: string): Promise<AvailableCalendar[]>;
-  connectCalendar(
-    slot: string,
-    calendarId: string,
-    roles: { source: boolean; destination: boolean },
-  ): Promise<CalendarRecord>;
-  setCalendarRoles(key: CalendarKey, roles: { source: boolean; destination: boolean }): void;
+  connectCalendar(slot: string, calendarId: string): Promise<CalendarRecord>;
   /** Stops syncing a calendar, as `calsync calendar remove` does. Rejects with
    * LockTimeoutError once `lockTimeoutMs` passes with a sync holding the lock. */
   removeCalendar(
@@ -182,8 +176,6 @@ export interface WebCalendarView {
   calendarUrl: string | null;
   shares: boolean;
   receives: boolean;
-  /** Write access, without which it can only share. */
-  writable: boolean;
   valid: boolean;
   message: string;
   /** Another tenant on this host syncs it alongside another of these calendars.
@@ -583,7 +575,6 @@ export class WebServer {
         calendarUrl: id === null ? null : calendarUrl(id),
         shares: calendar.source,
         receives: calendar.destination,
-        writable: isWritableAccessRole(calendar.accessRole),
         valid: check.valid,
         message: check.message,
         conflict: check.conflictsWith !== undefined,
@@ -775,8 +766,7 @@ export class WebServer {
   }
 
   /**
-   * `{ action: "add", account, calendarId, shares, receives }`, `{ action:
-   * "update", key, shares, receives }`, or `{ action: "remove", key,
+   * `{ action: "add", account, calendarId }` or `{ action: "remove", key,
    * keepBlocks? }` — the `calsync calendar` commands. Removal runs a pass, so
    * a sync holding the lock is a 409 the page can retry.
    */
@@ -788,10 +778,6 @@ export class WebServer {
     const body = await readJsonBody(request);
     const action = body?.["action"];
     const runtime = this.#runtime(tenant);
-    const roles = {
-      source: body?.["shares"] !== false,
-      destination: body?.["receives"] !== false,
-    };
     const calendar = (): CalendarRecord | undefined =>
       runtime.listCalendars().find((entry) => entry.key === body?.["key"]);
     try {
@@ -802,33 +788,10 @@ export class WebServer {
           respondJson(response, 400, { error: "account and calendarId are required" });
           return;
         }
-        const added = await runtime.connectCalendar(account, calendarId, roles);
+        const added = await runtime.connectCalendar(account, calendarId);
         this.#statusCache.delete(tenant);
         this.#log({ event: "web_calendar_added", tenant });
         respondJson(response, 200, { key: added.key });
-        return;
-      }
-      if (action === "update") {
-        const existing = calendar();
-        if (existing === undefined) {
-          respondJson(response, 404, { error: "unknown calendar" });
-          return;
-        }
-        if (!roles.source && !roles.destination) {
-          respondJson(response, 400, {
-            error: "a calendar must share busy time, receive it, or both",
-          });
-          return;
-        }
-        if (roles.destination && !isWritableAccessRole(existing.accessRole)) {
-          respondJson(response, 400, {
-            error: "calsync cannot write busy blocks to that calendar",
-          });
-          return;
-        }
-        runtime.setCalendarRoles(existing.key, roles);
-        this.#statusCache.delete(tenant);
-        respondJson(response, 200, { key: existing.key });
         return;
       }
       if (action === "remove") {
@@ -854,7 +817,7 @@ export class WebServer {
         respondJson(response, 200, { removed: existing.key, deleted: result?.deleted ?? null });
         return;
       }
-      respondJson(response, 400, { error: "action must be add, update or remove" });
+      respondJson(response, 400, { error: "action must be add or remove" });
     } catch (error) {
       if (error instanceof LockTimeoutError) {
         respondJson(response, 409, { error: "a sync is running right now; try again in a moment" });

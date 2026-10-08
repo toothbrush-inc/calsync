@@ -65,10 +65,7 @@ export interface AccountRuntime {
     | "checkCalendar"
     | "disconnectAccount"
   >;
-  state: Pick<
-    StateDatabase,
-    "listGoogleAccounts" | "listCalendars" | "setCalendarRoles" | "hasSignedIn"
-  >;
+  state: Pick<StateDatabase, "listGoogleAccounts" | "listCalendars" | "hasSignedIn">;
   removeCalendar(
     calendarKey: string,
     options?: { keepBlocks?: boolean; lockTimeoutMs?: number },

@@ -856,15 +856,8 @@ describe("MCP calendar tools", () => {
               readable: true,
             },
           ]),
-        connectCalendar: (slot: string, calendarId: string, roles) => {
-          state.addCalendar({
-            key: "cal-team",
-            account: slot,
-            calendarId,
-            name: "Team",
-            source: roles?.source ?? true,
-            destination: roles?.destination ?? true,
-          });
+        connectCalendar: (slot: string, calendarId: string) => {
+          state.addCalendar({ key: "cal-team", account: slot, calendarId, name: "Team" });
           const added = state.getCalendar("cal-team");
           return added === null ? Promise.reject(new Error("not added")) : Promise.resolve(added);
         },
@@ -931,14 +924,11 @@ describe("MCP calendar tools", () => {
       { calendar: "me@work.test", synced: true, can_receive: true, can_share: true },
       { calendar: "me@work.test/Team", synced: false, can_receive: true, can_share: true },
     ]);
-    const added = await handleAddCalendar(runtime, {
-      calendar: "me@work.test/team",
-      share_only: true,
-    });
+    const added = await handleAddCalendar(runtime, { calendar: "me@work.test/team" });
     expect(added.ok && added.data).toEqual({
       calendar: "me@work.test / Team",
       shares: true,
-      receives: false,
+      receives: true,
     });
     expect((await handleAddCalendar(runtime, { calendar: "nobody@x.test" })).ok).toBe(false);
 

@@ -204,22 +204,16 @@ function fakeRuntime(tenantId: string, overrides: Partial<WebTenantRuntime> = {}
         },
       ]);
     },
-    connectCalendar: (slot, calendarId, roles) => {
+    connectCalendar: (slot, calendarId) => {
+      // Team is read-only, so it only shares, as the real one decides.
       const added = calendarRecord(tenantId, "cal-team", slot, calendarId, {
         name: "Team",
         accessRole: "reader",
-        source: roles.source,
-        destination: roles.destination,
+        source: true,
+        destination: false,
       });
       runtime.calendars.push(added);
       return Promise.resolve(added);
-    },
-    setCalendarRoles: (key, roles) => {
-      runtime.calendars = runtime.calendars.map((calendar) =>
-        calendar.key === key
-          ? { ...calendar, source: roles.source, destination: roles.destination }
-          : calendar,
-      );
     },
     removeCalendar: (key) => {
       runtime.calendars = runtime.calendars.filter((calendar) => calendar.key !== key);
@@ -418,7 +412,6 @@ describe("web onboarding server", () => {
         account: "default-personal@example.com",
         shares: true,
         receives: true,
-        writable: true,
         valid: true,
         conflict: false,
       });
@@ -705,7 +698,7 @@ describe("web onboarding server", () => {
     }
   });
 
-  it("adds, re-roles and removes calendars, refusing what a calendar cannot do", async () => {
+  it("adds and removes calendars, with no way to change what one does", async () => {
     let busy = false;
     const { base, server, runtimes } = await startServer({
       runtimeFor: (tenantId) => {
@@ -737,23 +730,14 @@ describe("web onboarding server", () => {
       expect((await fetch(`${base}/api/calendars/available?account=nobody`)).status).toBe(400);
 
       expect(
-        (
-          await post({
-            action: "add",
-            account: "work",
-            calendarId: "team@group.example.com",
-            shares: true,
-            receives: false,
-          })
-        ).body,
+        (await post({ action: "add", account: "work", calendarId: "team@group.example.com" })).body,
       ).toEqual({ key: "cal-team" });
-      // Read-only: it cannot be made to receive busy blocks.
-      expect((await post({ action: "update", key: "cal-team", receives: true })).status).toBe(400);
+      // Roles are calsync's call, not the page's.
       expect(
         (await post({ action: "update", key: "personal", shares: true, receives: false })).status,
-      ).toBe(200);
+      ).toBe(400);
       expect(runtimes[0]?.calendars.find((entry) => entry.key === "personal")?.destination).toBe(
-        false,
+        true,
       );
 
       busy = true;
