@@ -189,6 +189,34 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
            verified_at = excluded.verified_at`,
       )
       .run(tid, slot, normalizeEmail(email), now.toISOString(), now.toISOString());
+    this.db
+      .prepare("INSERT OR IGNORE INTO signed_in_tenants (tenant_id, first_at) VALUES (?, ?)")
+      .run(tid, now.toISOString());
+  }
+
+  /**
+   * Whether this tenant ever had a sign-in. A tenant that removed all of its
+   * own is not new: nothing may sign it back in on its behalf.
+   */
+  hasSignedIn(tenantId?: string): boolean {
+    const tid = tenantId ?? this.tenantId;
+    return (
+      this.db.prepare("SELECT 1 FROM signed_in_tenants WHERE tenant_id = ?").get(tid) !== undefined
+    );
+  }
+
+  /**
+   * Hands every calendar of one sign-in to another and forgets the first:
+   * the same Google account signed in again under a new slot.
+   */
+  moveGoogleAccount(from: string, to: string, tenantId?: string): void {
+    const tid = tenantId ?? this.tenantId;
+    this.db.transaction(() => {
+      this.db
+        .prepare("UPDATE calendars SET account_slot = ? WHERE tenant_id = ? AND account_slot = ?")
+        .run(to, tid, from);
+      this.deleteGoogleAccount(from, tid);
+    })();
   }
 
   /** Marks a sign-in verified, learning its email when the check found it. */
@@ -828,6 +856,8 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
       for (const table of preKeyed) {
         this.copyLegacyRows(table, `${table}_pre_keys`, "tenant_id");
       }
+      this.db.exec(`INSERT OR IGNORE INTO signed_in_tenants (tenant_id, first_at)
+        SELECT tenant_id, MIN(authorized_at) FROM google_accounts GROUP BY tenant_id`);
     })();
   }
 
@@ -868,6 +898,12 @@ export class StateDatabase implements MappingStore, SyncStateStore, ExclusionSou
         authorized_at TEXT NOT NULL,
         verified_at TEXT,
         PRIMARY KEY (tenant_id, slot)
+      );
+
+      -- Tenants that ever signed in, which a fresh tenant has not.
+      CREATE TABLE IF NOT EXISTS signed_in_tenants (
+        tenant_id TEXT PRIMARY KEY,
+        first_at TEXT NOT NULL
       );
 
       -- One connected calendar, read and written through account_slot's sign-in.

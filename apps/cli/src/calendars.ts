@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import type { CalendarKey } from "@calsync/engine";
 
 import type { AppCalendar, AppConfig } from "./config.js";
+import type { AvailableCalendar } from "./google/auth.js";
 import type { CalendarRecord, GoogleAccountRecord } from "./storage/database.js";
 
 /**
@@ -128,9 +129,9 @@ export function resolveAccountRef(
 export function withStoredCalendars(
   config: AppConfig,
   calendars: readonly CalendarRecord[],
-  accounts: readonly GoogleAccountRecord[],
+  signedInBefore: boolean,
 ): AppConfig {
-  if (calendars.length === 0 && accounts.length === 0) {
+  if (calendars.length === 0 && !signedInBefore) {
     return config;
   }
   return { ...config, calendars: calendars.map(appCalendar) };
@@ -164,4 +165,36 @@ export function sameCalendarSet(
         ]),
     );
   return shape(left) === shape(right);
+}
+
+/**
+ * The account and Google calendar a person means by `<email>` (that
+ * account's own calendar) or `<email>/<calendar name or id>`, among the
+ * calendars the account can see.
+ */
+export async function resolveAvailableRef(
+  ref: string,
+  accounts: readonly GoogleAccountRecord[],
+  available: (slot: string) => Promise<AvailableCalendar[]>,
+): Promise<{ account: GoogleAccountRecord; calendar: AvailableCalendar }> {
+  const slash = ref.indexOf("/");
+  const account = resolveAccountRef(slash < 0 ? ref : ref.slice(0, slash), accounts);
+  const wanted =
+    slash < 0
+      ? undefined
+      : ref
+          .slice(slash + 1)
+          .trim()
+          .toLowerCase();
+  const calendar = (await available(account.slot)).find((option) =>
+    wanted === undefined
+      ? option.primary
+      : option.name.toLowerCase() === wanted || option.calendarId.toLowerCase() === wanted,
+  );
+  if (calendar === undefined) {
+    throw new CalendarRefError(
+      `${account.email ?? account.slot} has no calendar "${wanted ?? "primary"}" it can share`,
+    );
+  }
+  return { account, calendar };
 }

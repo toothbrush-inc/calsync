@@ -18,8 +18,15 @@ import {
   type ExclusionSnapshot,
   type ExclusionStore,
 } from "../exclusions.js";
+import {
+  calendarLabel,
+  resolveAvailableRef,
+  resolveCalendarRef,
+  withStoredCalendars,
+} from "../calendars.js";
 import type { AccountStatus, AuthorizationOptions, ConnectStartResult } from "../google/auth.js";
-import type { WatchChannelRecord } from "../storage/index.js";
+import type { AccountRuntime } from "../runtime.js";
+import { tokenSlot, type WatchChannelRecord } from "../storage/index.js";
 import { LockTimeoutError, type SyncService } from "../sync/service.js";
 import type { ScanGate } from "../scanlimit.js";
 import { sanitizeToolPayload } from "./privacy.js";
@@ -44,19 +51,19 @@ export interface McpRuntime {
     listWatchChannels?(): WatchChannelRecord[];
   };
   sync: Pick<SyncService, "once">;
+  /** Sign-ins and calendars. Absent → only the two roles' statuses are reported. */
+  accounts?: AccountRuntime;
+  /**
+   * The gateway's connect URL template ({slot}, {tenant}, {role}), as the
+   * dashboard's CALSYNC_WEB_CONNECT_URL. Set under the gateway, where sign-ins
+   * are collected there; absent → calsync's own consent flow.
+   */
+  connectUrl?: string;
   /** Bounds how often the full-window passes may run. Absent → unbounded.
    * An assistant can call these in a loop, so the gate matters more here
    * than it does behind a button. */
   scanGate?: ScanGate;
   loadConfig?: () => AppConfig;
-}
-
-export interface AccountStatusResult {
-  role: AccountRole;
-  configured: boolean;
-  valid: boolean;
-  writable: boolean;
-  message: string;
 }
 
 export interface SyncAggregates {
@@ -79,8 +86,26 @@ export interface PushStatusResult {
   channels: { calendar: string; expiresAt: string }[];
 }
 
+/** One Google sign-in. `account` is its address, once known. */
+export interface SignInStatusResult {
+  account: string;
+  valid: boolean;
+  message: string;
+  calendars: number;
+}
+
+/** One synced calendar, named the way the other tools take it. */
+export interface CalendarStatusResult {
+  calendar: string;
+  shares: boolean;
+  receives: boolean;
+  valid: boolean;
+  message: string;
+}
+
 export interface StatusResult {
-  accounts: AccountStatusResult[];
+  signIns: SignInStatusResult[];
+  calendars: CalendarStatusResult[];
   lastSync: (SyncAggregates & { lastFullSyncAt: string | null }) | null;
   push: PushStatusResult;
 }
@@ -117,22 +142,59 @@ export async function handleGetStatus(runtime: McpRuntime): Promise<ToolResult<S
   // Lock-free: launchd may hold the daemon instance lock; WAL allows concurrent readers.
   try {
     const config = resolveConfig(runtime);
-    const accounts = await Promise.all(
-      accountRoles.map(async (role) => {
-        const status = await runtime.auth.getStatus(role, config.accounts[role].calendarId);
-        return {
-          role: status.role,
-          configured: status.configured,
-          valid: status.valid,
-          writable: status.valid,
-          message: status.message,
-        };
-      }),
-    );
+    const accounts = runtime.accounts;
+    let signIns: SignInStatusResult[] = [];
+    let calendars: CalendarStatusResult[] = [];
+    if (accounts === undefined) {
+      signIns = await Promise.all(
+        accountRoles.map(async (role) => {
+          const status = await runtime.auth.getStatus(role, config.accounts[role].calendarId);
+          return { account: role, valid: status.valid, message: status.message, calendars: 0 };
+        }),
+      );
+    } else {
+      await adoptPending(runtime, accounts);
+      // A tenant that never signed in may have finished a role connect at the
+      // gateway: a passing check is what records it.
+      if (!accounts.state.hasSignedIn()) {
+        await Promise.all(
+          accountRoles.map((role) =>
+            runtime.auth.getStatus(role, config.accounts[role].calendarId).catch(() => undefined),
+          ),
+        );
+      }
+      const stored = accounts.state.listCalendars();
+      const signedIn = accounts.state.listGoogleAccounts();
+      signIns = await Promise.all(
+        signedIn.map(async (entry) => {
+          const check = await accounts.auth.checkAccount(entry.slot);
+          return {
+            account: check.email ?? entry.slot,
+            valid: check.valid,
+            message: check.message,
+            calendars: stored.filter((calendar) => calendar.account === entry.slot).length,
+          };
+        }),
+      );
+      const refreshed = accounts.state.listGoogleAccounts();
+      calendars = await Promise.all(
+        stored.map(async (calendar) => {
+          const check = await accounts.auth.checkCalendar(calendar);
+          return {
+            calendar: calendarLabel(check.calendar, refreshed),
+            shares: calendar.source,
+            receives: calendar.destination,
+            valid: check.valid,
+            message: check.message,
+          };
+        }),
+      );
+    }
     return {
       ok: true,
       data: {
-        accounts,
+        signIns,
+        calendars,
         // sync_state is one flat table across tenants; unscoped keys belong
         // to the default tenant, so every read names this tenant's.
         lastSync: readLastSync(
@@ -151,6 +213,219 @@ export async function handleGetStatus(runtime: McpRuntime): Promise<ToolResult<S
   } catch (error) {
     return toolFailure(error, "status_failed");
   }
+}
+
+/** Sign-ins this server sent someone to the gateway for, not yet recorded, with when. */
+const pendingSignIns = new WeakMap<McpRuntime, Map<string, number>>();
+/** How long a sign-in keeps its slot while the person is at Google. */
+const PENDING_SIGN_IN_MS = 60 * 60 * 1_000;
+
+function pendingFor(runtime: McpRuntime): Map<string, number> {
+  let pending = pendingSignIns.get(runtime);
+  if (pending === undefined) {
+    pending = new Map();
+    pendingSignIns.set(runtime, pending);
+  }
+  const cutoff = Date.now() - PENDING_SIGN_IN_MS;
+  for (const [slot, at] of pending) {
+    if (at < cutoff) {
+      pending.delete(slot);
+    }
+  }
+  return pending;
+}
+
+/** Records gateway sign-ins this server handed out; one failing never fails the status. */
+async function adoptPending(runtime: McpRuntime, accounts: AccountRuntime): Promise<void> {
+  const pending = pendingFor(runtime);
+  for (const slot of [...pending.keys()]) {
+    const adopted = await accounts.auth.adoptSignIn(slot).catch(() => undefined);
+    if (adopted !== undefined && adopted.status !== "missing") {
+      pending.delete(slot);
+    }
+  }
+}
+
+export interface ConnectAccountResult {
+  url: string;
+  expires_at?: string;
+  next: string;
+}
+
+/**
+ * Starts signing in another Google account. Under the gateway, a link to its
+ * consent flow for the next free slot, adopted on the next get_status; else
+ * calsync's own consent, recorded when the person finishes.
+ */
+export async function handleConnectAccount(
+  runtime: McpRuntime,
+): Promise<ToolResult<ConnectAccountResult>> {
+  const accounts = runtime.accounts;
+  if (accounts === undefined) {
+    return unavailable("connect_unavailable", "This server cannot sign in accounts");
+  }
+  try {
+    const next =
+      "After the person finishes in the browser, call get_status, then list_calendars with available=true and add_calendar.";
+    if (runtime.connectUrl !== undefined) {
+      // A fresh slot every time, never an existing account's: the gateway
+      // stores the token before anyone knows whose it is.
+      const pending = pendingFor(runtime);
+      const slot = accounts.auth.freeAccountSlot(pending.keys());
+      if (slot === undefined) {
+        return unavailable(
+          "account_limit",
+          "calsync holds at most 6 added Google accounts; remove one first",
+        );
+      }
+      const tenant = resolveConfig(runtime).tenantId;
+      pending.set(slot, Date.now());
+      return {
+        ok: true,
+        data: {
+          url: runtime.connectUrl
+            .replaceAll("{slot}", tokenSlot(slot, tenant))
+            .replaceAll("{tenant}", tenant)
+            .replaceAll("{role}", slot),
+          next,
+        },
+      };
+    }
+    const started = await accounts.auth.startAccountConnect();
+    return { ok: true, data: { url: started.url, expires_at: started.expiresAt, next } };
+  } catch (error) {
+    return toolFailure(error, "connect_account_failed");
+  }
+}
+
+export interface CalendarListResult {
+  /** What each synced calendar does; get_status checks them. */
+  calendars: { calendar: string; shares: boolean; receives: boolean }[];
+  /** With available=true: every calendar each signed-in account can see. */
+  available?: {
+    calendar: string;
+    synced: boolean;
+    can_receive: boolean;
+    can_share: boolean;
+  }[];
+}
+
+export async function handleListCalendars(
+  runtime: McpRuntime,
+  input: { available?: boolean | undefined } = {},
+): Promise<ToolResult<CalendarListResult>> {
+  const accounts = runtime.accounts;
+  if (accounts === undefined) {
+    return unavailable("calendars_unavailable", "This server cannot list calendars");
+  }
+  try {
+    const signedIn = accounts.state.listGoogleAccounts();
+    const stored = accounts.state.listCalendars();
+    const calendars = stored.map((calendar) => ({
+      calendar: calendarLabel(calendar, signedIn),
+      shares: calendar.source,
+      receives: calendar.destination,
+    }));
+    if (input.available !== true) {
+      return { ok: true, data: { calendars } };
+    }
+    const available: NonNullable<CalendarListResult["available"]> = [];
+    for (const entry of signedIn) {
+      const email = entry.email ?? entry.slot;
+      // One account that cannot list (signed out, say) leaves the others' lists.
+      const options = await accounts.auth.availableCalendars(entry.slot).catch(() => []);
+      for (const option of options) {
+        available.push({
+          calendar: option.primary ? email : `${email}/${option.name}`,
+          synced: stored.some(
+            (calendar) =>
+              calendar.calendarId.toLowerCase() === option.calendarId.toLowerCase() ||
+              (option.primary &&
+                calendar.account === entry.slot &&
+                calendar.calendarId === "primary"),
+          ),
+          can_receive: option.writable,
+          can_share: option.readable,
+        });
+      }
+    }
+    return { ok: true, data: { calendars, available } };
+  } catch (error) {
+    return toolFailure(error, "list_calendars_failed");
+  }
+}
+
+export interface AddCalendarInput {
+  calendar: string;
+  share_only?: boolean | undefined;
+  receive_only?: boolean | undefined;
+}
+
+export async function handleAddCalendar(
+  runtime: McpRuntime,
+  input: AddCalendarInput,
+): Promise<ToolResult<{ calendar: string; shares: boolean; receives: boolean }>> {
+  const accounts = runtime.accounts;
+  if (accounts === undefined) {
+    return unavailable("calendars_unavailable", "This server cannot add calendars");
+  }
+  if (input.share_only === true && input.receive_only === true) {
+    return unavailable("invalid_roles", "Use share_only or receive_only, not both");
+  }
+  try {
+    const { account, calendar } = await resolveAvailableRef(
+      input.calendar,
+      accounts.state.listGoogleAccounts(),
+      (slot) => accounts.auth.availableCalendars(slot),
+    );
+    const added = await accounts.auth.connectCalendar(account.slot, calendar.calendarId, {
+      source: input.receive_only !== true,
+      destination: input.share_only !== true,
+    });
+    return {
+      ok: true,
+      data: {
+        calendar: calendarLabel(added, accounts.state.listGoogleAccounts()),
+        shares: added.source,
+        receives: added.destination,
+      },
+    };
+  } catch (error) {
+    return toolFailure(error, "add_calendar_failed");
+  }
+}
+
+export async function handleRemoveCalendar(
+  runtime: McpRuntime,
+  input: { calendar: string; keep_blocks?: boolean | undefined },
+): Promise<ToolResult<{ calendar: string; deleted: number | null }>> {
+  const accounts = runtime.accounts;
+  if (accounts === undefined) {
+    return unavailable("calendars_unavailable", "This server cannot remove calendars");
+  }
+  // A removal runs a full pass and writes; an assistant can call it in a loop.
+  const gate = runtime.scanGate?.check(resolveConfig(runtime).tenantId, "write");
+  if (gate !== undefined && !gate.allowed) {
+    return scanRateLimited(gate.retryAfterSeconds, "removing a calendar");
+  }
+  try {
+    const signedIn = accounts.state.listGoogleAccounts();
+    const target = resolveCalendarRef(input.calendar, accounts.state.listCalendars(), signedIn);
+    const result = await accounts.removeCalendar(target.key, {
+      ...(input.keep_blocks === true ? { keepBlocks: true } : {}),
+    });
+    runtime.scanGate?.record(resolveConfig(runtime).tenantId, "write");
+    return {
+      ok: true,
+      data: { calendar: calendarLabel(target, signedIn), deleted: result?.deleted ?? null },
+    };
+  } catch (error) {
+    return toolFailure(error, "remove_calendar_failed");
+  }
+}
+
+function unavailable(code: string, message: string): ToolFailure {
+  return { ok: false, error: { code, message } };
 }
 
 export interface ConnectProviderInput {
@@ -288,7 +563,8 @@ export async function handleSyncNow(runtime: McpRuntime): Promise<ToolResult<Syn
 export interface ExclusionToolInput {
   keys?: string[] | undefined;
   keywords?: string[] | undefined;
-  from?: "personal" | "work" | undefined;
+  /** The calendar whose events keywords hold back, as get_status names it. */
+  from?: string | undefined;
 }
 
 export function handleAddExclusion(
@@ -307,7 +583,7 @@ export function handleRemoveExclusion(
 
 export function handleListExclusions(runtime: McpRuntime): ToolResult<ExclusionSnapshot> {
   try {
-    return { ok: true, data: snapshotExclusions(resolveConfig(runtime), runtime.state) };
+    return { ok: true, data: snapshotExclusions(storedConfig(runtime), runtime.state) };
   } catch (error) {
     return toolFailure(error, "list_exclusions_failed");
   }
@@ -319,15 +595,27 @@ function handleExclusionChange<T extends "add" | "remove">(
   input: ExclusionToolInput,
 ): ToolResult<ExclusionChangeResult & { action: T }> {
   try {
+    const config = storedConfig(runtime);
+    const sources = exclusionSources(config);
+    const accounts = runtime.accounts;
+    // `from` names a calendar the way get_status does; a key passes through.
+    const from =
+      input.from === undefined || sources.includes(input.from) || accounts === undefined
+        ? input.from
+        : resolveCalendarRef(
+            input.from,
+            accounts.state.listCalendars(),
+            accounts.state.listGoogleAccounts(),
+          ).key;
     const result = changeExclusions(
       action,
       runtime.state,
       {
         ...(input.keys === undefined ? {} : { keys: input.keys }),
         ...(input.keywords === undefined ? {} : { keywords: input.keywords }),
-        ...(input.from === undefined ? {} : { from: input.from }),
+        ...(from === undefined ? {} : { from }),
       },
-      exclusionSources(resolveConfig(runtime)),
+      sources,
       { allowMix: true },
     );
     return { ok: true, data: { action, ...result } };
@@ -361,6 +649,15 @@ function scanRateLimited(retryAfterSeconds: number, what: string): ToolFailure {
 
 function resolveConfig(runtime: McpRuntime): AppConfig {
   return (runtime.loadConfig ?? loadConfig)();
+}
+
+/** The config with the tenant's stored calendars: what exclusions apply to. */
+function storedConfig(runtime: McpRuntime): AppConfig {
+  const config = resolveConfig(runtime);
+  const accounts = runtime.accounts;
+  return accounts === undefined
+    ? config
+    : withStoredCalendars(config, accounts.state.listCalendars(), accounts.state.hasSignedIn());
 }
 
 function readLastSync(

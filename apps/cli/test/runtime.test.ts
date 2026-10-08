@@ -46,17 +46,13 @@ describe("withStoredCalendars", () => {
   });
 
   it("syncs the two environment calendars until any calendar is connected", () => {
-    expect(withStoredCalendars(config, [], []).calendars.map((calendar) => calendar.key)).toEqual([
-      "personal",
-      "work",
-    ]);
+    expect(
+      withStoredCalendars(config, [], false).calendars.map((calendar) => calendar.key),
+    ).toEqual(["personal", "work"]);
   });
 
   it("stays without calendars once a signed-in tenant removed them all", () => {
-    const signedIn = [
-      { tenantId: "default", slot: "personal", email: null, authorizedAt: "", verifiedAt: null },
-    ];
-    expect(withStoredCalendars(config, [], signedIn).calendars).toEqual([]);
+    expect(withStoredCalendars(config, [], true).calendars).toEqual([]);
   });
 
   it("then syncs exactly the connected calendars, each through its sign-in", () => {
@@ -88,7 +84,7 @@ describe("withStoredCalendars", () => {
           verifiedAt: null,
         },
       ],
-      [],
+      true,
     );
     expect(stored.calendars).toEqual([
       { key: "work", account: "work", calendarId: "primary", source: true, destination: true },

@@ -543,6 +543,57 @@ describe("account and calendar connection", () => {
     state.close();
   });
 
+  it("adopts a gateway sign-in by the account it turns out to be", async () => {
+    const state = new StateDatabase(":memory:");
+    state.upsertGoogleAccount("personal", "me@gmail.test", NOW);
+    state.addCalendar({ key: "personal", account: "personal", calendarId: "primary" });
+    const tokens = tokenStore();
+    tokens.stored.set("personal", "old-token");
+    const auth = new FakeAuth(state, tokens, {
+      account1: [{ id: "colleague@work.test", accessRole: "owner", primary: true }],
+      account2: [{ id: "me@gmail.test", accessRole: "owner", primary: true }],
+      personal: [{ id: "someone-else@x.test", accessRole: "owner", primary: true }],
+    });
+
+    expect(await auth.adoptSignIn("account1")).toMatchObject({
+      status: "adopted",
+      account: { slot: "account1", email: "colleague@work.test" },
+    });
+    // The same person again under a fresh slot: their calendars follow the new sign-in.
+    expect(await auth.adoptSignIn("account2")).toMatchObject({ status: "replaced" });
+    expect(state.getCalendar("personal")?.account).toBe("account2");
+    expect(state.getGoogleAccount("personal")).toBeNull();
+    expect(tokens.stored.has("personal")).toBe(false);
+    // A slot recorded for one address is never rebound to another.
+    state.upsertGoogleAccount("personal", "me-again@gmail.test", NOW);
+    expect(await auth.adoptSignIn("personal")).toMatchObject({
+      status: "mismatch",
+      email: "someone-else@x.test",
+    });
+    expect(state.getGoogleAccount("personal")?.email).toBe("me-again@gmail.test");
+    expect(await auth.adoptSignIn("account3")).toMatchObject({ status: "missing" });
+    state.close();
+  });
+
+  it("keeps a free slot for each sign-in still in progress", () => {
+    const state = new StateDatabase(":memory:");
+    state.upsertGoogleAccount("account1", "a@x.test", NOW);
+    const auth = new FakeAuth(state, tokenStore(), {});
+    expect(auth.freeAccountSlot()).toBe("account2");
+    expect(auth.freeAccountSlot(["account2"])).toBe("account3");
+    state.close();
+  });
+
+  it("remembers that a tenant signed in, even after it removed every sign-in", () => {
+    const state = new StateDatabase(":memory:");
+    expect(state.hasSignedIn()).toBe(false);
+    state.upsertGoogleAccount("account1", "a@x.test", NOW);
+    state.deleteGoogleAccount("account1");
+    expect(state.hasSignedIn()).toBe(true);
+    expect(state.hasSignedIn("other")).toBe(false);
+    state.close();
+  });
+
   it("forgets an unused sign-in locally without revoking it at Google", async () => {
     const state = new StateDatabase(":memory:");
     state.upsertGoogleAccount("account1", "me@work.test", NOW);
