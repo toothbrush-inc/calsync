@@ -1,6 +1,8 @@
 import { randomBytes, randomUUID } from "node:crypto";
 
-import { accountRoles, systemClock, type AccountRole, type Clock } from "@calsync/engine";
+import { systemClock, type Clock } from "@calsync/engine";
+
+import { accountRoles, type AccountRole } from "../config.js";
 
 import type { ChannelAPI } from "../google/channels.js";
 import type { WatchChannelRecord } from "../storage/index.js";

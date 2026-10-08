@@ -1,6 +1,6 @@
 import { KeychainError, KeychainSecretStore, type CommandRunner } from "@dvd-toy-box/vault";
 
-import type { AccountRole } from "@calsync/engine";
+import type { AccountRole } from "../config.js";
 
 const DEFAULT_SERVICE = "com.local.calsync.oauth";
 

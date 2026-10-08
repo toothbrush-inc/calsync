@@ -70,7 +70,7 @@ export function createCalsyncMcpServer(runtime: McpRuntime): McpServer {
     "preview_sync",
     {
       description:
-        "Dry-run one reconciliation. Returns counts by direction/operation. Source titles are omitted unless include_source_titles is true. Reports progress while waiting for the reconcile lock, listing calendars, and reconciling.",
+        "Dry-run one reconciliation. Returns counts by destination calendar and operation. Source titles are omitted unless include_source_titles is true. Reports progress while waiting for the reconcile lock, listing calendars, and reconciling.",
       inputSchema: z.object({
         include_source_titles: z
           .boolean()

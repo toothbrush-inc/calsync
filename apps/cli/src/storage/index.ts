@@ -1,7 +1,6 @@
 export {
   type AccountRecord,
   type EventMapping,
-  type ExclusionDirection,
   type StoredExclusionKey,
   type StoredExclusionKeyword,
   type WatchChannelRecord,

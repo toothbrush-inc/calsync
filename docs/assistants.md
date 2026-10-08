@@ -41,15 +41,15 @@ flow from the terminal.
 
 ## Tools
 
-| Tool               | What it does                                                              | Reads / writes                            |
-| ------------------ | ------------------------------------------------------------------------- | ----------------------------------------- |
-| `get_status`       | Auth state, calendar writability, and last-sync aggregates                | Reads                                     |
-| `connect_provider` | Starts Google consent for `personal` or `work` and returns a browser URL  | Writes a token to the vault after consent |
-| `preview_sync`     | Dry-runs one reconciliation and returns counts by direction and operation | Reads                                     |
-| `sync_now`         | Runs one live reconciliation pass and returns counts                      | Writes mirrors                            |
-| `list_exclusions`  | Lists keyword and opaque-key exclusions                                   | Reads                                     |
-| `add_exclusion`    | Excludes keywords or opaque keys from mirroring                           | Writes exclusions                         |
-| `remove_exclusion` | Stops excluding keywords or opaque keys                                   | Writes exclusions                         |
+| Tool               | What it does                                                             | Reads / writes                            |
+| ------------------ | ------------------------------------------------------------------------ | ----------------------------------------- |
+| `get_status`       | Auth state, calendar writability, and last-sync aggregates               | Reads                                     |
+| `connect_provider` | Starts Google consent for `personal` or `work` and returns a browser URL | Writes a token to the vault after consent |
+| `preview_sync`     | Dry-runs one reconciliation and returns counts by calendar and operation | Reads                                     |
+| `sync_now`         | Runs one live reconciliation pass and returns counts                     | Writes mirrors                            |
+| `list_exclusions`  | Lists keyword and opaque-key exclusions                                  | Reads                                     |
+| `add_exclusion`    | Excludes keywords or opaque keys from mirroring                          | Writes exclusions                         |
+| `remove_exclusion` | Stops excluding keywords or opaque keys                                  | Writes exclusions                         |
 
 Only `preview_sync` can return titles, and only when `include_source_titles`
 is explicitly true. The gateway config in [hosting.md](hosting.md) denies

@@ -229,7 +229,7 @@ describe("CLI scaffold", () => {
     output.mockRestore();
   });
 
-  it("summarizes dry-run operations by direction, operation, and reason", () => {
+  it("summarizes dry-run operations by destination calendar, operation, and reason", () => {
     const operations: ReconcileLog[] = [
       operation("personal", "work", "create", "destination-missing"),
       operation("personal", "work", "create", "destination-missing"),
@@ -243,18 +243,16 @@ describe("CLI scaffold", () => {
     );
 
     expect(report).toContain("Dry run: 3 operations planned.");
-    expect(report).toContain("personal → work:");
+    expect(report).toContain("busy blocks on work:");
     expect(report).toContain("create — destination missing: 2");
-    expect(report).toContain("work → personal:");
+    expect(report).toContain("busy blocks on personal:");
     expect(report).toContain("update — destination drifted: 1");
-    expect(report).toContain(
-      "Projected active mirrors: personal → work 2 (0 excluded, 0 duplicate-suppressed); work → personal 1",
-    );
+    expect(report).toContain("Projected busy blocks: work 2 (0 duplicate-suppressed); personal 1");
     expect(report).not.toContain("Private planning");
     expect(report).not.toContain("2026-08-10");
   });
 
-  it("ends default, detailed, and verbose dry runs with projected directional totals", async () => {
+  it("ends default, detailed, and verbose dry runs with projected per-calendar totals", async () => {
     const receivedOptions: NonNullable<Parameters<SyncService["once"]>[0]>[] = [];
     const once = vi.fn((options?: Parameters<SyncService["once"]>[0]) => {
       if (options !== undefined) {
@@ -264,8 +262,7 @@ describe("CLI scaffold", () => {
         operation("personal", "work", "create", "destination-missing", "Private planning"),
       );
       options?.onSourceEvent?.({
-        sourceRole: "personal",
-        destinationRole: "work",
+        sourceKey: "personal",
         sourceTitle: "Private planning",
         timeRange: {
           kind: "timed",
@@ -290,8 +287,8 @@ describe("CLI scaffold", () => {
     });
     const output = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
     const expectedEnding = [
-      "Projected active mirrors: personal → work 2 (1 excluded, 0 duplicate-suppressed); work → personal 3 (0 excluded, 2 duplicate-suppressed)",
-      "Excluded and duplicate-suppressed source events are not included in active totals.",
+      "Projected busy blocks: work 2 (0 duplicate-suppressed); personal 3 (2 duplicate-suppressed). Excluded events: personal 1, work 0",
+      "Excluded and duplicate-suppressed source events are not included in busy-block totals.",
       "",
     ].join("\n");
     const modes = [[], ["--details"], ["--verbose"]] as const;
@@ -332,8 +329,7 @@ describe("CLI scaffold", () => {
     const once = vi.fn((options?: Parameters<SyncService["once"]>[0]) => {
       options?.onOperation?.(planned);
       options?.onSourceEvent?.({
-        sourceRole: "personal",
-        destinationRole: "work",
+        sourceKey: "personal",
         sourceTitle: sensitiveTitle,
         timeRange: {
           kind: "timed",
@@ -406,8 +402,8 @@ describe("CLI scaffold", () => {
     expect(formatDryRunReport([], syncResult(), true)).toBe(
       [
         "Dry run: no changes planned.",
-        "Projected active mirrors: personal → work 0 (0 excluded, 0 duplicate-suppressed); work → personal 0 (0 excluded, 0 duplicate-suppressed)",
-        "Excluded and duplicate-suppressed source events are not included in active totals.",
+        "Projected busy blocks: work 0 (0 duplicate-suppressed); personal 0 (0 duplicate-suppressed). Excluded events: personal 0, work 0",
+        "Excluded and duplicate-suppressed source events are not included in busy-block totals.",
         "",
       ].join("\n"),
     );
@@ -459,9 +455,9 @@ describe("CLI scaffold", () => {
     const report = output.mock.calls.map(([value]) => String(value)).join("");
     expect(report).toContain("Reconciliation complete: 2 created");
     expect(report).toContain(
-      "Active mirrors: personal → work 3 (1 excluded, 0 duplicate-suppressed); work → personal 4 (0 excluded, 2 duplicate-suppressed)",
+      "Busy blocks: work 3 (0 duplicate-suppressed); personal 4 (2 duplicate-suppressed). Excluded events: personal 1, work 0",
     );
-    expect(report).toContain("not included in active totals");
+    expect(report).toContain("not included in busy-block totals");
     output.mockRestore();
   });
 
@@ -488,7 +484,7 @@ describe("CLI scaffold", () => {
     const report = output.mock.calls.map(([value]) => String(value)).join("");
     expect(report).toContain("Reconciliation incomplete: 1 created");
     expect(report).toContain("1 failed");
-    expect(report).toContain("Active mirrors after partial run: personal → work 1");
+    expect(report).toContain("Busy blocks after partial run: work 1");
     expect(report).toContain("did not fully converge");
     output.mockRestore();
   });
@@ -524,8 +520,8 @@ describe("exclude commands", () => {
       expect(listed).toContain("therapy  (cli)");
       expect(listed).toContain(`${personalOccurrence}  (cli)`);
       expect(listed).toContain(`${workSeries}  (cli)`);
-      expect(listed).toContain("personal → work");
-      expect(listed).toContain("work → personal");
+      expect(listed).toContain("from personal:");
+      expect(listed).toContain("from work:");
       expect(listed).not.toContain("Private medical");
 
       await parseExclude(["remove", "--from", "personal", "--keyword", "dentist,therapy"]);
@@ -544,9 +540,9 @@ describe("exclude commands", () => {
         "Dentist, therapy, school pickup",
       ]);
       expect(added).toContain("Added:");
-      expect(added).toContain('keyword "dentist" (personal → work)');
-      expect(added).toContain('keyword "therapy" (personal → work)');
-      expect(added).toContain('keyword "school pickup" (personal → work)');
+      expect(added).toContain('keyword "dentist" (from personal)');
+      expect(added).toContain('keyword "therapy" (from personal)');
+      expect(added).toContain('keyword "school pickup" (from personal)');
       expect(added).toContain("The next sync pass applies this.");
 
       const again = await parseExclude([
@@ -557,9 +553,9 @@ describe("exclude commands", () => {
         "dentist,,focus time",
       ]);
       expect(again).toContain("Added:");
-      expect(again).toContain('keyword "focus time" (personal → work)');
+      expect(again).toContain('keyword "focus time" (from personal)');
       expect(again).toContain("Already present:");
-      expect(again).toContain('keyword "dentist" (personal → work)');
+      expect(again).toContain('keyword "dentist" (from personal)');
     });
 
     it("treats unquoted spaces after a comma as part of the last keyword", async () => {
@@ -571,18 +567,18 @@ describe("exclude commands", () => {
         "dentist,therapy,school",
         "pickup",
       ]);
-      expect(added).toContain('keyword "dentist" (personal → work)');
-      expect(added).toContain('keyword "therapy" (personal → work)');
-      expect(added).toContain('keyword "school pickup" (personal → work)');
+      expect(added).toContain('keyword "dentist" (from personal)');
+      expect(added).toContain('keyword "therapy" (from personal)');
+      expect(added).toContain('keyword "school pickup" (from personal)');
     });
 
-    it("adds multiple opaque keys and infers direction from each key", async () => {
+    it("adds multiple opaque keys and infers the source calendar from each key", async () => {
       const added = await parseExclude(["add", personalOccurrence, personalSeries, workSeries]);
-      expect(added).toContain("this occurrence (personal → work):");
+      expect(added).toContain("this occurrence (from personal):");
       expect(added).toContain(personalOccurrence);
-      expect(added).toContain("the whole series (personal → work):");
+      expect(added).toContain("the whole series (from personal):");
       expect(added).toContain(personalSeries);
-      expect(added).toContain("the whole series (work → personal):");
+      expect(added).toContain("the whole series (from work):");
       expect(added).toContain(workSeries);
 
       const again = await parseExclude(["add", personalOccurrence, workSeries]);
@@ -603,9 +599,9 @@ describe("exclude commands", () => {
         "confidential,missing-phrase",
       ]);
       expect(removedKeywords).toContain("Removed:");
-      expect(removedKeywords).toContain('keyword "confidential" (work → personal)');
+      expect(removedKeywords).toContain('keyword "confidential" (from work)');
       expect(removedKeywords).toContain("Missing:");
-      expect(removedKeywords).toContain('keyword "missing-phrase" (work → personal)');
+      expect(removedKeywords).toContain('keyword "missing-phrase" (from work)');
       expect(removedKeywords).toContain("edit .env");
 
       const removedKeys = await parseExclude(["remove", personalOccurrence, personalSeries]);
@@ -651,9 +647,13 @@ describe("exclude commands", () => {
 
   it("lists env exclusions separately from CLI exclusions", () => {
     const state = new StateDatabase(":memory:");
-    state.addExclusionKeyword("personalToWork", "dentist");
+    state.addExclusionKeyword("personal", "dentist");
     const config: AppConfig = {
       tenantId: "default",
+      calendars: [
+        { key: "personal", calendarId: "personal", source: true, destination: true },
+        { key: "work", calendarId: "work", source: true, destination: true },
+      ],
       accounts: {
         personal: { tenantId: "default", role: "personal", calendarId: "personal" },
         work: { tenantId: "default", role: "work", calendarId: "work" },
@@ -662,10 +662,8 @@ describe("exclude commands", () => {
       window: { pastDays: 30, futureDays: 365 },
       timezone: "UTC",
       exclusions: {
-        personalToWork: [],
-        workToPersonal: [],
-        personalToWorkKeywords: ["focus time"],
-        workToPersonalKeywords: [],
+        keys: { personal: [], work: [] },
+        keywords: { personal: ["focus time"], work: [] },
       },
     };
 
@@ -734,8 +732,8 @@ function operation(
 ): ReconcileLog {
   return {
     operation: operationName,
-    sourceRole,
-    destinationRole,
+    destinationKey: destinationRole,
+    sourceKeys: [sourceRole],
     reason,
     sourceTitles: [sourceTitle],
     timeRange: {
@@ -802,17 +800,16 @@ function syncResult(
     repaired: values.repaired ?? 0,
     failed: values.failed ?? 0,
     converged: values.converged ?? true,
-    mirrors: {
-      personalToWork: {
+    destinations: {
+      work: {
         active: values.personalActive ?? 0,
-        excluded: values.personalExcluded ?? 0,
         duplicateSuppressed: values.personalDuplicates ?? 0,
       },
-      workToPersonal: {
-        active: values.workActive ?? 0,
-        excluded: values.workExcluded ?? 0,
-        duplicateSuppressed: values.workDuplicates ?? 0,
-      },
+      personal: { active: values.workActive ?? 0, duplicateSuppressed: values.workDuplicates ?? 0 },
+    },
+    sources: {
+      personal: { excluded: values.personalExcluded ?? 0 },
+      work: { excluded: values.workExcluded ?? 0 },
     },
   };
 }

@@ -68,13 +68,13 @@ calsync sync --once --dry-run --verbose
 The detailed report includes lines like:
 
 ```text
-personal → work | one-time event | 2026-08-12T15:00:00-07:00 → 2026-08-12T16:00:00-07:00 | "Dentist" | not excluded
+personal | one-time event | 2026-08-12T15:00:00-07:00 → 2026-08-12T16:00:00-07:00 | "Dentist" | not excluded
   occurrence only: calsync-exclude:v1:p2w:occ:AbCdEf...
   whole series:    calsync-exclude:v1:p2w:series:XyZ123...
 ```
 
-Then add several at once. Direction is inferred from each opaque key; keyword
-batches take `--from` once. Do not mix keys and keywords in one command.
+Then add several at once. Each opaque key names the calendar it came from;
+keyword batches take `--from` once. Do not mix keys and keywords in one command.
 
 ```sh
 calsync exclude add --from personal --keyword dentist,therapy,school pickup
@@ -86,7 +86,8 @@ calsync exclude remove KEY1 KEY2
 calsync exclude remove --from work --keyword confidential,internal
 ```
 
-`--from personal` means personal → work; `--from work` means the reverse.
+An exclusion belongs to the calendar whose events it holds back: `--from
+personal` keeps matching personal events off every other calendar.
 Keywords are case-insensitive literal substrings (`plan` matches `planning`),
 comma-separated, trimmed, and blanks are ignored — a comma cannot appear
 inside a keyword. Add and remove are idempotent.

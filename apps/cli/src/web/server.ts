@@ -2,7 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
 import type {
-  AccountRole,
+  CalendarKey,
   DedupeResult,
   ReconcileLog,
   ReconcileSourceDetail,
@@ -11,10 +11,9 @@ import type {
   StrayBlockKind,
   SyncReconcileResult,
 } from "@calsync/engine";
-import { accountRoles } from "@calsync/engine";
 import { tenantForIdentity } from "@dvd-toy-box/vault";
 
-import { parseTenantId, ConfigError } from "../config.js";
+import { accountRoles, parseTenantId, ConfigError, type AccountRole } from "../config.js";
 import type { ScanGate, ScanOperation } from "../scanlimit.js";
 import type {
   ExclusionChangeInput,
@@ -138,8 +137,8 @@ export interface WebStatusView {
   lastFullSyncAt: string | null;
   lastResult: {
     converged: boolean;
-    personalToWorkActive: number;
-    workToPersonalActive: number;
+    /** Busy blocks on each calendar, by calendar key. */
+    blocks: Record<CalendarKey, number>;
   } | null;
   connectMode: "local" | "external";
 }
@@ -150,7 +149,8 @@ export type WebPreviewStatus =
 /** One source event as the dry-run preview shows it: the title the person
  * needs to recognise it, when it is, and the keys that would exclude it. */
 export interface WebPreviewEvent {
-  direction: "personalToWork" | "workToPersonal";
+  /** Calendar the event is on. */
+  source: CalendarKey;
   title: string | null;
   when: ReconcileTimeRange;
   recurring: boolean;
@@ -162,7 +162,8 @@ export interface WebPreviewView {
   ranAt: string;
   planned: { created: number; updated: number; deleted: number; repaired: number };
   converged: boolean;
-  mirrors: SyncReconcileResult["mirrors"];
+  destinations: SyncReconcileResult["destinations"];
+  sources: SyncReconcileResult["sources"];
   events: WebPreviewEvent[];
 }
 
@@ -170,7 +171,7 @@ export interface WebPreviewView {
  * doubles another block or stands alone with no event behind it. Managed
  * blocks are all titled "Busy", so there is no title to leak. */
 export interface WebDedupeRemoval {
-  calendar: AccountRole;
+  calendar: CalendarKey;
   when: ReconcileTimeRange;
   kind: StrayBlockKind;
 }
@@ -483,8 +484,12 @@ export class WebServer {
           ? null
           : {
               converged: summary.lastResult.converged,
-              personalToWorkActive: summary.lastResult.mirrors.personalToWork.active,
-              workToPersonalActive: summary.lastResult.mirrors.workToPersonal.active,
+              blocks: Object.fromEntries(
+                Object.entries(summary.lastResult.destinations).map(([key, totals]) => [
+                  key,
+                  totals.active,
+                ]),
+              ),
             },
       connectMode: this.options.connectUrl === undefined ? "local" : "external",
     };
@@ -637,7 +642,8 @@ export class WebServer {
         repaired: result.repaired,
       },
       converged: result.converged,
-      mirrors: result.mirrors,
+      destinations: result.destinations,
+      sources: result.sources,
       events: sources.map(previewEvent),
     };
     this.options.scanGate?.remember(tenant, "preview", view);
@@ -704,14 +710,14 @@ export class WebServer {
     for (const operation of operations) {
       const kind = STRAY_KINDS[operation.reason];
       if (kind !== undefined && operation.timeRange !== undefined) {
-        removals.push({ calendar: operation.destinationRole, when: operation.timeRange, kind });
+        removals.push({ calendar: operation.destinationKey, when: operation.timeRange, kind });
       }
     }
     this.#log({
       event: "web_dedupe",
       tenant,
       applied: apply,
-      inspected: result.inspected.personal + result.inspected.work,
+      inspected: Object.values(result.inspected).reduce((sum, count) => sum + count, 0),
       removed: result.deleted,
     });
     const gate = this.options.scanGate;
@@ -1004,7 +1010,7 @@ async function readJsonBody(request: IncomingMessage): Promise<Record<string, un
 
 function previewEvent(source: ReconcileSourceDetail): WebPreviewEvent {
   return {
-    direction: source.sourceRole === "personal" ? "personalToWork" : "workToPersonal",
+    source: source.sourceKey,
     title: source.sourceTitle ?? null,
     when: source.timeRange,
     recurring: source.isRecurring,

@@ -2,9 +2,9 @@ import { MANAGED_PROPERTY } from "./normalize.js";
 import type { GoogleCalendarEvent } from "./normalize.js";
 import type { ManagedBusyEvent, ManagedBusyEventInsert } from "./project.js";
 import type {
-  AccountRole,
   CalendarAPI,
   CalendarChangeSet,
+  CalendarKey,
   EventMapping,
   ExclusionSource,
   MappingStore,
@@ -100,9 +100,11 @@ export class MemoryMappingStore implements MappingStore {
     return mapping === undefined ? null : { ...mapping };
   }
 
-  listMappings(sourceRole?: AccountRole): EventMapping[] {
+  listMappings(destinationKey?: CalendarKey): EventMapping[] {
     const mappings = [...this.mappings.values()]
-      .filter((mapping) => sourceRole === undefined || mapping.sourceRole === sourceRole)
+      .filter(
+        (mapping) => destinationKey === undefined || mapping.destinationKey === destinationKey,
+      )
       .sort((left, right) => left.mappingKey.localeCompare(right.mappingKey));
     return mappings.map((mapping) => ({ ...mapping }));
   }

@@ -28,9 +28,11 @@ import {
 } from "./config.js";
 import {
   changeExclusions,
+  exclusionSources,
   snapshotExclusions,
   type ExclusionChangeResult,
   type ExclusionItem,
+  type ExclusionListEntry,
 } from "./exclusions.js";
 import type { GoogleAuthService } from "./google/auth.js";
 import { LaunchdServiceManager, type LaunchdService } from "./launchd/service.js";
@@ -39,7 +41,7 @@ import { runLiveMcpStdioServer } from "./mcp/server.js";
 import { TerminalProgress } from "./progress.js";
 import { ScanGate } from "./scanlimit.js";
 import { CALSYNC_VERSION, createAuthRuntime } from "./runtime.js";
-import { StateDatabase, type ExclusionDirection } from "./storage/index.js";
+import { StateDatabase } from "./storage/index.js";
 import {
   daemonIsRunning,
   daemonLockPathFor,
@@ -351,7 +353,9 @@ Examples:
     )
     .action((keys: string[], options: ExclusionCliOptions & { tenant?: string }) => {
       withState(optionalTenant(options.tenant) ?? defaultTenantId(), (state) => {
-        process.stdout.write(`${applyExclusionChange("add", state, keys, options)}\n`);
+        process.stdout.write(
+          `${applyExclusionChange("add", state, keys, options, accountRoles)}\n`,
+        );
       });
     });
 
@@ -377,7 +381,9 @@ Examples:
     )
     .action((keys: string[], options: ExclusionCliOptions & { tenant?: string }) => {
       withState(optionalTenant(options.tenant) ?? defaultTenantId(), (state) => {
-        process.stdout.write(`${applyExclusionChange("remove", state, keys, options)}\n`);
+        process.stdout.write(
+          `${applyExclusionChange("remove", state, keys, options, accountRoles)}\n`,
+        );
       });
     });
 }
@@ -513,7 +519,9 @@ function addWebCommands(program: Command): void {
             // the MCP tools do.
             listExclusions: () => snapshotExclusions(loadConfig(), runtime.state),
             changeExclusions: (action, input) =>
-              changeExclusions(action, runtime.state, input, { allowMix: true }),
+              changeExclusions(action, runtime.state, input, exclusionSources(loadConfig()), {
+                allowMix: true,
+              }),
             previewSync: async ({ lockTimeoutMs }) => {
               const sources: ReconcileSourceDetail[] = [];
               const result = await runtime.sync.once({
@@ -622,19 +630,27 @@ function applyExclusionChange(
   state: StateDatabase,
   keys: string[] | string | undefined,
   options: { from?: string[] | string; keyword?: string[] | string },
+  sources: readonly string[],
 ): string {
   return formatExclusionChangeReport(
     action,
-    changeExclusions(action, state, {
-      ...(keys === undefined ? {} : { keys: typeof keys === "string" ? [keys] : keys }),
-      ...(options.keyword === undefined
-        ? {}
-        : {
-            keywords:
-              typeof options.keyword === "string" ? [options.keyword] : [options.keyword.join(" ")],
-          }),
-      ...(options.from === undefined ? {} : { from: options.from }),
-    }),
+    changeExclusions(
+      action,
+      state,
+      {
+        ...(keys === undefined ? {} : { keys: typeof keys === "string" ? [keys] : keys }),
+        ...(options.keyword === undefined
+          ? {}
+          : {
+              keywords:
+                typeof options.keyword === "string"
+                  ? [options.keyword]
+                  : [options.keyword.join(" ")],
+            }),
+        ...(options.from === undefined ? {} : { from: options.from }),
+      },
+      sources,
+    ),
   );
 }
 
@@ -645,8 +661,8 @@ function formatExclusionChangeReport(
   const lines: string[] = [];
   const formatItem = (item: ExclusionItem): string =>
     item.kind === "keyword"
-      ? `  keyword "${item.value}" (${formatDirection(item.direction)})`
-      : `  ${formatKeyScope(item.value)} (${formatDirection(item.direction)}): ${item.value}`;
+      ? `  keyword "${item.value}" (${formatSource(item.source)})`
+      : `  ${formatKeyScope(item.value)} (${formatSource(item.source)}): ${item.value}`;
   const pushSection = (title: string, items: ExclusionItem[]) => {
     if (items.length === 0) {
       return;
@@ -678,39 +694,17 @@ const EXCLUSION_APPLY_HINT =
   "The next sync pass applies this. Preview with `calsync sync --once --dry-run`, or wait for the background service.";
 
 export function formatExclusionList(config: AppConfig, state: StateDatabase): string {
-  const storedKeys = new Map(
-    state.listExclusionKeys().map((row) => [`${row.direction}\0${row.value}`, row] as const),
-  );
-  const storedKeywords = new Map(
-    state.listExclusionKeywords().map((row) => [`${row.direction}\0${row.keyword}`, row] as const),
-  );
+  const snapshot = snapshotExclusions(config, state);
+  const origin = (entry: ExclusionListEntry): string => (entry.origin === "cli" ? "cli" : ".env");
   const lines: string[] = [];
-  for (const direction of ["personalToWork", "workToPersonal"] as const) {
-    lines.push(`${formatDirection(direction)}:`);
-    const envKeywords =
-      direction === "personalToWork"
-        ? config.exclusions.personalToWorkKeywords
-        : config.exclusions.workToPersonalKeywords;
-    const envKeys =
-      direction === "personalToWork"
-        ? config.exclusions.personalToWork
-        : config.exclusions.workToPersonal;
-    const keywordLines = [
-      ...[...storedKeywords.values()]
-        .filter((row) => row.direction === direction)
-        .map((row) => `    ${row.keyword}  (cli)`),
-      ...envKeywords
-        .filter((keyword) => !storedKeywords.has(`${direction}\0${keyword}`))
-        .map((keyword) => `    ${keyword}  (.env)`),
-    ];
-    const keyLines = [
-      ...[...storedKeys.values()]
-        .filter((row) => row.direction === direction)
-        .map((row) => `    ${row.value}  (cli)`),
-      ...envKeys
-        .filter((value) => !storedKeys.has(`${direction}\0${value}`))
-        .map((value) => `    ${value}  (.env)`),
-    ];
+  for (const source of exclusionSources(config)) {
+    lines.push(`${formatSource(source)}:`);
+    const keywordLines = snapshot.keywords
+      .filter((entry) => entry.source === source)
+      .map((entry) => `    ${entry.value}  (${origin(entry)})`);
+    const keyLines = snapshot.keys
+      .filter((entry) => entry.source === source)
+      .map((entry) => `    ${entry.value}  (${origin(entry)})`);
     lines.push("  keywords:");
     lines.push(...(keywordLines.length === 0 ? ["    (none)"] : keywordLines));
     lines.push("  keys:");
@@ -724,8 +718,9 @@ export function formatExclusionList(config: AppConfig, state: StateDatabase): st
   return `${lines.join("\n")}\n`;
 }
 
-function formatDirection(direction: ExclusionDirection): string {
-  return direction === "personalToWork" ? "personal → work" : "work → personal";
+/** An exclusion holds a source's events back from every other calendar. */
+function formatSource(source: string): string {
+  return `from ${source}`;
 }
 
 function formatKeyScope(value: string): string {
@@ -815,12 +810,17 @@ function printResult(result: ReconcileResult): void {
 
 function printDedupeResult(result: DedupeResult, dryRun: boolean): void {
   const count = (n: number, word: string): string => `${String(n)} ${n === 1 ? word : `${word}s`}`;
-  const checked = result.inspected.personal + result.inspected.work;
-  const duplicates = result.duplicates.personal + result.duplicates.work;
-  const phantoms = result.phantoms.personal + result.phantoms.work;
-  const onCalendars =
-    `${String(result.duplicates.personal + result.phantoms.personal)} on personal, ` +
-    `${String(result.duplicates.work + result.phantoms.work)} on work`;
+  const sum = (counts: Record<string, number>): number =>
+    Object.values(counts).reduce((total, value) => total + value, 0);
+  const checked = sum(result.inspected);
+  const duplicates = sum(result.duplicates);
+  const phantoms = sum(result.phantoms);
+  const onCalendars = Object.keys(result.inspected)
+    .map(
+      (calendar) =>
+        `${String((result.duplicates[calendar] ?? 0) + (result.phantoms[calendar] ?? 0))} on ${calendar}`,
+    )
+    .join(", ");
   process.stdout.write(
     `Stray-block cleanup ${dryRun ? "preview" : "complete"}: ${dryRun ? "would remove" : "removed"} ` +
       `${count(result.deleted, "busy block")} ` +
@@ -835,15 +835,15 @@ function printSyncResult(result: SyncReconcileResult): void {
     `Reconciliation ${status}: ${String(result.created)} created, ${String(result.updated)} updated, ${String(result.deleted)} deleted, ${String(result.repaired)} repaired${result.failed === 0 ? "" : `, ${String(result.failed)} failed`}\n`,
   );
   process.stdout.write(
-    `${formatMirrorTotals(result, result.converged ? "Active mirrors" : "Active mirrors after partial run")}\n`,
+    `${formatMirrorTotals(result, result.converged ? "Busy blocks" : "Busy blocks after partial run")}\n`,
   );
   if (!result.converged) {
     process.stdout.write(
-      "Desired state did not fully converge; totals include only desired mirrors active after successful operations.\n",
+      "Desired state did not fully converge; totals include only busy blocks in place after successful operations.\n",
     );
   }
   process.stdout.write(
-    "Excluded and duplicate-suppressed source events are not included in active totals.\n",
+    "Excluded and duplicate-suppressed source events are not included in busy-block totals.\n",
   );
 }
 
@@ -858,20 +858,12 @@ export function formatDryRunReport(
     total === 0
       ? ["Dry run: no changes planned."]
       : [`Dry run: ${String(total)} ${total === 1 ? "operation" : "operations"} planned.`];
-  const directions = [
-    ["personal", "work"],
-    ["work", "personal"],
-  ] as const;
-  for (const [sourceRole, destinationRole] of directions) {
-    const directional = operations.filter(
-      (entry) => entry.sourceRole === sourceRole && entry.destinationRole === destinationRole,
-    );
-    if (directional.length === 0) {
-      continue;
-    }
-    lines.push(`${sourceRole} → ${destinationRole}:`);
+  const destinations = [...new Set(operations.map((entry) => entry.destinationKey))];
+  for (const destination of destinations) {
+    const onDestination = operations.filter((entry) => entry.destinationKey === destination);
+    lines.push(`busy blocks on ${destination}:`);
     const counts = new Map<string, number>();
-    for (const entry of directional) {
+    for (const entry of onDestination) {
       const key = `${entry.operation}\0${entry.reason}`;
       counts.set(key, (counts.get(key) ?? 0) + 1);
     }
@@ -901,7 +893,7 @@ export function formatDryRunReport(
             ? `${entry.timeRange.start} → ${entry.timeRange.end} (all-day; end exclusive)`
             : `${entry.timeRange.start} → ${entry.timeRange.end}`;
       lines.push(
-        `  ${entry.sourceRole} → ${entry.destinationRole} | ${entry.operation} | ${range} | ${formatReason(entry.reason)} | ${title}`,
+        `  ${formatFlow(entry)} | ${entry.operation} | ${range} | ${formatReason(entry.reason)} | ${title}`,
       );
     }
   }
@@ -922,7 +914,7 @@ export function formatDryRunReport(
               ? "excluded_by_legacy_raw_key"
               : `excluded_by_${source.exclusionReason}_key`;
       lines.push(
-        `  ${source.sourceRole} → ${source.destinationRole} | ${recurrence} | ${formatTimeRange(source.timeRange)} | ${title} | ${exclusion}`,
+        `  ${source.sourceKey} | ${recurrence} | ${formatTimeRange(source.timeRange)} | ${title} | ${exclusion}`,
         `    occurrence only: ${source.exclusionKeys.occurrence}`,
         `    whole series:    ${source.exclusionKeys.series}`,
       );
@@ -930,16 +922,31 @@ export function formatDryRunReport(
   }
   lines.push(
     ...(showDetails && (operations.length > 0 || sources.length > 0) ? [""] : []),
-    formatMirrorTotals(result, "Projected active mirrors"),
-    "Excluded and duplicate-suppressed source events are not included in active totals.",
+    formatMirrorTotals(result, "Projected busy blocks"),
+    "Excluded and duplicate-suppressed source events are not included in busy-block totals.",
   );
   return `${lines.join("\n")}\n`;
 }
 
 function formatMirrorTotals(result: SyncReconcileResult, label: string): string {
-  const personal = result.mirrors.personalToWork;
-  const work = result.mirrors.workToPersonal;
-  return `${label}: personal → work ${String(personal.active)} (${String(personal.excluded)} excluded, ${String(personal.duplicateSuppressed)} duplicate-suppressed); work → personal ${String(work.active)} (${String(work.excluded)} excluded, ${String(work.duplicateSuppressed)} duplicate-suppressed)`;
+  const blocks = Object.entries(result.destinations)
+    .map(
+      ([calendar, totals]) =>
+        `${calendar} ${String(totals.active)} (${String(totals.duplicateSuppressed)} duplicate-suppressed)`,
+    )
+    .join("; ");
+  const excluded = Object.entries(result.sources)
+    .map(([calendar, totals]) => `${calendar} ${String(totals.excluded)}`)
+    .join(", ");
+  return `${label}: ${blocks}. Excluded events: ${excluded}`;
+}
+
+/** "personal, family → work": the calendars behind a block, and where it sits. */
+function formatFlow(entry: ReconcileLog): string {
+  const sources = entry.sourceKeys ?? [];
+  return sources.length === 0
+    ? `→ ${entry.destinationKey}`
+    : `${sources.join(", ")} → ${entry.destinationKey}`;
 }
 
 function formatTimeRange(range: ReconcileSourceDetail["timeRange"]): string {
@@ -977,7 +984,9 @@ function printSyncStatus(status: SyncStatus): void {
     return;
   }
   if (status.event === "invalid_sync_token") {
-    process.stdout.write(`${status.role}: invalid sync token; rebuilding incremental state.\n`);
+    process.stdout.write(
+      `${status.calendarKey}: invalid sync token; rebuilding incremental state.\n`,
+    );
     return;
   }
   process.stdout.write(

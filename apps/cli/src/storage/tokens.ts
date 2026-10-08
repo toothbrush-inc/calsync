@@ -1,6 +1,6 @@
 import { connectionId, grantFromManifest, type Vault } from "@dvd-toy-box/vault";
 
-import type { AccountRole } from "@calsync/engine";
+import type { AccountRole } from "../config.js";
 
 import { CALSYNC_CAPABILITY } from "../capability.js";
 import { tokenSlot, type TokenStore } from "./keychain.js";

@@ -69,11 +69,15 @@ describe("loadConfig", () => {
     expect(config.fullSyncIntervalMs).toBe(86_400_000);
     expect(config.logging).toEqual({ maxBytes: 5 * 1024 * 1024, backups: 5 });
     expect(config.window).toEqual({ pastDays: 30, futureDays: 365 });
-    expect(config.exclusions.personalToWork).toEqual([]);
-    expect(config.exclusions.personalToWorkKeywords).toEqual([]);
+    expect(config.calendars).toEqual([
+      { key: "personal", calendarId: "personal@example.com", source: true, destination: true },
+      { key: "work", calendarId: "work@example.com", source: true, destination: true },
+    ]);
+    expect(config.exclusions.keys["personal"]).toEqual([]);
+    expect(config.exclusions.keywords["personal"]).toEqual([]);
   });
 
-  it("normalizes optional per-direction exclusions", () => {
+  it("normalizes optional exclusions onto the calendar whose events they hold back", () => {
     const config = loadConfig({
       CALSYNC_PERSONAL_CALENDAR_ID: "personal",
       CALSYNC_WORK_CALENDAR_ID: "work",
@@ -84,10 +88,10 @@ describe("loadConfig", () => {
       CALSYNC_EXCLUDE_WORK_TO_PERSONAL_KEYWORDS: " Confidential ",
     });
 
-    expect(config.exclusions.personalToWork).toEqual(["focus", "travel"]);
-    expect(config.exclusions.workToPersonal).toEqual(["on-call"]);
-    expect(config.exclusions.personalToWorkKeywords).toEqual(["team sync", "[vip]", "c++"]);
-    expect(config.exclusions.workToPersonalKeywords).toEqual(["confidential"]);
+    expect(config.exclusions.keys["personal"]).toEqual(["focus", "travel"]);
+    expect(config.exclusions.keys["work"]).toEqual(["on-call"]);
+    expect(config.exclusions.keywords["personal"]).toEqual(["team sync", "[vip]", "c++"]);
+    expect(config.exclusions.keywords["work"]).toEqual(["confidential"]);
   });
 
   it("reports invalid configuration without exposing values", () => {

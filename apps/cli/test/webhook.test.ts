@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import type { AccountRole } from "@calsync/engine";
+import type { AccountRole } from "../src/config.js";
 
 import type { WatchChannelRecord } from "../src/storage/index.js";
 import { channelTokenHash, SyncTrigger, WebhookReceiver } from "../src/sync/webhook.js";

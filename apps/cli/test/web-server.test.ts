@@ -2,13 +2,9 @@ import { request as httpRequest } from "node:http";
 
 import { describe, expect, it } from "vitest";
 
-import type {
-  AccountRole,
-  ReconcileLog,
-  ReconcileSourceDetail,
-  StoredSyncSummary,
-} from "@calsync/engine";
+import type { ReconcileLog, ReconcileSourceDetail, StoredSyncSummary } from "@calsync/engine";
 
+import type { AccountRole } from "../src/config.js";
 import type { ExclusionChangeResult, ExclusionSnapshot } from "../src/exclusions.js";
 import type { AccountStatus, ConnectStartResult } from "../src/google/auth.js";
 import type { AccountRecord } from "../src/storage/index.js";
@@ -58,8 +54,7 @@ function accountRecord(role: AccountRole, tenantId: string, calendarId: string):
 }
 
 const previewSource: ReconcileSourceDetail = {
-  sourceRole: "personal",
-  destinationRole: "work",
+  sourceKey: "personal",
   sourceTitle: "Dentist",
   timeRange: {
     kind: "timed",
@@ -75,8 +70,7 @@ const previewSource: ReconcileSourceDetail = {
 
 const duplicateRemoval: ReconcileLog = {
   operation: "delete",
-  sourceRole: "personal",
-  destinationRole: "work",
+  destinationKey: "work",
   reason: "duplicate-busy-block",
   timeRange: {
     kind: "timed",
@@ -124,20 +118,22 @@ function fakeRuntime(
         repaired: 0,
         failed: 0,
         converged: true,
-        mirrors: {
-          personalToWork: { active: 4, excluded: 1, duplicateSuppressed: 0 },
-          workToPersonal: { active: 2, excluded: 0, duplicateSuppressed: 0 },
+        destinations: {
+          work: { active: 4, duplicateSuppressed: 0 },
+          personal: { active: 2, duplicateSuppressed: 0 },
+        },
+        sources: {
+          personal: { excluded: 1 },
+          work: { excluded: 0 },
         },
       },
     }),
     listExclusions: (): ExclusionSnapshot => ({
       keywords: [
-        { value: "dentist", direction: "personalToWork", origin: "cli" },
-        { value: "confidential", direction: "workToPersonal", origin: "env" },
+        { value: "dentist", source: "personal", origin: "cli" },
+        { value: "confidential", source: "work", origin: "env" },
       ],
-      keys: [
-        { value: "calsync-exclude:v1:p2w:occ:abc", direction: "personalToWork", origin: "cli" },
-      ],
+      keys: [{ value: "calsync-exclude:v1:p2w:occ:abc", source: "personal", origin: "cli" }],
     }),
     changeExclusions: (action, input): ExclusionChangeResult => {
       runtime.exclusionCalls.push({ action, input });
@@ -145,11 +141,9 @@ function fakeRuntime(
         throw new Error('Invalid exclusion key "bogus"');
       }
       return {
-        added:
-          action === "add" ? [{ kind: "keyword", value: "x", direction: "personalToWork" }] : [],
+        added: action === "add" ? [{ kind: "keyword", value: "x", source: "personal" }] : [],
         alreadyPresent: [],
-        removed:
-          action === "remove" ? [{ kind: "keyword", value: "x", direction: "personalToWork" }] : [],
+        removed: action === "remove" ? [{ kind: "keyword", value: "x", source: "personal" }] : [],
         missing: [],
       };
     },
@@ -175,8 +169,7 @@ function fakeRuntime(
             ...duplicateRemoval,
             dryRun,
             reason: "phantom-busy-block",
-            sourceRole: "work",
-            destinationRole: "personal",
+            destinationKey: "personal",
           },
           // Never a stray-block removal: the view must leave it out.
           { ...duplicateRemoval, reason: "source-no-longer-desired", sourceTitles: ["Dentist"] },
@@ -193,17 +186,20 @@ function fakeRuntime(
           repaired: 0,
           failed: 0,
           converged: true,
-          mirrors: {
-            personalToWork: { active: 1, excluded: 1, duplicateSuppressed: 0 },
-            workToPersonal: { active: 0, excluded: 0, duplicateSuppressed: 0 },
+          destinations: {
+            work: { active: 1, duplicateSuppressed: 0 },
+            personal: { active: 0, duplicateSuppressed: 0 },
+          },
+          sources: {
+            personal: { excluded: 1 },
+            work: { excluded: 0 },
           },
         },
         sources: [
           previewSource,
           {
             ...previewSource,
-            sourceRole: "work",
-            destinationRole: "personal",
+            sourceKey: "work",
             sourceTitle: "Confidential staffing",
             exclusionReason: "keyword",
             isRecurring: false,
@@ -305,8 +301,7 @@ describe("web onboarding server", () => {
       expect(status.lastFullSyncAt).toBe("2026-08-28T09:00:00.000Z");
       expect(status.lastResult).toEqual({
         converged: true,
-        personalToWorkActive: 4,
-        workToPersonalActive: 2,
+        blocks: { work: 4, personal: 2 },
       });
     } finally {
       await server.close();
@@ -701,7 +696,7 @@ describe("web onboarding server", () => {
 
       const snapshot = (await (await fetch(`${base}/api/exclusions`)).json()) as ExclusionSnapshot;
       expect(snapshot.keywords).toHaveLength(2);
-      expect(snapshot.keys[0]).toMatchObject({ origin: "cli", direction: "personalToWork" });
+      expect(snapshot.keys[0]).toMatchObject({ origin: "cli", source: "personal" });
 
       const post = async (body: unknown, headers: Record<string, string> = {}): Promise<Response> =>
         fetch(`${base}/api/exclusions`, {
@@ -837,7 +832,7 @@ describe("web onboarding server", () => {
       expect(view.planned).toEqual({ created: 1, updated: 0, deleted: 0, repaired: 0 });
       expect(view.events).toEqual([
         {
-          direction: "personalToWork",
+          source: "personal",
           title: "Dentist",
           when: previewSource.timeRange,
           recurring: true,
@@ -845,7 +840,7 @@ describe("web onboarding server", () => {
           keys: previewSource.exclusionKeys,
         },
         expect.objectContaining({
-          direction: "workToPersonal",
+          source: "work",
           title: "Confidential staffing",
           status: "excluded-keyword",
         }),
