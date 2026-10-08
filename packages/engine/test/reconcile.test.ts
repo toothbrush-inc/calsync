@@ -1062,6 +1062,25 @@ describe("Reconciler", () => {
       await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({ created: 0 });
     });
 
+    it("keeps finding a free ID however often a slot is vacated and refilled", async () => {
+      const runtime = setup([at("a", "09:00", "10:00")]);
+      const live = () => runtime.work.events.filter((event) => event.status !== "cancelled");
+      for (let round = 0; round < 4; round += 1) {
+        await runtime.reconciler.reconcile();
+        expect(live()).toHaveLength(1);
+        const id = first(live()).id;
+        runtime.personal.events.splice(0);
+        await runtime.reconciler.reconcile();
+        if (id != null) {
+          runtime.work.events.push({ id, status: "cancelled" });
+        }
+        runtime.personal.events.push(at(`a-${String(round)}`, "09:00", "10:00"));
+      }
+      await runtime.reconciler.reconcile();
+      expect(live()).toHaveLength(1);
+      expect(first(runtime.state.listMappings()).destinationEventId).toBe(first(live()).id);
+    });
+
     it("replaces legacy one-per-event mirrors with merged blocks", async () => {
       const runtime = setup([at("a", "09:00", "10:00"), at("b", "09:30", "10:30")]);
       for (const id of ["a", "b"]) {

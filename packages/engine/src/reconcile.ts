@@ -178,6 +178,12 @@ const LONG_PRUNE_SPACING_MS = 300;
 const MAX_DELETE_SPACING_MS = 1_200;
 const INITIAL_COOLDOWN_MS = 5_000;
 const MAX_COOLDOWN_MS = 60_000;
+/**
+ * Replacement IDs tried when a returning slot's ID belongs to a deleted block.
+ * Each return of the same slot consumes one; a slot vacated and refilled this
+ * often within Google's tombstone retention is not plausible.
+ */
+const MAX_TOMBSTONE_LINKS = 32;
 /** Tries per block across cooldowns, on top of the adapter's own quick retries. */
 const MAX_DELETE_ATTEMPTS = 6;
 
@@ -949,10 +955,18 @@ export class Reconciler {
               // A slot that comes back reuses its interval key, and the ID it
               // derives may belong to a block deleted earlier. Google keeps
               // that tombstone and answers the insert with a conflict, so
-              // insert again under an ID derived from the tombstone.
-              if (inserted?.status === "cancelled") {
+              // follow the chain of IDs derived from each tombstone until one
+              // is free: every return of the slot used up one link.
+              for (
+                let link = 0;
+                inserted?.status === "cancelled" && link < MAX_TOMBSTONE_LINKS;
+                link += 1
+              ) {
                 insert.id = managedGoogleEventId(`${key}:replacement:${insert.id}`);
                 inserted = await client.insertEvent(destinationCalendarId, insert);
+              }
+              if (inserted?.status === "cancelled") {
+                throw new Error("Every replacement ID for this busy block is a deleted event");
               }
             },
             result,
