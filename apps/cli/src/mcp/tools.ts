@@ -500,9 +500,7 @@ function countOperations(operations: readonly ReconcileLog[]): OperationCount[] 
 }
 
 function titledSources(operations: readonly ReconcileLog[]): string[] {
-  return operations.flatMap((entry) =>
-    entry.sourceTitle === undefined ? [] : [entry.sourceTitle],
-  );
+  return operations.flatMap((entry) => entry.sourceTitles ?? []);
 }
 
 function toolFailure(error: unknown, code: string): ToolFailure {

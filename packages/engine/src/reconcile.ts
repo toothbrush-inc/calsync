@@ -58,7 +58,8 @@ export interface ReconcileLog {
   destinationRole: AccountRole;
   reason: ReconcileReason;
   timeRange?: ReconcileTimeRange;
-  sourceTitle?: string;
+  /** Titles of every source merged into the block, in start order; untitled sources are left out. */
+  sourceTitles?: string[];
   dryRun: boolean;
 }
 
@@ -124,6 +125,12 @@ export interface ReconcileOptions {
   log?: (entry: ReconcileLog) => void;
   onSourceEvent?: (entry: ReconcileSourceDetail) => void;
   onProgress?: (progress: ReconcileProgress) => void;
+  /**
+   * Each managed block a sync pass deleted. Google reports the deletion back
+   * as a cancelled change; the caller remembers these to tell its own
+   * deletions from someone else's.
+   */
+  onDestinationDeleted?: (destinationRole: AccountRole, eventId: string) => void;
 }
 
 export interface ReconcileProgress {
@@ -324,7 +331,7 @@ export class Reconciler {
           "rebuild-mapping",
           options,
           blockTimeRange(block),
-          blockTitle(block),
+          blockTitles(block),
         );
       }
     }
@@ -867,6 +874,9 @@ export class Reconciler {
         finishItem(failuresBefore, operationsBefore);
         continue;
       }
+      if (options.dryRun !== true) {
+        options.onDestinationDeleted?.(destinationRole, mapping.destinationEventId);
+      }
       record(
         result,
         "delete",
@@ -922,6 +932,9 @@ export class Reconciler {
           finishItem(failuresBefore, operationsBefore);
           continue;
         }
+        if (options.dryRun !== true) {
+          options.onDestinationDeleted?.(destinationRole, extraId);
+        }
         record(
           result,
           "delete",
@@ -929,7 +942,7 @@ export class Reconciler {
           "duplicate-destination",
           options,
           eventTimeRange(extra),
-          blockTitle(block),
+          blockTitles(block),
         );
       }
 
@@ -987,7 +1000,7 @@ export class Reconciler {
           reason,
           options,
           blockTimeRange(block),
-          blockTitle(block),
+          blockTitles(block),
         );
       } else if (!matchesManagedProjection(destination, projectBusyEvent(block, key))) {
         const destinationId = destination.id;
@@ -1018,7 +1031,7 @@ export class Reconciler {
           "destination-drifted",
           options,
           blockTimeRange(block),
-          blockTitle(block),
+          blockTitles(block),
         );
       }
 
@@ -1033,7 +1046,7 @@ export class Reconciler {
           "mapping-missing",
           options,
           blockTimeRange(block),
-          blockTitle(block),
+          blockTitles(block),
         );
       }
       finishItem(failuresBefore, operationsBefore);
@@ -1360,9 +1373,11 @@ function blockTimeRange(block: BusyBlock): ReconcileTimeRange {
   return { kind: block.time.kind, start, end };
 }
 
-/** A block stands for one event only when nothing merged into it; then its title may be shown. */
-function blockTitle(block: BusyBlock): string | undefined {
-  return block.sources.length === 1 ? block.sources[0]?.sourceTitle : undefined;
+/** Every titled source merged into the block, for private dry-run detail. */
+function blockTitles(block: BusyBlock): string[] {
+  return block.sources.flatMap((source) =>
+    source.sourceTitle === undefined ? [] : [source.sourceTitle],
+  );
 }
 
 function intersectDuplicateKeys(
@@ -1405,7 +1420,7 @@ function record(
   reason: ReconcileReason,
   options: ReconcileOptions,
   timeRange?: ReconcileTimeRange,
-  sourceTitle?: string,
+  sourceTitles: readonly string[] = [],
 ): void {
   const field = `${operation}${operation === "repair" ? "ed" : "d"}` as
     "created" | "updated" | "deleted" | "repaired";
@@ -1416,7 +1431,7 @@ function record(
     destinationRole: opposite(sourceRole),
     reason,
     ...(timeRange === undefined ? {} : { timeRange }),
-    ...(sourceTitle === undefined ? {} : { sourceTitle }),
+    ...(sourceTitles.length === 0 ? {} : { sourceTitles: [...sourceTitles] }),
     dryRun: options.dryRun ?? false,
   });
 }

@@ -735,7 +735,7 @@ function operation(
     sourceRole,
     destinationRole,
     reason,
-    sourceTitle,
+    sourceTitles: [sourceTitle],
     timeRange: {
       kind: "timed",
       start: "2026-08-10T10:00:00Z",

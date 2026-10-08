@@ -413,6 +413,17 @@ describe("CLI scaffold", () => {
     );
   });
 
+  it("lists every title merged into one busy block", () => {
+    const merged: ReconcileLog = {
+      ...operation("personal", "work", "create", "destination-missing"),
+      sourceTitles: ["Dentist", "School pickup"],
+    };
+
+    expect(
+      formatDryRunReport([merged], syncResult({ created: 1, personalActive: 1 }), true),
+    ).toContain('| "Dentist" + "School pickup"');
+  });
+
   it("labels all-day detail ranges and their exclusive end date", () => {
     const allDay: ReconcileLog = {
       ...operation("work", "personal", "create", "destination-missing", "Private holiday"),
@@ -726,7 +737,7 @@ function operation(
     sourceRole,
     destinationRole,
     reason,
-    sourceTitle,
+    sourceTitles: [sourceTitle],
     timeRange: {
       kind: "timed",
       start: "2026-08-10T10:00:00Z",

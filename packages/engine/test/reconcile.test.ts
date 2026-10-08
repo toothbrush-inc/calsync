@@ -623,7 +623,7 @@ describe("Reconciler", () => {
         destinationRole: "work",
         dryRun: false,
       });
-      expect(operations.every((entry) => entry.sourceTitle === undefined)).toBe(true);
+      expect(operations.every((entry) => entry.sourceTitles === undefined)).toBe(true);
       // The live mirror is untouched, so the next pass has nothing to do.
       await expect(runtime.reconciler.reconcile()).resolves.toMatchObject({
         created: 0,
@@ -974,6 +974,27 @@ describe("Reconciler", () => {
         updated: 0,
         deleted: 0,
       });
+    });
+
+    it("logs every titled source merged into a block, in start order", async () => {
+      const runtime = setup([
+        at("later", "09:30", "10:30", { summary: "School pickup" }),
+        at("untitled", "09:45", "10:00", { summary: null }),
+        at("earlier", "09:00", "10:00", { summary: "Dentist" }),
+      ]);
+      const operations: ReconcileLog[] = [];
+
+      await runtime.reconciler.reconcile({
+        dryRun: true,
+        log: (entry) => operations.push(entry),
+      });
+      expect(operations).toEqual([
+        expect.objectContaining({
+          operation: "create",
+          sourceTitles: ["Dentist", "School pickup"],
+          timeRange: { kind: "timed", start: "2026-08-10T09:00:00Z", end: "2026-08-10T10:30:00Z" },
+        }),
+      ]);
     });
 
     it("compares instants, not offsets, when merging", async () => {

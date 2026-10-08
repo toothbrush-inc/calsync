@@ -115,6 +115,7 @@ export class SyncEngine {
     }
 
     const pendingTokens: Partial<Record<AccountRole, string>> = {};
+    const ownDeletions = readOwnDeletions(this.syncState, this.config.tenantId);
     // changesRequireFull matches managed events against mappings sourced from
     // the opposite calendar, so it needs the tenant's full mapping list.
     const tenantMappings = this.mappings.listMappings(undefined, this.config.tenantId);
@@ -125,7 +126,7 @@ export class SyncEngine {
       if (poll.invalidToken) {
         reason = "invalid-token";
       }
-      if (changesRequireFull(role, poll.changes.events, tenantMappings)) {
+      if (changesRequireFull(role, poll.changes.events, tenantMappings, ownDeletions[role])) {
         relevantChange = true;
       }
     }
@@ -134,6 +135,7 @@ export class SyncEngine {
     }
 
     if (reason === undefined) {
+      // This poll consumed the echoes of the last pass's deletions.
       persistIncrementalState(
         this.syncState,
         pendingTokens,
@@ -141,6 +143,7 @@ export class SyncEngine {
         undefined,
         now,
         this.config.tenantId,
+        noDeletions(),
       );
       emitStatus(options, {
         event: "incremental_noop",
@@ -154,7 +157,14 @@ export class SyncEngine {
       reason,
       nextFullAt: new Date(now.getTime() + fullSyncInterval(config)).toISOString(),
     });
-    const result = await reconciler.reconcile({ ...this.reconcileOptions(options), now });
+    const deleted = noDeletions();
+    const result = await reconciler.reconcile({
+      ...this.reconcileOptions(options),
+      now,
+      onDestinationDeleted: (role, eventId) => {
+        deleted[role].push(eventId);
+      },
+    });
     persistIncrementalState(
       this.syncState,
       pendingTokens,
@@ -162,6 +172,7 @@ export class SyncEngine {
       result,
       now,
       this.config.tenantId,
+      deleted,
     );
     return result;
   }
@@ -240,6 +251,40 @@ function syncTokenKey(role: AccountRole, tenantId: string): string {
   return stateKey(`incremental:sync-token:${role}`, tenantId);
 }
 
+function ownDeletionsKey(role: AccountRole, tenantId: string): string {
+  return stateKey(`incremental:own-deletions:${role}`, tenantId);
+}
+
+type OwnDeletions = Record<AccountRole, string[]>;
+
+function noDeletions(): OwnDeletions {
+  return { personal: [], work: [] };
+}
+
+/**
+ * Managed blocks the previous full pass deleted, per calendar. Their
+ * cancellations arrive in the very next poll, which consumes them, so the
+ * list only ever spans one pass. Unreadable state reads as empty: the worst
+ * case is one redundant full pass.
+ */
+function readOwnDeletions(
+  state: SyncStateStore,
+  tenantId: string,
+): Record<AccountRole, Set<string>> {
+  const read = (role: AccountRole): Set<string> => {
+    const value = state.getState(ownDeletionsKey(role, tenantId));
+    try {
+      const parsed: unknown = value === null ? [] : JSON.parse(value);
+      return new Set(
+        Array.isArray(parsed) ? parsed.filter((id): id is string => typeof id === "string") : [],
+      );
+    } catch {
+      return new Set();
+    }
+  };
+  return { personal: read("personal"), work: read("work") };
+}
+
 function clearSyncTokens(state: SyncStateStore, tenantId: string): void {
   for (const role of accountRoles) {
     state.deleteState(syncTokenKey(role, tenantId));
@@ -256,6 +301,7 @@ function changesRequireFull(
   calendarRole: AccountRole,
   events: readonly GoogleCalendarEvent[],
   mappings: readonly EventMapping[],
+  ownDeletions: ReadonlySet<string>,
 ): boolean {
   const destinations = new Map(
     mappings
@@ -270,6 +316,11 @@ function changesRequireFull(
     }
     const destination = destinations.get(id);
     if (event.status === "cancelled") {
+      // A block calsync itself deleted changes nothing it wants; anything
+      // else cancelled (a source, or a block someone else removed) does.
+      if (ownDeletions.has(id)) {
+        continue;
+      }
       return true;
     }
     if (destination !== undefined) {
@@ -341,6 +392,7 @@ function persistIncrementalState(
   result: SyncReconcileResult | undefined,
   now: Date,
   tenantId: string,
+  ownDeletions: OwnDeletions,
 ): void {
   const personal = tokens.personal;
   const work = tokens.work;
@@ -352,6 +404,8 @@ function persistIncrementalState(
       [syncTokenKey("personal", tenantId)]: personal,
       [syncTokenKey("work", tenantId)]: work,
       [stateKey(CONFIG_FINGERPRINT_KEY, tenantId)]: fingerprint,
+      [ownDeletionsKey("personal", tenantId)]: JSON.stringify(ownDeletions.personal),
+      [ownDeletionsKey("work", tenantId)]: JSON.stringify(ownDeletions.work),
       ...(result === undefined
         ? {}
         : {

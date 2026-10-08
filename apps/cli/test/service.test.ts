@@ -601,6 +601,50 @@ describe("incremental sync orchestration", () => {
     runtime.close();
   });
 
+  it("skips the echo of its own block deletions but not anyone else's", async () => {
+    const runtime = incrementalRuntime();
+    runtime.personal.events.push({
+      id: "personal-source",
+      start: { dateTime: "2026-08-10T10:00:00Z" },
+      end: { dateTime: "2026-08-10T11:00:00Z" },
+    });
+    await runtime.service.once();
+    const blockId = runtime.work.events[0]?.id;
+    if (blockId == null) {
+      throw new Error("expected a busy block");
+    }
+
+    // The source goes; the full pass that follows deletes its block.
+    runtime.personal.events.splice(0);
+    runtime.personal.changeQueue.push({
+      events: [{ id: "personal-source", status: "cancelled" }],
+      nextSyncToken: "personal-source-gone",
+    });
+    await runtime.service.once();
+    expect(runtime.work.deletedIds).toEqual([blockId]);
+    const reads = (): number => runtime.personal.fullReads + runtime.work.fullReads;
+    const before = reads();
+
+    // Google reports that deletion back: it changes nothing calsync wants.
+    runtime.work.changeQueue.push({
+      events: [{ id: blockId, status: "cancelled" }],
+      nextSyncToken: "work-own-delete",
+    });
+    const statuses: string[] = [];
+    await runtime.service.once({ onStatus: (status) => statuses.push(status.event) });
+    expect(statuses).toEqual(["incremental_noop"]);
+    expect(reads()).toBe(before);
+
+    // The echo was consumed; any later cancellation is someone else's.
+    runtime.work.changeQueue.push({
+      events: [{ id: blockId, status: "cancelled" }],
+      nextSyncToken: "work-foreign-delete",
+    });
+    await runtime.service.once();
+    expect(reads()).toBe(before + 2);
+    runtime.close();
+  });
+
   it("clears a 410 token, establishes a fresh baseline, and performs recovery full sync", async () => {
     const runtime = incrementalRuntime();
     await runtime.service.once();

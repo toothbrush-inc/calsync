@@ -179,7 +179,7 @@ function fakeRuntime(
             destinationRole: "personal",
           },
           // Never a stray-block removal: the view must leave it out.
-          { ...duplicateRemoval, reason: "source-no-longer-desired", sourceTitle: "Dentist" },
+          { ...duplicateRemoval, reason: "source-no-longer-desired", sourceTitles: ["Dentist"] },
         ],
       });
     },
