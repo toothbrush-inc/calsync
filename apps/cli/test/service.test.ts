@@ -13,7 +13,7 @@ import {
   type CalendarAPI,
 } from "@calsync/engine";
 
-import type { AppConfig } from "../src/config.js";
+import type { AppCalendar, AppConfig } from "../src/config.js";
 import { StateDatabase } from "../src/storage/index.js";
 import {
   acquireLock,
@@ -25,6 +25,7 @@ import {
   classifyReconciliationError,
   DefaultSyncService,
   ReconciliationError,
+  type DaemonTenant,
 } from "../src/sync/service.js";
 
 describe("Google error classification", () => {
@@ -1807,5 +1808,93 @@ describe("daemon with calendars that change while it runs", () => {
       rmSync(directory, { recursive: true, force: true });
     }
     expect(lines.some((line) => line.includes("not open"))).toBe(false);
+  });
+
+  it("wakes from the backstop wait to sync a calendar added mid-run", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "calsync-wake-"));
+    const state = new StateDatabase(join(directory, "state.sqlite3"));
+    const watched: string[] = [];
+    const channelApi = {
+      watchEvents: (request: { calendarId: string; channelId: string }) => {
+        watched.push(request.calendarId);
+        return Promise.resolve({
+          channelId: request.channelId,
+          resourceId: `resource-${request.calendarId}`,
+          expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1_000).toISOString(),
+        });
+      },
+      stopChannel: (): Promise<void> => Promise.resolve(),
+    };
+    const auth = {
+      createCalendarClient: () => Promise.resolve(idleCalendar()),
+      createChannelClient: () => Promise.resolve(channelApi),
+    };
+    const passes: string[] = [];
+    const writeLog = (line: string): void => {
+      if (line.includes('"reconcile_complete"')) {
+        passes.push((JSON.parse(line) as { trigger: string }).trigger);
+      }
+    };
+    const webhook = {
+      address: "https://calsync.example.test/gcal/webhook",
+      host: "127.0.0.1",
+      port: 0,
+      path: "/gcal/webhook",
+      debounceMs: 0,
+      channelTtlSeconds: 604_800,
+      renewBeforeMs: 60 * 60 * 1_000,
+      // Armed channels put the backstop far beyond the test…
+      pollIntervalMs: 10 * 60 * 1_000,
+    };
+    // …so only the poll-rate calendar check can bring the new calendar in.
+    const config: AppConfig = { ...testConfig(), pollIntervalMs: 20, webhook };
+    const serviceFor = (calendars: readonly AppCalendar[]): DaemonTenant =>
+      new DefaultSyncService(
+        { ...config, calendars: [...calendars] },
+        auth,
+        state,
+        join(directory, "default.lock"),
+        writeLog,
+      ).daemonTenant();
+    let tenant = serviceFor(config.calendars);
+    const daemon = new SyncDaemon(
+      config,
+      () => [tenant],
+      (channelId) => state.getWatchChannelByChannelId(channelId),
+      join(directory, "daemon.lock"),
+      writeLog,
+    );
+
+    const stop = new AbortController();
+    const running = daemon.start({ signal: stop.signal });
+    try {
+      for (let tries = 0; tries < 200 && passes.length === 0; tries += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      // Several poll intervals with nothing changed: no extra passes.
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      expect(passes).toEqual(["startup"]);
+
+      tenant = serviceFor([
+        ...config.calendars,
+        {
+          key: "cal-family",
+          account: "account1",
+          calendarId: "family-calendar",
+          source: true,
+          destination: true,
+        },
+      ]);
+      for (let tries = 0; tries < 200 && !watched.includes("family-calendar"); tries += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(passes).toEqual(["startup", "calendars"]);
+      expect(watched).toContain("family-calendar");
+    } finally {
+      stop.abort();
+      await running;
+      state.close();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 });

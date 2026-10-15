@@ -203,8 +203,11 @@ and expects a reverse proxy in front of it; see
 
 `get_status` reports `push.configured` and each channel's expiry. Daemon logs
 carry `webhook_listening`, `webhook_channel_armed`, `webhook_notification`,
-and a `trigger` field (`startup`, `webhook`, `scheduled`) on every
-`reconcile_complete`. The channel token is never logged or persisted in the
+and a `trigger` field (`startup`, `webhook`, `scheduled`, `calendars`) on
+every `reconcile_complete`. `calendars` is a pass for a tenant whose stored
+calendars changed (one added or removed, or a new sign-up): the daemon checks
+for that every `CALSYNC_POLL_INTERVAL_SECONDS` while it waits on the backstop,
+so a new calendar mirrors within a minute instead of at the next backstop. The channel token is never logged or persisted in the
 clear.
 
 ## The OAuth callback listener
