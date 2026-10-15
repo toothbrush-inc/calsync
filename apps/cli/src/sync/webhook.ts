@@ -159,7 +159,12 @@ function pathOf(url: string | undefined): string | undefined {
   return separator === -1 ? url : url.slice(0, separator);
 }
 
-export type SyncTriggerReason = "startup" | "webhook" | "scheduled" | "aborted";
+/**
+ * Why the daemon runs a pass round. `calendars`: a tenant's stored calendars
+ * changed (one was added or removed, or a tenant signed up) while the daemon
+ * waited between passes.
+ */
+export type SyncTriggerReason = "startup" | "webhook" | "scheduled" | "calendars" | "aborted";
 
 /**
  * Coalesces a burst of notifications into one sync.

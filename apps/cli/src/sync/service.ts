@@ -312,13 +312,16 @@ export interface DaemonTenant {
  * cadence — the slow backstop while its push channels are armed, the poll
  * rate while they are not — so one tenant with broken channels doesn't drag
  * every healthy tenant into fast polling. The tenant provider is consulted
- * before every pass round, so tenants authorized after startup join the loop
- * without a restart.
+ * before every pass round, and at the poll rate during the backstop wait, so
+ * a tenant that signs up or changes its calendars gets a pass within a poll
+ * interval rather than at the next backstop.
  */
 export class SyncDaemon {
   readonly #dirty = new Set<string>();
   /** When each tenant's last pass round started, keyed by tenant id. */
   readonly #lastPass = new Map<string, number>();
+  /** The calendars each tenant's last pass ran with, keyed by tenant id. */
+  readonly #passedCalendars = new Map<string, readonly AppCalendar[]>();
   /** Last startPush failure, so retries don't repeat the same log line. */
   #pushFailure: string | undefined;
 
@@ -363,6 +366,7 @@ export class SyncDaemon {
           }
           await this.runLoggedPass(tenant, options, reason);
           this.#lastPass.set(tenant.tenantId, roundStart);
+          this.#passedCalendars.set(tenant.tenantId, tenant.calendars);
           if (controller.signal.aborted) {
             break;
           }
@@ -400,11 +404,48 @@ export class SyncDaemon {
     }
     // Channels expire on Google's schedule; re-arm between passes.
     await push.ensure();
-    return await push.trigger.next(this.nextScheduledWaitMs(push), signal);
+    // The backstop can be many minutes away, and nothing on Google's side
+    // notifies a calendar that was just added. Wake at the poll rate to look
+    // for stored-calendar changes, so a new calendar mirrors (and gets its
+    // channel armed on the next ensure) within one poll interval.
+    const deadline = this.clock.now().getTime() + this.nextScheduledWaitMs(push);
+    for (;;) {
+      const remaining = deadline - this.clock.now().getTime();
+      const slice = Math.max(0, Math.min(remaining, this.config.pollIntervalMs));
+      const reason = await push.trigger.next(slice, signal);
+      if (reason !== "scheduled" || slice >= remaining) {
+        return reason;
+      }
+      const changed = this.changedTenants();
+      if (changed.length > 0) {
+        for (const tenantId of changed) {
+          this.#dirty.add(tenantId);
+        }
+        return "calendars";
+      }
+    }
+  }
+
+  /** Tenants whose calendars differ from what their last pass ran with. */
+  private changedTenants(): string[] {
+    const current = this.tenants();
+    const active = new Set(current.map((tenant) => tenant.tenantId));
+    for (const tenantId of this.#passedCalendars.keys()) {
+      if (!active.has(tenantId)) {
+        this.#passedCalendars.delete(tenantId);
+      }
+    }
+    return current
+      .filter((tenant) => {
+        const passed = this.#passedCalendars.get(tenant.tenantId);
+        return passed === undefined || !sameCalendarSet(passed, tenant.calendars);
+      })
+      .map((tenant) => tenant.tenantId);
   }
 
   /**
    * The tenants a pass round covers: the notified tenants after a webhook,
+   * the tenants whose calendars changed after a calendars wake,
    * the tenants whose cadence has elapsed on a timer wake, everyone otherwise
    * (startup, or a poll-only daemon without push).
    */
@@ -412,7 +453,7 @@ export class SyncDaemon {
     reason: SyncTriggerReason,
     push: PushSession | undefined,
   ): Set<string> | undefined {
-    if (reason === "webhook" && this.#dirty.size > 0) {
+    if ((reason === "webhook" || reason === "calendars") && this.#dirty.size > 0) {
       return new Set(this.#dirty);
     }
     if (reason !== "scheduled" || push === undefined) {
